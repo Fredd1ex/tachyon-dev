@@ -129,4 +129,4 @@ the effective key source and current model.
 
 ## License
 
-MIT
+GPLV3
