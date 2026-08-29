@@ -7,11 +7,7 @@ pub mod prompt;
 
 use crate::capabilities::Capability;
 
-pub const CAPABILITIES: &[Capability] = &[
-    Capability::Respond,
-    Capability::DelegateOne,
-    Capability::DelegateMany,
-];
+pub const CAPABILITIES: &[Capability] = &[Capability::DelegateOne, Capability::DelegateMany];
 
 pub const DELEGATION_CAPABILITIES: &[Capability] =
     &[Capability::DelegateOne, Capability::DelegateMany];
@@ -21,12 +17,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn forced_work_removes_direct_response() {
-        assert_eq!(CAPABILITIES[0], Capability::Respond);
-        assert_eq!(
-            DELEGATION_CAPABILITIES,
-            &[Capability::DelegateOne, Capability::DelegateMany]
-        );
+    fn conversation_exposes_only_delegation_tools() {
+        assert_eq!(CAPABILITIES, DELEGATION_CAPABILITIES);
     }
 }
 

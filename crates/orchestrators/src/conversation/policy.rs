@@ -2,9 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const CLASSIFICATION_PROMPT: &str = "Return exactly one enum value and nothing else: AnswerNow, AttachToActiveTurn, InterruptAndReplan, or WaitForActiveTurn.\n\nClassify the incoming message relative to the active turn and its context. AnswerNow means it can be answered independently without changing the active turn. AttachToActiveTurn means it supplies information or a refinement for the active turn. InterruptAndReplan means it changes the objective enough that the active turn should be stopped and reconsidered. WaitForActiveTurn means it should be handled after the active turn. Do not explain your choice.";
+pub const CLASSIFICATION_PROMPT: &str = "Return only `AnswerNow` if the message can be handled independently of active work; otherwise return `WaitForActiveTurn`.";
 
-pub const ANSWERABILITY_PROMPT: &str = "Return exactly one value and nothing else: AnswerFromContext or NeedsNewWork.\n\nClassify whether the existing conversation and task evidence are sufficient to answer the incoming message accurately. Choose AnswerFromContext when the answer can be grounded in the available evidence, even if it requires a simple inference. Choose NeedsNewWork only when relevant evidence is missing, stale, or contradictory. Do not call tools and do not explain your choice.";
+pub const ANSWERABILITY_PROMPT: &str = "Return only `AnswerFromContext` if the supplied context supports an accurate answer, including simple inference. Otherwise return `NeedsNewWork`, especially for missing, stale, or contradictory evidence.";
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InteractionDecision {

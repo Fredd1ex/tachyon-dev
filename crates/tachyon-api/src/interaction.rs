@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{EventEnvelope, LifetimeClass};
+use crate::{AgentState, EventEnvelope, LifetimeClass};
 
 pub const INTERACTION_PROTOCOL_VERSION: u16 = 1;
 
@@ -54,7 +54,16 @@ pub enum InteractionCommand {
     AcceptUserTurn { text: String },
     CancelConversation { reason: String },
     PublishBackgroundUpdate { event: EventEnvelope },
+    RestoreOperationalState { sessions: Vec<RecoveredSession> },
     NotifyUser { text: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveredSession {
+    pub session_id: String,
+    pub task_type: String,
+    pub description: String,
+    pub state: AgentState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,6 +200,28 @@ mod tests {
         assert!(wire.contains(r#""intent":"start_tasks""#));
         assert_eq!(
             serde_json::from_str::<InteractionEventEnvelope>(&wire).unwrap(),
+            envelope
+        );
+    }
+
+    #[test]
+    fn operational_recovery_is_a_typed_non_user_command() {
+        let envelope = InteractionCommandEnvelope {
+            metadata: metadata(),
+            command: InteractionCommand::RestoreOperationalState {
+                sessions: vec![RecoveredSession {
+                    session_id: "worker-1".into(),
+                    task_type: "research".into(),
+                    description: "compare sources".into(),
+                    state: AgentState::Waiting,
+                }],
+            },
+        };
+        let wire = serde_json::to_string(&envelope).unwrap();
+        assert!(!wire.contains('\n'));
+        assert!(wire.contains(r#""command":"restore_operational_state""#));
+        assert_eq!(
+            serde_json::from_str::<InteractionCommandEnvelope>(&wire).unwrap(),
             envelope
         );
     }

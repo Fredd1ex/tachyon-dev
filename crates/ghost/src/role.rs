@@ -172,12 +172,9 @@ mod tests {
         let worker = AgentRole::Worker.system_prompt(&cfg);
         assert!(worker.contains("`ipython`"));
         assert!(worker.contains("`agent_browser`"));
-        assert!(worker.contains("preconfigured Lightpanda engine"));
-        assert!(worker.contains("prefer `read <URL>`"));
-        assert!(worker.contains("`snapshot -i -c`"));
-        assert!(worker.contains("fresh snapshot"));
         assert!(!worker.contains("`spawn_agent`"));
         assert!(worker.contains("assigned workspace"));
+        assert!(worker.len() < 750);
     }
 
     #[test]

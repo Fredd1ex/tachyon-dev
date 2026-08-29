@@ -25,14 +25,14 @@ impl ToolSchema {
 pub fn spawn_agent() -> ToolSchema {
     ToolSchema::new(
         "spawn_agent",
-        "Delegate one objective to a worker. Use short for disposable work, long for reusable work, or persistent for durable work. Independent objectives may be delegated together.",
+        "Delegate one objective requiring fresh work.",
         json!({
             "type": "object",
             "properties": {
-                "task": { "type": "string", "description": "Objective to complete." },
-                "cwd": { "type": "string", "description": "Optional workspace." },
+                "task": { "type": "string" },
+                "cwd": { "type": "string" },
                 "lifetime_class": { "type": "string", "enum": ["short", "long", "persistent"], "default": "long" },
-                "purpose": { "type": "string", "description": "Objective label." }
+                "purpose": { "type": "string" }
             },
             "required": ["task"],
             "additionalProperties": false,
@@ -43,11 +43,11 @@ pub fn spawn_agent() -> ToolSchema {
 pub fn respond() -> ToolSchema {
     ToolSchema::new(
         "respond",
-        "Respond directly only when the request can be answered accurately from the conversation or stable general knowledge and requires no fresh evidence, external retrieval, or execution. If information is missing, current, environment-dependent, or must be verified, use spawn_agent or spawn_agents instead.",
+        "Return the final response when no fresh retrieval or execution is required.",
         json!({
             "type": "object",
             "properties": {
-                "response": { "type": "string", "description": "The complete natural response to the user." }
+                "response": { "type": "string" }
             },
             "required": ["response"],
             "additionalProperties": false,
@@ -58,14 +58,13 @@ pub fn respond() -> ToolSchema {
 pub fn spawn_agents() -> ToolSchema {
     ToolSchema::new(
         "spawn_agents",
-        "Start independent worker objectives concurrently. Use short, long, or persistent lifetime as appropriate.",
+        "Delegate independent objectives concurrently.",
         json!({
             "type": "object",
             "properties": {
                 "tasks": {
                     "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Independent objectives."
+                    "items": { "type": "string" }
                 },
                 "lifetime_class": { "type": "string", "enum": ["short", "long", "persistent"], "default": "long" }
             },
@@ -163,4 +162,21 @@ pub fn agent_replan() -> ToolSchema {
         "Replace a worker with a new objective, retaining its identity and dependencies.",
         true,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversation_schema_budget_stays_compact() {
+        let schemas = [spawn_agent(), spawn_agents()];
+        let chars = schemas
+            .iter()
+            .map(|schema| {
+                schema.name.len() + schema.description.len() + schema.parameters.to_string().len()
+            })
+            .sum::<usize>();
+        assert!(chars < 900, "conversation schemas grew to {chars} chars");
+    }
 }

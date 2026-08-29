@@ -180,7 +180,8 @@ Status: complete and behavior-preserving.
   compatibility adapt them to model transport schemas.
 - Tachyond resolves `TACHYON_FOREGROUND_BIN` or the sibling
   `tachyon-foreground` binary and supervises it separately from workers.
-- Replaced the legacy `orch` runtime identity with the stable `foreground` ID.
+- Replaced the abbreviated legacy runtime identity with the stable `foreground`
+  ID.
   API requests are `ForegroundChat` and `ForegroundSubscribe`, and structured
   events use `Actor::Foreground`. Legacy serialized request/actor names remain
   decode aliases only.
@@ -196,6 +197,19 @@ Status: complete and behavior-preserving.
 - Model routing, prompts, required-tool behavior, DSML suppression/recovery,
   ordered commits, and concurrent independent turns.
 - Worker process topology and Tachyond lifecycle authority.
+
+### Verification
+
+```text
+cargo check --workspace --all-targets
+cargo test --workspace
+cargo build --workspace
+cargo tree -p tachyon-foreground --depth 1
+cargo tree -p tachyon-orchestrator --depth 1
+```
+
+All pass. The dependency trees confirm that Foreground does not depend on Ghost
+and orchestration policy does not depend on model transport.
 
 ### Remaining Coupling After Slice 3B
 

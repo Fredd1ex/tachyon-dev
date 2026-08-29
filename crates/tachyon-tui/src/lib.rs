@@ -42,7 +42,7 @@ use ratatui::Terminal;
 use tachyon_api::types::{
     Actor, AgentEvent, AgentInfo, AgentState, ApiResponse, DaemonInfo, EventEnvelope, EventStream,
 };
-use tachyon_api::FOREGROUND_ID;
+use tachyon_api::{InteractionEvent, InteractionEventEnvelope, FOREGROUND_ID};
 
 use tachyon_client::{Client, Subscription};
 
@@ -451,6 +451,10 @@ enum TuiEvent {
         agent_id: String,
         envelope: EventEnvelope,
     },
+    Interaction {
+        agent_id: String,
+        envelope: InteractionEventEnvelope,
+    },
     Ended {
         agent_id: String,
         summary: String,
@@ -822,6 +826,7 @@ pub fn run() -> io::Result<()> {
     let (sub_out, sub_rx) = mpsc::channel::<TuiEvent>();
     let mut subscribed: HashMap<String, ()> = HashMap::new();
     let mut seen_events: HashSet<(String, u64)> = HashSet::new();
+    let mut seen_interactions: HashSet<(String, String, u64)> = HashSet::new();
     let mut agent_infos: HashMap<String, AgentInfo> = HashMap::new();
     let config = tachyon_util::config::Config::load();
     let mut daemon: Option<DaemonInfo> = None;
@@ -912,6 +917,33 @@ pub fn run() -> io::Result<()> {
         while let Ok(ev) = sub_rx.try_recv() {
             redraw = true;
             match ev {
+                TuiEvent::Interaction { agent_id, envelope } => {
+                    let identity = (
+                        envelope.metadata.conversation_id.clone(),
+                        envelope.metadata.message_id.clone(),
+                        envelope.metadata.generation,
+                    );
+                    if !seen_interactions.insert(identity) {
+                        continue;
+                    }
+                    let is_foreground = agent_id == FOREGROUND_ID;
+                    let idx = find_or_create_thread(&mut threads, &agent_id, is_foreground, None);
+                    match &envelope.event {
+                        InteractionEvent::UserTurnAccepted { .. }
+                        | InteractionEvent::ConversationDelta { .. }
+                        | InteractionEvent::ConversationIntentProduced { .. } => {
+                            foreground_busy = true;
+                            foreground_activity = "working".into();
+                        }
+                        InteractionEvent::ConversationFinished { .. }
+                        | InteractionEvent::ForegroundRequestTimedOut { .. } => {
+                            foreground_busy = false;
+                            foreground_activity = "working".into();
+                        }
+                        InteractionEvent::UserVisibleNotificationPublished { .. } => {}
+                    }
+                    apply_interaction_event(&mut threads[idx], envelope);
+                }
                 TuiEvent::Structured { agent_id, envelope } => {
                     if !accept_event(&mut seen_events, &envelope) {
                         continue;
@@ -1558,17 +1590,7 @@ fn classify_line(t: &mut Thread, text: &str) {
         // Reconcile the optimistic local message with the daemon-assigned turn
         // instead of retaining a second uncorrelated conversation history.
         let body = text["[user]".len()..].trim_start();
-        if let Some(index) = t.items.iter().rposition(|item| {
-            item.kind == ItemKind::User && item.turn.is_none() && item.text.trim() == body
-        }) {
-            t.items[index].turn = turn.clone();
-            if let Some(pending) = t.items[index + 1..]
-                .iter_mut()
-                .find(|item| item.kind == ItemKind::PendingReply && item.turn.is_none())
-            {
-                pending.turn = turn;
-            }
-        }
+        accept_user_turn(t, body, turn);
         return;
     } else if let Some(rest) = text.strip_prefix("[tool-result:") {
         if let Some((id, output)) = rest.split_once("] ") {
@@ -1639,6 +1661,54 @@ fn classify_line(t: &mut Thread, text: &str) {
     } else if !text.trim().is_empty() {
         // Plain content glues onto whatever the thread was doing.
         t.add(ItemKind::System, text.to_string());
+    }
+}
+
+fn accept_user_turn(thread: &mut Thread, text: &str, turn: Option<String>) {
+    if let Some(index) = thread.items.iter().rposition(|item| {
+        item.kind == ItemKind::User && item.turn.is_none() && item.text.trim() == text.trim()
+    }) {
+        thread.items[index].turn = turn.clone();
+        if let Some(pending) = thread.items[index + 1..]
+            .iter_mut()
+            .find(|item| item.kind == ItemKind::PendingReply && item.turn.is_none())
+        {
+            pending.turn = turn;
+        }
+    }
+}
+
+fn apply_interaction_event(thread: &mut Thread, envelope: InteractionEventEnvelope) {
+    let turn = envelope.metadata.turn_id;
+    match envelope.event {
+        InteractionEvent::UserTurnAccepted { text } => accept_user_turn(thread, &text, turn),
+        InteractionEvent::ConversationDelta { text } => {
+            thread.add_reply_fragment(text, turn, false)
+        }
+        InteractionEvent::ConversationFinished { text } => thread.finish_reply(text, turn),
+        InteractionEvent::ConversationIntentProduced { .. } => thread.touch(),
+        InteractionEvent::ForegroundRequestTimedOut { deadline_ms } => {
+            if let Some(pending) = thread
+                .items
+                .iter_mut()
+                .rev()
+                .find(|item| item.kind == ItemKind::PendingReply && item.turn == turn)
+            {
+                pending.kind = ItemKind::Error;
+                pending.text = format!("request timed out after {deadline_ms}ms");
+            } else {
+                thread.add_turn(
+                    ItemKind::Error,
+                    format!("request timed out after {deadline_ms}ms"),
+                    turn,
+                );
+            }
+            thread.streaming = false;
+            thread.touch();
+        }
+        InteractionEvent::UserVisibleNotificationPublished { text } => {
+            thread.add_turn(ItemKind::System, text, turn)
+        }
     }
 }
 
@@ -4380,6 +4450,10 @@ fn accept_event(seen: &mut HashSet<(String, u64)>, envelope: &EventEnvelope) -> 
     envelope.event_id == 0 || seen.insert((envelope.session_id.clone(), envelope.event_id))
 }
 
+fn decode_interaction_event(data: &str) -> Option<InteractionEventEnvelope> {
+    serde_json::from_str(data).ok()
+}
+
 fn spawn_stream_thread(agent_id: String, to_ui: mpsc::Sender<TuiEvent>) {
     std::thread::spawn(move || {
         let mut sub = match Subscription::open(&agent_id) {
@@ -4395,6 +4469,18 @@ fn spawn_stream_thread(agent_id: String, to_ui: mpsc::Sender<TuiEvent>) {
         while let Some(resp) = sub.next() {
             match resp {
                 ApiResponse::Event { stream, data } => {
+                    if let Some(envelope) = decode_interaction_event(&data) {
+                        if to_ui
+                            .send(TuiEvent::Interaction {
+                                agent_id: agent_id.clone(),
+                                envelope,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
                     let envelope = serde_json::from_str::<EventEnvelope>(&data).or_else(|_| {
                         serde_json::from_str::<AgentEvent>(&data).map(|kind| EventEnvelope {
                             event_id: 0,
@@ -4483,6 +4569,65 @@ mod tests {
             occurred_at_ms: 1,
             kind,
         }
+    }
+
+    fn interaction(event: InteractionEvent) -> InteractionEventEnvelope {
+        InteractionEventEnvelope {
+            metadata: tachyon_api::InteractionMetadata {
+                protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
+                message_id: "event-1".into(),
+                correlation_id: "turn-2".into(),
+                causation_id: Some("command-1".into()),
+                conversation_id: FOREGROUND_ID.into(),
+                turn_id: Some("2".into()),
+                generation: 1,
+                occurred_at_ms: 1,
+            },
+            event,
+        }
+    }
+
+    #[test]
+    fn typed_interaction_stream_projects_one_final_reply() {
+        let mut thread = Thread::new_foreground();
+        thread.add(ItemKind::User, "hello".into());
+        thread.reserve_reply();
+
+        apply_interaction_event(
+            &mut thread,
+            interaction(InteractionEvent::UserTurnAccepted {
+                text: "hello".into(),
+            }),
+        );
+        apply_interaction_event(
+            &mut thread,
+            interaction(InteractionEvent::ConversationDelta { text: "Hi ".into() }),
+        );
+        apply_interaction_event(
+            &mut thread,
+            interaction(InteractionEvent::ConversationFinished {
+                text: "Hi there.".into(),
+            }),
+        );
+
+        assert_eq!(thread.items.len(), 2);
+        assert_eq!(thread.items[0].turn.as_deref(), Some("2"));
+        assert_eq!(thread.items[1].kind, ItemKind::Reply);
+        assert_eq!(thread.items[1].text, "Hi there.");
+        assert!(!thread.streaming);
+    }
+
+    #[test]
+    fn interaction_envelope_is_decoded_before_line_fallback() {
+        let wire = serde_json::to_string(&interaction(InteractionEvent::ConversationFinished {
+            text: "done".into(),
+        }))
+        .unwrap();
+        let decoded = decode_interaction_event(&wire).expect("typed interaction event");
+        assert!(matches!(
+            decoded.event,
+            InteractionEvent::ConversationFinished { text } if text == "done"
+        ));
     }
 
     #[test]

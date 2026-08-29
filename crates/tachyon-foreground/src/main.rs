@@ -12,13 +12,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use futures_util::future::join_all;
 use interaction::{
-    assess_answerability, chat_requiring_decision, classify, synthesize_spoken_response,
+    assess_answerability, chat_with_delegation, classify, policy_context,
+    synthesize_spoken_response,
 };
 use tachyon_api::transport::Connection;
 use tachyon_api::types::{
     Actor, AgentEvent, ApiRequest, ApiResponse, EventEnvelope, EventStream, LifetimeClass,
 };
-use tachyon_api::{InteractionCommand, InteractionCommandEnvelope};
+use tachyon_api::{
+    InteractionCommand, InteractionCommandEnvelope, InteractionEvent, InteractionEventEnvelope,
+    InteractionIntent, InteractionMetadata, RecoveredSession, TaskIntent, FOREGROUND_ID,
+};
 use tachyon_model::{ChatMessage, Content, Model, Role, TokenUsage, ToolCall, ToolSpec};
 use tachyon_orchestrator::conversation::policy::{
     execution_policy, publication_requires_dependency, Answerability, InteractionDecision,
@@ -48,18 +52,10 @@ impl AgentRole {
         )
     }
 
-    fn tools(self, force_delegation: bool) -> Vec<ToolSpec> {
-        let capabilities = if force_delegation {
-            tachyon_orchestrator::conversation::DELEGATION_CAPABILITIES
-        } else {
-            tachyon_orchestrator::conversation::CAPABILITIES
-        };
-        capabilities
+    fn tools(self, _force_delegation: bool) -> Vec<ToolSpec> {
+        tachyon_orchestrator::conversation::CAPABILITIES
             .iter()
             .map(|capability| match capability {
-                tachyon_orchestrator::capabilities::Capability::Respond => {
-                    tachyon_orchestrator::tools::respond()
-                }
                 tachyon_orchestrator::capabilities::Capability::DelegateOne => {
                     tachyon_orchestrator::tools::spawn_agent()
                 }
@@ -128,8 +124,16 @@ enum EvidenceRecord {
 }
 
 enum ChatInput {
-    User(String),
+    User {
+        text: String,
+        metadata: InteractionMetadata,
+    },
     Evidence(EvidenceRecord),
+    Recovery(Vec<RecoveredSession>),
+    Notification {
+        text: String,
+        metadata: InteractionMetadata,
+    },
     Ignore,
 }
 
@@ -157,6 +161,7 @@ struct EventContext {
 
 static EVENT_CONTEXT: OnceLock<EventContext> = OnceLock::new();
 static EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static LEGACY_INPUT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn main() -> ExitCode {
     if let Some(code) = tachyon_util::guard::guard_or_exit_code() {
@@ -249,6 +254,7 @@ async fn run_chat(
     let (turn_tx, mut turn_rx) = tokio::sync::mpsc::channel::<(
         u64,
         String,
+        InteractionMetadata,
         bool,
         InteractionDecision,
         TokenUsage,
@@ -263,12 +269,13 @@ async fn run_chat(
     let processor_state_changed = Arc::clone(&state_changed);
     let processor_checkpoint_tx = checkpoint_tx.clone();
     tokio::spawn(async move {
-        while let Some((turn, text, queued, decision, routing_usage, accepted_at)) =
+        while let Some((turn, text, metadata, queued, decision, routing_usage, accepted_at)) =
             turn_rx.recv().await
         {
             let args = (
                 turn,
                 text,
+                metadata,
                 queued,
                 decision,
                 routing_usage,
@@ -289,8 +296,8 @@ async fn run_chat(
     let stdin = tokio::io::stdin();
     let mut reader = tokio::io::BufReader::new(stdin).lines();
     while let Ok(Some(line)) = reader.next_line().await {
-        let text = match decode_chat_input(&line, role) {
-            ChatInput::User(text) => text,
+        let (text, mut metadata) = match decode_chat_input(&line, role) {
+            ChatInput::User { text, metadata } => (text, metadata),
             ChatInput::Evidence(record) => {
                 if matches!(record.event(), AgentEvent::WorkerCompleted { .. }) {
                     let mut state = conversation.lock().unwrap();
@@ -306,9 +313,37 @@ async fn run_chat(
                 }
                 continue;
             }
+            ChatInput::Recovery(sessions) => {
+                if !sessions.is_empty() {
+                    let summary = sessions
+                        .iter()
+                        .map(|session| format!("{} ({})", session.description, session.state))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    emit_interaction_event(
+                        &synthetic_interaction_metadata(None),
+                        InteractionEvent::UserVisibleNotificationPublished {
+                            text: format!("Recovered persistent work: {summary}"),
+                        },
+                    );
+                }
+                continue;
+            }
+            ChatInput::Notification { text, metadata } => {
+                emit_interaction_event(
+                    &metadata,
+                    InteractionEvent::UserVisibleNotificationPublished { text },
+                );
+                continue;
+            }
             ChatInput::Ignore => continue,
         };
         let turn = next_turn.fetch_add(1, Ordering::Relaxed);
+        metadata.turn_id = Some(turn.to_string());
+        emit_interaction_event(
+            &metadata,
+            InteractionEvent::UserTurnAccepted { text: text.clone() },
+        );
         let accepted_at = std::time::Instant::now();
         let (queued, classifier_context) = {
             let mut active = active_turns.lock().unwrap();
@@ -326,6 +361,7 @@ async fn run_chat(
                 .send((
                     turn,
                     text,
+                    metadata,
                     false,
                     InteractionDecision::WaitForActiveTurn,
                     TokenUsage::default(),
@@ -344,6 +380,7 @@ async fn run_chat(
         let classifier_tx = turn_tx.clone();
         let classifier_model = model.clone();
         let classifier_active_turns = Arc::clone(&active_turns);
+        let classifier_metadata = metadata.clone();
         tokio::spawn(async move {
             let (decision, usage) = if let Some(model) = classifier_model {
                 tokio::time::timeout(
@@ -369,7 +406,15 @@ async fn run_chat(
                 elapsed_ms: accepted_at.elapsed().as_millis() as u64,
             });
             if classifier_tx
-                .send((turn, text, true, decision, usage, accepted_at))
+                .send((
+                    turn,
+                    text,
+                    classifier_metadata,
+                    true,
+                    decision,
+                    usage,
+                    accepted_at,
+                ))
                 .await
                 .is_err()
             {
@@ -384,6 +429,7 @@ async fn process_turn(
     args: (
         u64,
         String,
+        InteractionMetadata,
         bool,
         InteractionDecision,
         TokenUsage,
@@ -400,6 +446,7 @@ async fn process_turn(
     let (
         turn,
         text,
+        metadata,
         queued,
         decision,
         mut auxiliary_usage,
@@ -423,7 +470,12 @@ async fn process_turn(
             "[foreground:error] model is not configured (set OPENROUTER_API_KEY and restart the daemon)"
                 .into(),
         );
-        emit_turn_block(Some(turn), "[agent]", answer);
+        emit_interaction_event(
+            &metadata,
+            InteractionEvent::ConversationFinished {
+                text: answer.into(),
+            },
+        );
         let mut current = conversation.lock().unwrap();
         current.pending.insert(
             turn,
@@ -475,11 +527,11 @@ async fn process_turn(
             })
             .collect::<Vec<_>>();
         if !relevant.is_empty() {
-            local.push(ChatMessage::new(Role::System, relevant.join("\n\n")));
+            local.push(ChatMessage::new(Role::User, relevant.join("\n\n")));
         }
     }
     let answerability = if publication_requires_dependency(queued, decision) {
-        let context = serde_json::to_string(&local).unwrap_or_default();
+        let context = policy_context(&local);
         let (answerability, usage) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             assess_answerability(&model, &context, &text),
@@ -495,16 +547,12 @@ async fn process_turn(
     };
     let policy = execution_policy(answerability);
 
-    // Correlated evidence is private turn context, not durable assistant prose.
-    // Commit only the accepted user message and this turn's generated records.
-    let base_len = local.len();
     local.push(ChatMessage::new(Role::User, text.clone()));
-    println!("[turn:{turn}] [user] {text}");
     emit_turn(Some(turn), "[status] working".into());
     // Routing controls scheduling only. A separate answerability decision
     // controls whether dependent turns may answer without fresh work.
     let tools_enabled = true;
-    match loop_until_done(
+    let final_answer = match loop_until_done(
         &model,
         &mut local,
         role,
@@ -514,12 +562,12 @@ async fn process_turn(
         policy.answer_from_context,
         true,
         Some(accepted_at),
+        Some(&metadata),
     )
     .await
     {
         Ok(Turn::Done(answer, mut usage)) => {
             usage += auxiliary_usage;
-            record_final_answer(&mut local, &answer);
             emit_event(AgentEvent::Usage {
                 turn: Some(turn),
                 prompt_tokens: usage.prompt_tokens,
@@ -531,12 +579,18 @@ async fn process_turn(
                 stage: "publication_started".into(),
                 elapsed_ms: accepted_at.elapsed().as_millis() as u64,
             });
-            emit_turn_block(Some(turn), "[agent]", &answer);
+            emit_interaction_event(
+                &metadata,
+                InteractionEvent::ConversationFinished {
+                    text: answer.clone(),
+                },
+            );
             emit_event(AgentEvent::Timing {
                 turn,
                 stage: "completed".into(),
                 elapsed_ms: accepted_at.elapsed().as_millis() as u64,
             });
+            answer
         }
         Ok(Turn::MaxIterations(mut usage)) => {
             usage += auxiliary_usage;
@@ -548,22 +602,32 @@ async fn process_turn(
             });
             let answer =
                 "I couldn't complete that request because the agent reached its processing limit.";
-            record_final_answer(&mut local, answer);
             emit_turn(Some(turn), "[foreground:error] max iterations".into());
-            emit_turn_block(Some(turn), "[agent]", answer);
+            emit_interaction_event(
+                &metadata,
+                InteractionEvent::ConversationFinished {
+                    text: answer.into(),
+                },
+            );
+            answer.into()
         }
         Err(error) => {
             let answer =
                 "I couldn't complete that request because the agent encountered an internal error.";
-            record_final_answer(&mut local, answer);
             emit_turn(Some(turn), format!("[foreground:error] {error}"));
-            emit_turn_block(Some(turn), "[agent]", answer);
+            emit_interaction_event(
+                &metadata,
+                InteractionEvent::ConversationFinished {
+                    text: answer.into(),
+                },
+            );
+            answer.into()
         }
-    }
+    };
     let mut current = conversation.lock().unwrap();
     current
         .pending
-        .insert(turn, local.into_iter().skip(base_len).collect());
+        .insert(turn, durable_turn_messages(text, final_answer));
     commit_ready_turns(&mut current);
     let _ = checkpoint_tx.send(checkpoint_snapshot(&current));
     state_changed.notify_waiters();
@@ -819,6 +883,35 @@ fn emit_event(event: AgentEvent) {
     }
 }
 
+fn emit_interaction_event(metadata: &InteractionMetadata, event: InteractionEvent) {
+    let sequence = EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut event_metadata = metadata.clone();
+    event_metadata.protocol_version = tachyon_api::INTERACTION_PROTOCOL_VERSION;
+    event_metadata.message_id = format!("interaction-event-{sequence}");
+    event_metadata.causation_id = Some(metadata.message_id.clone());
+    event_metadata.occurred_at_ms = unix_now_ms();
+    let envelope = InteractionEventEnvelope {
+        metadata: event_metadata,
+        event,
+    };
+    if let Ok(data) = serde_json::to_string(&envelope) {
+        println!("{data}");
+    }
+}
+
+fn synthetic_interaction_metadata(turn: Option<u64>) -> InteractionMetadata {
+    let sequence = LEGACY_INPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let message_id = format!("legacy-input-{sequence}");
+    let conversation_id = EVENT_CONTEXT
+        .get()
+        .and_then(|context| context.conversation_id.clone())
+        .unwrap_or_else(|| FOREGROUND_ID.into());
+    let mut metadata =
+        InteractionMetadata::new(&message_id, &message_id, conversation_id, unix_now_ms());
+    metadata.turn_id = turn.map(|turn| turn.to_string());
+    metadata
+}
+
 fn init_event_context(_role: AgentRole, agent_id: Option<&str>) {
     let session_id = agent_id
         .map(str::to_string)
@@ -867,21 +960,27 @@ fn decode_chat_input(line: &str, role: AgentRole) -> ChatInput {
             if envelope.metadata.protocol_version != tachyon_api::INTERACTION_PROTOCOL_VERSION {
                 return ChatInput::Ignore;
             }
+            let metadata = envelope.metadata;
             return match envelope.command {
                 InteractionCommand::AcceptUserTurn { text } => {
                     let text = text.trim().to_string();
                     if text.is_empty() {
                         ChatInput::Ignore
                     } else {
-                        ChatInput::User(text)
+                        ChatInput::User { text, metadata }
                     }
                 }
                 InteractionCommand::PublishBackgroundUpdate { event } => {
                     ChatInput::Evidence(EvidenceRecord::Correlated(event))
                 }
+                InteractionCommand::RestoreOperationalState { sessions } => {
+                    ChatInput::Recovery(sessions)
+                }
+                InteractionCommand::NotifyUser { text } => {
+                    ChatInput::Notification { text, metadata }
+                }
                 InteractionCommand::BeginConversation { .. }
-                | InteractionCommand::CancelConversation { .. }
-                | InteractionCommand::NotifyUser { .. } => ChatInput::Ignore,
+                | InteractionCommand::CancelConversation { .. } => ChatInput::Ignore,
             };
         }
     }
@@ -893,7 +992,10 @@ fn decode_chat_input(line: &str, role: AgentRole) -> ChatInput {
             .map(ChatInput::Evidence)
             .unwrap_or(ChatInput::Ignore)
     } else {
-        ChatInput::User(text)
+        ChatInput::User {
+            text,
+            metadata: synthetic_interaction_metadata(None),
+        }
     }
 }
 
@@ -924,6 +1026,7 @@ async fn loop_until_done(
     mut answer_from_dependency: bool,
     stream_reply: bool,
     accepted_at: Option<std::time::Instant>,
+    interaction_metadata: Option<&InteractionMetadata>,
 ) -> Result<Turn, String> {
     let tools = tools_enabled.then(|| role.tools(force_delegation));
     let max_iter = 8;
@@ -955,10 +1058,14 @@ async fn loop_until_done(
                         });
                     }
                 }
-                emit_event(AgentEvent::ReplyDelta {
-                    turn,
-                    text: delta.to_string(),
-                });
+                if let Some(metadata) = interaction_metadata {
+                    emit_interaction_event(
+                        metadata,
+                        InteractionEvent::ConversationDelta {
+                            text: delta.to_string(),
+                        },
+                    );
+                }
             }
         };
         if let (Some(turn), Some(accepted_at)) = (turn, accepted_at) {
@@ -972,7 +1079,7 @@ async fn loop_until_done(
             answer_from_dependency = false;
             model.chat(conversation, None, &mut relay).await
         } else if role == AgentRole::Conversation && tools_enabled && !delegation_used {
-            chat_requiring_decision(
+            chat_with_delegation(
                 model,
                 conversation,
                 tools.as_deref().expect("conversation tools are enabled"),
@@ -996,20 +1103,25 @@ async fn loop_until_done(
         usage += completion.usage;
         let text_out = completion.text.trim().to_string();
         let mut tool_calls = completion.tool_calls.clone();
-        if role == AgentRole::Conversation
-            && direct_response(&tool_calls).is_some_and(|response| response.contains("DSML"))
-        {
-            tool_calls = dsml_delegation_call(&tool_calls, turn)
+        let mut protocol_recovered = false;
+        let dsml_response = direct_response(&tool_calls)
+            .filter(|response| response.contains("DSML"))
+            .or_else(|| text_out.contains("DSML").then(|| text_out.clone()));
+        if role == AgentRole::Conversation && dsml_response.is_some() {
+            tool_calls = dsml_response
+                .as_deref()
+                .and_then(|response| dsml_delegation_response(response, turn))
                 .or_else(|| fallback_delegation_call(conversation, turn))
                 .into_iter()
                 .collect();
+            protocol_recovered = !tool_calls.is_empty();
         }
         let has_delegation = tool_calls
             .iter()
             .any(|call| matches!(call.name.as_str(), "spawn_agent" | "spawn_agents"));
         let fallback_delegation =
             role == AgentRole::Conversation && force_delegation && !has_delegation;
-        if fallback_delegation {
+        if fallback_delegation || protocol_recovered {
             tool_calls.clear();
             if let Some(call) = fallback_delegation_call(conversation, turn) {
                 tool_calls.push(call);
@@ -1105,6 +1217,23 @@ async fn loop_until_done(
             }
             tool_jobs.push((tc, allowed));
         }
+        let tasks = tool_jobs
+            .iter()
+            .filter(|(call, allowed)| {
+                *allowed && matches!(call.name.as_str(), "spawn_agent" | "spawn_agents")
+            })
+            .flat_map(|(call, _)| task_intents(call))
+            .collect::<Vec<_>>();
+        if !tasks.is_empty() {
+            if let Some(metadata) = interaction_metadata {
+                emit_interaction_event(
+                    metadata,
+                    InteractionEvent::ConversationIntentProduced {
+                        intents: vec![InteractionIntent::StartTasks { tasks }],
+                    },
+                );
+            }
+        }
         let outputs_future = async {
             join_all(
                 tool_jobs
@@ -1160,10 +1289,14 @@ async fn loop_until_done(
                             });
                         }
                     }
-                    emit_event(AgentEvent::ReplyDelta {
-                        turn,
-                        text: delta.to_string(),
-                    });
+                    if let Some(metadata) = interaction_metadata {
+                        emit_interaction_event(
+                            metadata,
+                            InteractionEvent::ConversationDelta {
+                                text: delta.to_string(),
+                            },
+                        );
+                    }
                 }
             };
             let answer =
@@ -1196,8 +1329,7 @@ fn direct_response(tool_calls: &[ToolCall]) -> Option<String> {
     (!response.trim().is_empty()).then_some(response)
 }
 
-fn dsml_delegation_call(tool_calls: &[ToolCall], turn: Option<u64>) -> Option<ToolCall> {
-    let response = direct_response(tool_calls)?;
+fn dsml_delegation_response(response: &str, turn: Option<u64>) -> Option<ToolCall> {
     let name = response.split_once("invoke name=\"")?.1.split_once('"')?.0;
     let arguments = match name {
         "spawn_agent" => {
@@ -1244,18 +1376,11 @@ fn dsml_parameter<'a>(response: &'a str, name: &str) -> Option<&'a str> {
     Some(body.split_once("</")?.0.trim())
 }
 
-fn record_final_answer(conversation: &mut Vec<ChatMessage>, answer: &str) {
-    let already_recorded = conversation.last().is_some_and(|message| {
-        message.role == Role::Assistant
-            && message
-                .content
-                .iter()
-                .all(|content| matches!(content, Content::Text(_)))
-            && message.plain().trim() == answer.trim()
-    });
-    if !already_recorded {
-        conversation.push(ChatMessage::new(Role::Assistant, answer));
-    }
+fn durable_turn_messages(user: String, answer: String) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::new(Role::User, user),
+        ChatMessage::new(Role::Assistant, answer),
+    ]
 }
 
 fn fallback_delegation_call(conversation: &[ChatMessage], turn: Option<u64>) -> Option<ToolCall> {
@@ -1320,6 +1445,47 @@ fn usable_acknowledgement(text: &str) -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+fn task_intents(call: &ToolCall) -> Vec<TaskIntent> {
+    let value = serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap_or_default();
+    let lifetime_class = value
+        .get("lifetime_class")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    match call.name.as_str() {
+        "spawn_agent" => value
+            .get("task")
+            .and_then(|value| value.as_str())
+            .filter(|task| !task.trim().is_empty())
+            .map(|task| {
+                vec![TaskIntent {
+                    objective: task.into(),
+                    purpose: value
+                        .get("purpose")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .into(),
+                    lifetime_class,
+                }]
+            })
+            .unwrap_or_default(),
+        "spawn_agents" => value
+            .get("tasks")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str())
+            .filter(|task| !task.trim().is_empty())
+            .map(|task| TaskIntent {
+                objective: task.into(),
+                purpose: String::new(),
+                lifetime_class,
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1601,9 +1767,52 @@ mod tests {
         })
         .unwrap();
         match decode_chat_input(&line, AgentRole::Conversation) {
-            ChatInput::User(text) => assert_eq!(text, "first line\nsecond line"),
+            ChatInput::User { text, metadata } => {
+                assert_eq!(text, "first line\nsecond line");
+                assert_eq!(metadata.message_id, "command-1");
+                assert_eq!(metadata.correlation_id, "turn-1");
+            }
             _ => panic!("expected a user turn"),
         }
+    }
+
+    #[test]
+    fn operational_recovery_never_becomes_a_user_turn() {
+        let sessions = vec![RecoveredSession {
+            session_id: "worker-1".into(),
+            task_type: "research".into(),
+            description: "compare sources".into(),
+            state: tachyon_api::AgentState::Waiting,
+        }];
+        let line = serde_json::to_string(&InteractionCommandEnvelope {
+            metadata: interaction_metadata(),
+            command: InteractionCommand::RestoreOperationalState {
+                sessions: sessions.clone(),
+            },
+        })
+        .unwrap();
+        match decode_chat_input(&line, AgentRole::Conversation) {
+            ChatInput::Recovery(decoded) => assert_eq!(decoded, sessions),
+            _ => panic!("expected operational recovery"),
+        }
+    }
+
+    #[test]
+    fn delegation_calls_produce_provider_neutral_task_intents() {
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "spawn_agents".into(),
+            arguments: serde_json::json!({
+                "tasks": ["London weather", "Tokyo weather"],
+                "lifetime_class": "short"
+            })
+            .to_string(),
+        };
+        let intents = task_intents(&call);
+        assert_eq!(intents.len(), 2);
+        assert_eq!(intents[0].objective, "London weather");
+        assert_eq!(intents[1].objective, "Tokyo weather");
+        assert_eq!(intents[0].lifetime_class, LifetimeClass::Short);
     }
 
     #[test]
@@ -1746,13 +1955,16 @@ mod tests {
     }
 
     #[test]
-    fn visible_final_answer_is_recorded_exactly_once() {
-        let mut conversation = vec![ChatMessage::new(Role::User, "hello")];
-        record_final_answer(&mut conversation, "Hi.");
-        record_final_answer(&mut conversation, "Hi.");
+    fn durable_turn_contains_only_visible_transcript() {
+        let conversation = durable_turn_messages("hello".into(), "Hi.".into());
         assert_eq!(conversation.len(), 2);
+        assert_eq!(conversation[0].role, Role::User);
         assert_eq!(conversation[1].role, Role::Assistant);
         assert_eq!(conversation[1].plain(), "Hi.");
+        assert!(conversation
+            .iter()
+            .flat_map(|message| &message.content)
+            .all(|content| matches!(content, Content::Text(_))));
     }
 
     #[test]
@@ -1830,11 +2042,16 @@ mod tests {
             name: "respond".into(),
             arguments: serde_json::json!({ "response": response }).to_string(),
         };
-        let recovered = dsml_delegation_call(&[call], Some(7)).expect("delegation");
+        let legacy_response = direct_response(&[call]).expect("legacy response");
+        let recovered = dsml_delegation_response(&legacy_response, Some(7)).expect("delegation");
         assert_eq!(recovered.name, "spawn_agents");
         let arguments: serde_json::Value = serde_json::from_str(&recovered.arguments).unwrap();
         assert_eq!(arguments["tasks"].as_array().unwrap().len(), 2);
         assert_eq!(arguments["tasks"][1], "Get current Tokyo weather");
+
+        let direct = dsml_delegation_response(response, Some(8)).expect("direct delegation");
+        assert_eq!(direct.name, "spawn_agents");
+        assert_eq!(direct.id, "dsml-recovered-8");
     }
 
     #[test]

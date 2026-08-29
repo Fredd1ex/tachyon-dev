@@ -6,11 +6,11 @@ use tachyon_model::ToolSpec;
 pub fn ipython() -> ToolSpec {
     ToolSpec::new(
         "ipython",
-        "Run IPython code in the agent environment. Use normal Python for analysis and prefix shell commands with ! (for example, !rg pattern or !curl URL). The working directory is the agent workspace.",
+        "Run Python or one `!` shell command in the assigned workspace.",
         json!({
             "type": "object",
             "properties": {
-                "code": { "type": "string", "description": "IPython code to execute." }
+                "code": { "type": "string" }
             },
             "required": ["code"],
             "additionalProperties": false,
@@ -21,14 +21,31 @@ pub fn ipython() -> ToolSpec {
 pub fn agent_browser() -> ToolSpec {
     ToolSpec::new(
         "agent_browser",
-        "Use the fixed agent-browser CLI with its preconfigured Lightpanda engine. Prefer `read <URL>` for agent-readable research. For rendered interaction, use `open <URL>`, `snapshot -i -c`, current `@eN` refs, targeted `get text`, and `close`; refresh refs after navigation or page changes.",
+        "Use the fixed browser. Prefer `read <URL>` for text. For interaction use `open`, `snapshot -i -c`, current refs, fresh snapshots after changes, targeted `get text`, and `close`.",
         json!({
             "type": "object",
             "properties": {
-                "args": { "type": "string", "description": "Exactly one command's arguments after the fixed executable, such as `read <URL>`, `open <URL>`, `snapshot -i -c`, `click @e2`, `get text @e1`, or `close`. Do not include `agent-browser`, `--engine`, or an executable path." }
+                "args": { "type": "string", "description": "One command's arguments; omit the executable and engine options." }
             },
             "required": ["args"],
             "additionalProperties": false,
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_schema_budget_stays_compact() {
+        let schemas = [ipython(), agent_browser()];
+        let chars = schemas
+            .iter()
+            .map(|schema| {
+                schema.name.len() + schema.description.len() + schema.parameters.to_string().len()
+            })
+            .sum::<usize>();
+        assert!(chars < 850, "worker schemas grew to {chars} chars");
+    }
 }

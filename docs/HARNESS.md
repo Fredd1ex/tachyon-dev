@@ -271,8 +271,9 @@ persona = "Focused, task-oriented, and concise in execution reports."
 - Sends the tool schemas from `tools/mod.rs` as `tools`.
 
 Runtime overrides via env where useful (`TACHYON_MAX_ITERATIONS`,
-`GHOST_TIMEOUT`, `GHOST_OUTPUT_LIMIT`, `GHOST_CWD`); model defaults come from
-the CLI-managed config and credentials are resolved separately.
+`TACHYON_TOOL_OUTPUT_CONTEXT_CHARS`, `GHOST_TIMEOUT`, `GHOST_OUTPUT_LIMIT`,
+`GHOST_CWD`); model defaults come from the CLI-managed config and credentials
+are resolved separately.
 
 ## Agent loop (linear history)
 
@@ -281,11 +282,15 @@ the CLI-managed config and credentials are resolved separately.
 2. Call model (streaming) → assistant message
 3. If no tool_calls → StopReason::Completed, done
 4. For each tool_call: dispatch to ipython/agent_browser via ExecBackend → ToolResult
-5. Append assistant + tool results to conversation (linear; history == messages)
+5. Append assistant + bounded tool results to the active conversation
 6. Check max iterations (default 100) → StopReason::MaxIterations
 7. Truncate to token budget if needed
 8. Goto 2
 ```
+
+Full tool output remains available in diagnostic events. Only the model-context
+copy is bounded. At completed assignment boundaries, raw tool protocol is
+removed from warm-worker history while objectives and final findings remain.
 
 Interruption (Ctrl-C / later control channel): cancel in-flight exec + generation,
 stop with `StopReason::Interrupted`. Termination is immediate.

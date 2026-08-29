@@ -406,9 +406,10 @@ TUI updates must not add a user-visible wait.
 - Interaction classification runs asynchronously after a queued message is
   accepted. It has a short timeout and safely defaults to waiting for the active
   turn, so a slow routing request cannot block input.
-- A normal turn uses one tool-choice Conversation completion to select
-  `respond`, `spawn_agent`, or `spawn_agents`. It does not make a separate
-  fresh-work classifier request before the real completion.
+- A normal turn uses one Conversation completion. It answers with ordinary text
+  when existing context is sufficient, or selects `spawn_agent`/`spawn_agents`
+  for fresh work. It does not make a separate fresh-work classifier request or
+  pay for a synthetic direct-response tool schema.
 - Independent Background tasks are submitted concurrently through Tachyond.
 - Parallel work is an incremental evidence stream, not a single blocking batch.
   Each completed task publishes typed evidence immediately while unrelated tasks
@@ -438,8 +439,8 @@ TUI updates must not add a user-visible wait.
   events and conclude with one authoritative `Reply`. Completions that may
   contain planning or tool calls remain buffered. Context-only replies and
   post-worker synthesis run without tools, so their deltas are safe to publish.
-- Provider protocol markup emitted inside a textual `respond` argument is never
-  user-facing prose. The stream filters protocol markers across chunk
+- Provider protocol markup emitted in textual output is never user-facing
+  prose. The stream filters protocol markers across chunk
   boundaries; a recoverable nested delegation becomes a typed tool call, and a
   malformed one falls back to delegating the original user objective. The TUI
   also sanitizes final replies, rendered items, and persisted session history so
@@ -576,9 +577,9 @@ answers, safe typed reply streaming, and TUI event deduplication. Tachyond
 persists and forwards `logical_task_id`, `origin_turn_id`, `parent_task_id`, and
 `tool_call_id`. Ghost checkpoints the full correlated evidence envelope and
 uses origin-turn correlation for normal wakeups; lexical objective matching is
-retained only for legacy uncorrelated checkpoint evidence. Direct `respond`
-arguments stream through a strict incremental JSON decoder; planning content
-and delegation arguments remain private. Typed delegation may atomically reuse
+retained only for legacy uncorrelated checkpoint evidence. Direct responses use
+ordinary assistant text; protocol markup is filtered incrementally, while
+delegation arguments remain private. Typed delegation may atomically reuse
 a ready retained background worker with the same worker profile, lifetime, and
 workspace policy, clears old terminal replay before assignment, and bounds
 result waits. Persistent supervisors latch and replay typed readiness after a
