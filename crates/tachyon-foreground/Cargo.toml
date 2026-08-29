@@ -1,0 +1,20 @@
+[package]
+name = "tachyon-foreground"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tachyon user-facing Conversation runtime"
+
+[[bin]]
+name = "tachyon-foreground"
+path = "src/main.rs"
+
+[dependencies]
+futures-util = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tachyon-api.workspace = true
+tachyon-model.workspace = true
+tachyon-orchestrator.workspace = true
+tachyon-util.workspace = true

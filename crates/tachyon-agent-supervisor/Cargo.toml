@@ -1,0 +1,14 @@
+[package]
+name = "tachyon-agent-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tachyon-agent-supervisor"
+path = "src/main.rs"
+
+[dependencies]
+nix.workspace = true
+serde_json.workspace = true
+tachyon-api.workspace = true

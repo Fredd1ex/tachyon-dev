@@ -1,0 +1,19 @@
+[package]
+name = "tachyon-util"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared utilities for the Tachyon runtime (root guard, common helpers)"
+
+[dependencies]
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+fs2.workspace = true
+nix.workspace = true
+keyring.workspace = true
+tachyon-model.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring-core = "1"
+linux-keyutils-keyring-store = "1"

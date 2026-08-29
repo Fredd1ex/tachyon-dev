@@ -1,0 +1,11 @@
+[package]
+name = "tachyon-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Conversation, background, and memory orchestration policy for Tachyon"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+uuid.workspace = true

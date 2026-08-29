@@ -1,0 +1,10 @@
+[package]
+name = "tachyon-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "IPC client for talking to the Tachyon daemon"
+
+[dependencies]
+tachyon-api.workspace = true
+tachyon-util.workspace = true

@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["crates/ghost", "crates/memory", "crates/orchestrators", "crates/tachyon-foreground", "crates/tachyon-model", "crates/tachyond", "crates/tachyon-agent-supervisor", "crates/tachyon", "crates/tachyon-api", "crates/tachyon-client", "crates/tachyon-tui", "crates/tachyon-util"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+nix = { version = "0.29", features = ["signal", "process", "user"] }
+signal-hook = "0.3"
+fs2 = "0.4"
+shell-words = "1"
+keyring = { version = "4", features = ["v1"] }
+rpassword = "7"
+
+[workspace.dependencies.tachyon-util]
+path = "crates/tachyon-util"
+
+[workspace.dependencies.tachyon-api]
+path = "crates/tachyon-api"
+
+[workspace.dependencies.tachyon-client]
+path = "crates/tachyon-client"
+
+[workspace.dependencies.tachyon-tui]
+path = "crates/tachyon-tui"
+
+[workspace.dependencies.tachyon-orchestrator]
+path = "crates/orchestrators"
+
+[workspace.dependencies.tachyon-model]
+path = "crates/tachyon-model"

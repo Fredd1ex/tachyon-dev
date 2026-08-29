@@ -1,0 +1,18 @@
+[package]
+name = "tachyond"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tachyond — the persistent Tachyon daemon (Phase 2)"
+
+[[bin]]
+name = "tachyond"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+tachyon-api.workspace = true
+tachyon-util.workspace = true
+signal-hook.workspace = true
+nix.workspace = true
+tachyon-memory = { path = "../memory" }

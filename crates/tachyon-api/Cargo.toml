@@ -1,0 +1,10 @@
+[package]
+name = "tachyon-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared wire types for the Tachyon daemon IPC"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
