@@ -18,6 +18,7 @@ use interaction::{
 use tachyon_api::transport::Connection;
 use tachyon_api::types::{
     Actor, AgentEvent, ApiRequest, ApiResponse, EventEnvelope, EventStream, LifetimeClass,
+    WorkOutcome,
 };
 use tachyon_api::{
     InteractionCommand, InteractionCommandEnvelope, InteractionEvent, InteractionEventEnvelope,
@@ -151,6 +152,19 @@ impl EvidenceRecord {
             Self::Legacy(_) => None,
         }
     }
+}
+
+fn is_completed_evidence(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::WorkerCompleted { .. }
+            | AgentEvent::WorkResult {
+                result: tachyon_api::WorkResult {
+                    outcome: WorkOutcome::Completed { .. },
+                    ..
+                }
+            }
+    )
 }
 
 struct EventContext {
@@ -299,7 +313,7 @@ async fn run_chat(
         let (text, mut metadata) = match decode_chat_input(&line, role) {
             ChatInput::User { text, metadata } => (text, metadata),
             ChatInput::Evidence(record) => {
-                if matches!(record.event(), AgentEvent::WorkerCompleted { .. }) {
+                if is_completed_evidence(record.event()) {
                     let mut state = conversation.lock().unwrap();
                     if !state
                         .evidence
@@ -523,6 +537,21 @@ async fn process_turn(
                 ) => Some(format!(
                     "Available background evidence (worker {worker_id}, objective {objective}):\n{result}"
                 )),
+                AgentEvent::WorkResult {
+                    result:
+                        tachyon_api::WorkResult {
+                            work_id,
+                            objective,
+                            outcome: WorkOutcome::Completed { result, .. },
+                            ..
+                        },
+                } if evidence_relevant_to_follow_up(
+                    record,
+                    turn.saturating_sub(1),
+                    &text,
+                ) => Some(format!(
+                    "Available background evidence (work {work_id}, objective {objective}):\n{result}"
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -697,8 +726,17 @@ fn evidence_relevant_to_follow_up(
     prior_turn: u64,
     incoming: &str,
 ) -> bool {
-    let AgentEvent::WorkerCompleted { objective, .. } = record.event() else {
-        return false;
+    let objective = match record.event() {
+        AgentEvent::WorkerCompleted { objective, .. } => objective,
+        AgentEvent::WorkResult {
+            result:
+                tachyon_api::WorkResult {
+                    objective,
+                    outcome: WorkOutcome::Completed { .. },
+                    ..
+                },
+        } => objective,
+        _ => return false,
     };
     record
         .origin_turn()
@@ -857,6 +895,8 @@ fn emit_event(event: AgentEvent) {
     };
     let task_id = match &event {
         AgentEvent::WorkerCompleted { worker_id, .. } => Some(worker_id.clone()),
+        AgentEvent::WorkProgress { event } => Some(event.work_id.clone()),
+        AgentEvent::WorkResult { result } => Some(result.work_id.clone()),
         _ => None,
     };
     let fallback = EventContext {
@@ -936,7 +976,11 @@ fn event_turn(event: &AgentEvent) -> Option<u64> {
         | AgentEvent::WorkerStarted { turn, .. }
         | AgentEvent::Error { turn, .. } => *turn,
         AgentEvent::Timing { turn, .. } => Some(*turn),
-        AgentEvent::WorkerCompleted { .. } | AgentEvent::WorkerReleaseRequested { .. } => None,
+        AgentEvent::WorkerCompleted { .. }
+        | AgentEvent::WorkCandidate { .. }
+        | AgentEvent::WorkProgress { .. }
+        | AgentEvent::WorkResult { .. }
+        | AgentEvent::WorkerReleaseRequested { .. } => None,
     }
 }
 
@@ -1243,6 +1287,15 @@ async fn loop_until_done(
             .await
         };
         let outputs = outputs_future.await;
+        let delegation_succeeded =
+            tool_jobs
+                .iter()
+                .zip(&outputs)
+                .any(|((call, allowed), output)| {
+                    *allowed
+                        && matches!(call.name.as_str(), "spawn_agent" | "spawn_agents")
+                        && output.succeeded
+                });
         if delegation_in_this_batch {
             if let (Some(turn), Some(accepted_at)) = (turn, accepted_at) {
                 emit_event(AgentEvent::Timing {
@@ -1258,18 +1311,21 @@ async fn loop_until_done(
             emit_turn_block(
                 turn,
                 &format!("[tool-result:{}]", tc.id),
-                &truncate(&out, 600),
+                &truncate(&out.text, 600),
             );
             results.push(ChatMessage {
                 role: Role::Tool,
                 content: vec![Content::ToolResult {
                     id: tc.id.clone(),
-                    output: out,
+                    output: out.text,
                 }],
             });
         }
         conversation.extend(results);
         if role == AgentRole::Conversation && delegation_used {
+            if !delegation_succeeded {
+                return Ok(Turn::Done(delegation_failure_response(conversation), usage));
+            }
             if let (Some(turn), Some(accepted_at)) = (turn, accepted_at) {
                 emit_event(AgentEvent::Timing {
                     turn,
@@ -1338,7 +1394,7 @@ fn dsml_delegation_response(response: &str, turn: Option<u64>) -> Option<ToolCal
             serde_json::json!({
                 "task": task,
                 "purpose": dsml_parameter(&response, "description").unwrap_or("fresh work"),
-                "lifetime_class": "long"
+                "lifetime_class": "short"
             })
         }
         "spawn_agents" => {
@@ -1358,7 +1414,7 @@ fn dsml_delegation_response(response: &str, turn: Option<u64>) -> Option<ToolCal
             if tasks.is_empty() {
                 return None;
             }
-            serde_json::json!({ "tasks": tasks, "lifetime_class": "long" })
+            serde_json::json!({ "tasks": tasks, "lifetime_class": "short" })
         }
         _ => return None,
     };
@@ -1395,7 +1451,7 @@ fn fallback_delegation_call(conversation: &[ChatMessage], turn: Option<u64>) -> 
         name: "spawn_agent".into(),
         arguments: serde_json::json!({
             "task": task,
-            "lifetime_class": "long",
+            "lifetime_class": "short",
             "purpose": "fresh work"
         })
         .to_string(),
@@ -1454,7 +1510,7 @@ fn task_intents(call: &ToolCall) -> Vec<TaskIntent> {
         .get("lifetime_class")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default();
+        .unwrap_or(LifetimeClass::Short);
     match call.name.as_str() {
         "spawn_agent" => value
             .get("task")
@@ -1489,20 +1545,41 @@ fn task_intents(call: &ToolCall) -> Vec<TaskIntent> {
     }
 }
 
+struct ToolOutput {
+    text: String,
+    succeeded: bool,
+}
+
+impl ToolOutput {
+    fn success(text: String) -> Self {
+        Self {
+            text,
+            succeeded: true,
+        }
+    }
+
+    fn failure(text: String) -> Self {
+        Self {
+            text,
+            succeeded: false,
+        }
+    }
+}
+
 async fn run_tool(
     tc: &ToolCall,
     role: AgentRole,
     delegation_allowed: bool,
     turn: Option<u64>,
-) -> String {
+) -> ToolOutput {
     if !role.allows_tool(&tc.name) {
-        return format!("{} is not available to the {role:?} role", tc.name);
+        return ToolOutput::failure(format!("{} is not available to the {role:?} role", tc.name));
     }
     match tc.name.as_str() {
         "spawn_agent" => {
             let task = arg(&tc.arguments, "task");
             if !delegation_allowed {
-                return "Delegation has already been used for this turn. Synthesize an answer from the worker results already received; do not spawn another worker.".into();
+                return ToolOutput::failure("Delegation has already been used for this turn. Synthesize an answer from the worker results already received; do not spawn another worker.".into());
             }
             let cwd_arg = arg(&tc.arguments, "cwd");
             let cwd = (!cwd_arg.is_empty()).then_some(cwd_arg);
@@ -1512,7 +1589,7 @@ async fn run_tool(
                 .get("lifetime_class")
                 .cloned()
                 .and_then(|value| serde_json::from_value(value).ok())
-                .unwrap_or_default();
+                .unwrap_or(LifetimeClass::Short);
             let purpose = value
                 .get("purpose")
                 .and_then(|value| value.as_str())
@@ -1524,14 +1601,14 @@ async fn run_tool(
             })
             .await
             {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => format!("worker spawn failed: {error}"),
-                Err(error) => format!("worker spawn task failed: {error}"),
+                Ok(Ok(result)) => ToolOutput::success(result),
+                Ok(Err(error)) => ToolOutput::failure(format!("worker spawn failed: {error}")),
+                Err(error) => ToolOutput::failure(format!("worker spawn task failed: {error}")),
             }
         }
         "spawn_agents" => {
             if !delegation_allowed {
-                return "Delegation has already been used for this turn. Synthesize an answer from the worker results already received; do not spawn another worker.".into();
+                return ToolOutput::failure("Delegation has already been used for this turn. Synthesize an answer from the worker results already received; do not spawn another worker.".into());
             }
             let tasks = match serde_json::from_str::<serde_json::Value>(&tc.arguments)
                 .ok()
@@ -1539,13 +1616,17 @@ async fn run_tool(
                 .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
             {
                 Some(tasks) if !tasks.is_empty() => tasks,
-                _ => return "spawn_agents requires a non-empty tasks array".into(),
+                _ => {
+                    return ToolOutput::failure(
+                        "spawn_agents requires a non-empty tasks array".into(),
+                    );
+                }
             };
             let lifetime_class = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                 .ok()
                 .and_then(|value| value.get("lifetime_class").cloned())
                 .and_then(|value| serde_json::from_value(value).ok())
-                .unwrap_or_default();
+                .unwrap_or(LifetimeClass::Short);
             let jobs = tasks.into_iter().enumerate().map(|(index, task)| {
                 let lifetime_class = lifetime_class;
                 let correlation = delegation_correlation(tc, turn, Some(index));
@@ -1554,17 +1635,34 @@ async fn run_tool(
                 })
             });
             let results = join_all(jobs).await;
-            results
-                .into_iter()
-                .map(|result| match result {
-                    Ok(Ok(answer)) => answer,
-                    Ok(Err(error)) => format!("worker failed: {error}"),
-                    Err(error) => format!("worker task failed: {error}"),
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n")
+            let mut evidence = Vec::new();
+            let mut failures = Vec::new();
+            for result in results {
+                match result {
+                    Ok(Ok(answer)) => evidence.push(answer),
+                    Ok(Err(error)) => failures.push(format!("worker failed: {error}")),
+                    Err(error) => failures.push(format!("worker task failed: {error}")),
+                }
+            }
+            let succeeded = !evidence.is_empty();
+            let text = if succeeded {
+                evidence.join("\n\n")
+            } else {
+                failures.join("\n\n")
+            };
+            ToolOutput { text, succeeded }
         }
-        other => format!("unknown tool: {other}"),
+        other => ToolOutput::failure(format!("unknown tool: {other}")),
+    }
+}
+
+fn delegation_failure_response(conversation: &[ChatMessage]) -> String {
+    let evidence = compose_worker_response(conversation);
+    if evidence.contains("timed out waiting for a result") {
+        "I couldn't complete the lookup before its deadline, so I don't have reliable current information to answer that yet.".into()
+    } else {
+        "I couldn't complete the lookup, so I don't have reliable information to answer that yet."
+            .into()
     }
 }
 
@@ -1609,6 +1707,7 @@ fn spawn_via_daemon(
     purpose: String,
     correlation: DelegationCorrelation,
 ) -> Result<String, String> {
+    let work_id = correlation.logical_task_id.clone();
     let origin_turn = correlation
         .origin_turn_id
         .as_deref()
@@ -1622,7 +1721,7 @@ fn spawn_via_daemon(
             depends_on: Vec::new(),
             lifetime_class,
             purpose,
-            logical_task_id: Some(correlation.logical_task_id),
+            logical_task_id: Some(work_id.clone()),
             origin_turn_id: correlation.origin_turn_id,
             parent_task_id: correlation.parent_task_id,
             tool_call_id: correlation.tool_call_id,
@@ -1641,63 +1740,45 @@ fn spawn_via_daemon(
 
     let mut stream = Connection::connect(&socket).map_err(|e| e.to_string())?;
     stream
-        .send(&ApiRequest::AgentSubscribe { id: id.clone() })
+        .send(&ApiRequest::WorkSubscribe {
+            work_id: work_id.clone(),
+        })
         .map_err(|e| e.to_string())?;
-    let deadline = std::time::Instant::now() + worker_result_timeout();
-    let mut result: Option<String> = None;
     loop {
-        let remaining = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .ok_or_else(|| format!("worker {id} timed out waiting for a result"))?;
-        stream
-            .set_read_timeout(Some(remaining))
-            .map_err(|e| e.to_string())?;
-        match stream.recv().map_err(|error| {
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-            ) {
-                format!("worker {id} timed out waiting for a result")
-            } else {
-                error.to_string()
-            }
-        })? {
+        match stream.recv().map_err(|error| error.to_string())? {
             ApiResponse::Event {
                 stream: EventStream::Stdout,
                 data,
             } => {
-                if let Some(AgentEvent::WorkerCompleted { result: answer, .. }) =
-                    decode_event(&data)
-                {
-                    result = Some(answer);
-                    break;
+                if let Some(AgentEvent::WorkResult { result }) = decode_event(&data) {
+                    return match result.outcome {
+                        WorkOutcome::Completed { result, .. } => {
+                            println!("[worker:result] {id} {result}");
+                            Ok(result)
+                        }
+                        WorkOutcome::TimedOut { .. } => {
+                            Err(format!("worker {id} timed out waiting for a result"))
+                        }
+                        WorkOutcome::Failed { message } => Err(format!("worker {id}: {message}")),
+                        WorkOutcome::Blocked { reason } => {
+                            Err(format!("worker {id} blocked: {reason}"))
+                        }
+                        WorkOutcome::Cancelled { reason } => {
+                            Err(format!("worker {id} cancelled: {reason}"))
+                        }
+                    };
                 }
             }
             ApiResponse::Event {
                 stream: EventStream::Exit,
                 data,
             } => {
-                if result.is_none() {
-                    result = Some(data);
-                }
-                break;
+                return Err(format!("worker {id} exited without a work result: {data}"));
             }
             ApiResponse::Error { message, .. } => return Err(message),
             _ => {}
         }
     }
-    let answer = result.unwrap_or_else(|| "worker completed without a response".into());
-    println!("[worker:result] {id} {answer}");
-    Ok(answer)
-}
-
-fn worker_result_timeout() -> std::time::Duration {
-    let seconds = std::env::var("TACHYON_WORKER_RESULT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(60)
-        .max(1);
-    std::time::Duration::from_secs(seconds)
 }
 
 fn arg(args: &str, key: &str) -> String {
@@ -2003,6 +2084,26 @@ mod tests {
     }
 
     #[test]
+    fn failed_delegation_does_not_turn_timeout_into_factual_evidence() {
+        let conversation = vec![
+            ChatMessage::new(Role::User, "get current release information"),
+            ChatMessage {
+                role: Role::Tool,
+                content: vec![Content::ToolResult {
+                    id: "lookup".into(),
+                    output: "worker spawn failed: worker worker-1 timed out waiting for a result"
+                        .into(),
+                }],
+            },
+        ];
+
+        let response = delegation_failure_response(&conversation);
+        assert!(response.contains("before its deadline"));
+        assert!(!response.contains("worker"));
+        assert!(!response.contains("release"));
+    }
+
+    #[test]
     fn acknowledgement_filter_rejects_internal_planning() {
         assert_eq!(
             usable_acknowledgement("I will ask a worker to inspect this."),
@@ -2071,8 +2172,37 @@ mod tests {
             assert_eq!(call.name, "spawn_agent");
             let arguments: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
             assert_eq!(arguments["task"], objective);
-            assert_eq!(arguments["lifetime_class"], "long");
+            assert_eq!(arguments["lifetime_class"], "short");
         }
+    }
+
+    #[test]
+    fn only_completed_work_results_are_reusable_evidence() {
+        let completed = AgentEvent::WorkResult {
+            result: tachyon_api::WorkResult {
+                work_id: "work-1".into(),
+                objective: "inspect".into(),
+                generation: 0,
+                assignment: 0,
+                outcome: WorkOutcome::Completed {
+                    result: "verified".into(),
+                    artifacts: Vec::new(),
+                    context: String::new(),
+                    suggested_reuse: false,
+                },
+            },
+        };
+        let timeout = AgentEvent::WorkResult {
+            result: tachyon_api::WorkResult {
+                work_id: "work-2".into(),
+                objective: "inspect".into(),
+                generation: 0,
+                assignment: 0,
+                outcome: WorkOutcome::TimedOut { deadline_ms: 10 },
+            },
+        };
+        assert!(is_completed_evidence(&completed));
+        assert!(!is_completed_evidence(&timeout));
     }
 
     #[test]

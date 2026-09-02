@@ -31,13 +31,15 @@ presented as a context-aware decision.
 Retention is determined by the session's lifetime class. A completed task does
 not have one universal retention outcome:
 
-- **Short** workers are disposable one-off jobs. Tachyond releases them after
-  their successful result and cleans up their private workspace.
+- **Short** workers are disposable sessions with a three-assignment budget.
+  Tachyond releases them when that budget is exhausted and cleans up their
+  private workspace.
 - **Long** workers remain reusable while the current daemon is alive. The
   Orchestrator may release them explicitly or Tachyond may retire them through
   an expired lease or safety policy.
-- **Persistent** workers preserve their logical identity, workspace, and
-  checkpoints across daemon/process recovery. They require explicit release.
+- **Persistent** workers run under an independent supervisor. A graceful daemon
+  shutdown leaves the supervisor alive; the next daemon reattaches through its
+  control socket. They require explicit release.
 
 This keeps weather lookups and other one-off work from accumulating while still
 supporting development, data analysis, and ML workflows where the next useful
@@ -50,15 +52,17 @@ Orchestrator-selected policy hint that Tachyond enforces mechanically:
 
 | Class | Example | Default behavior |
 | --- | --- | --- |
-| `short` | Weather lookup or one-off fact check. | Release after a successful result; no reuse or restart recovery. |
+| `short` | Weather lookup or a small sequence of related checks. | Reuse for at most three completed assignments, then release; no restart recovery. |
 | `long` | Research, coding, or an ML project worker. | Retain and reuse during the current daemon lifetime; do not restore after daemon restart. |
 | `persistent` | A personal workspace or long-running service. | Preserve logical identity, workspace, artifacts, and checkpoints across process or daemon restarts; release explicitly. |
 
 The class belongs to the logical session, not the process. A session may be
 restarted while keeping its identity, workspace, artifacts, and conversation
-context. The Orchestrator may promote `short` to `long` when a result reveals
-future value, or promote `long` to `persistent` when restart recovery matters,
-but Tachyond must not silently downgrade a session.
+context. After verifying that a result satisfies its objective, the Background
+Coordinator may promote or demote the class as future needs become clear.
+Crossing the persistent boundary recreates an idle completed worker under the
+appropriate supervised or daemon-bound process topology. Tachyond alone applies
+the state transition and signals or kills the process.
 
 `long` optimizes for reuse during the current interaction. `persistent`
 optimizes for continuation over time and requires durable recovery metadata.
@@ -105,7 +109,7 @@ policy from raw process IDs:
 session       lifetime    state    purpose       retained  idle   action
 ml-project    persistent   waiting  ml-training   yes       2m     keep
 research      long         waiting  research      yes       8m     keep
-weather       short        completed weather      no        1m     release
+weather       short        completed weather      yes       1m     keep (1/3)
 browser-7     short        failed   lookup        no        -      release
 ```
 
@@ -118,12 +122,13 @@ lifetime class, retention state, and short-session budget. For example:
 
 ```text
 research  long  waiting  retained
-weather   short completed released  turns 1/1
+weather   short completed retained  turns 1/3
 ```
 
-Long and persistent sessions expose their retention state directly; short
-sessions normally disappear after completion unless the Orchestrator promotes
-them before work begins.
+Long and persistent sessions expose their retention state directly. Short
+sessions disappear after their third completed assignment unless the
+Coordinator promotes them; any idle completed session may also be explicitly
+released or reclassified after result verification.
 
 The `staged` state is the manual-intervention window. A staged worker remains
 alive until `stage_until_secs`; `agent_retain` returns it to `waiting` and

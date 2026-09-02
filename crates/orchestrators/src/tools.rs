@@ -31,7 +31,12 @@ pub fn spawn_agent() -> ToolSchema {
             "properties": {
                 "task": { "type": "string" },
                 "cwd": { "type": "string" },
-                "lifetime_class": { "type": "string", "enum": ["short", "long", "persistent"], "default": "long" },
+                "lifetime_class": {
+                    "type": "string",
+                    "enum": ["short", "long", "persistent"],
+                    "default": "short",
+                    "description": "short is reusable for at most 3 assignments, long lasts until this daemon exits, persistent survives daemon exit and is reattached on restart"
+                },
                 "purpose": { "type": "string" }
             },
             "required": ["task"],
@@ -66,7 +71,12 @@ pub fn spawn_agents() -> ToolSchema {
                     "type": "array",
                     "items": { "type": "string" }
                 },
-                "lifetime_class": { "type": "string", "enum": ["short", "long", "persistent"], "default": "long" }
+                "lifetime_class": {
+                    "type": "string",
+                    "enum": ["short", "long", "persistent"],
+                    "default": "short",
+                    "description": "short is reusable for at most 3 assignments, long lasts until this daemon exits, persistent survives daemon exit and is reattached on restart"
+                }
             },
             "required": ["tasks"],
             "additionalProperties": false,
@@ -126,13 +136,13 @@ pub fn agent_release() -> ToolSchema {
 pub fn agent_retain() -> ToolSchema {
     ToolSchema::new(
         "agent_retain",
-        "Retain a completed worker session and workspace for future related work. Retention is the default; optionally provide a Unix lease deadline.",
+        "Retain a verified completed worker and optionally promote or demote its lifecycle as the task evolves. Short allows 3 more assignments, long lasts until daemon exit, and persistent is reattached after daemon restart.",
         json!({
             "type": "object",
             "properties": {
                 "id": { "type": "string", "description": "The Tachyon agent id." },
                 "lease_until_secs": { "type": "integer", "description": "Optional Unix timestamp at which retention may expire." },
-                "lifetime_class": { "type": "string", "enum": ["short", "long", "persistent"], "description": "Optional promotion to a different lifetime policy." }
+                "lifetime_class": { "type": "string", "enum": ["short", "long", "persistent"], "description": "Optional promotion or demotion to a different lifetime policy." }
             },
             "required": ["id"],
             "additionalProperties": false,

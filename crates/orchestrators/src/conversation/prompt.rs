@@ -6,7 +6,7 @@ pub struct PromptContext<'a> {
     pub persona: Option<&'a str>,
 }
 
-pub const SYNTHESIS_PROMPT: &str = "Using the evidence below, answer the request directly. Return only a concise spoken response. Do not mention internal work. Include material uncertainty, and use formatting only if requested.";
+pub const SYNTHESIS_PROMPT: &str = "Using only the evidence below, answer the request directly. Never fill missing facts from prior knowledge. If evidence for a claim failed or timed out, say it could not be verified. Return only a concise spoken response, do not mention internal work, include material uncertainty, and use formatting only if requested.";
 
 pub fn system_prompt(context: PromptContext<'_>) -> String {
     let PromptContext {

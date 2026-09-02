@@ -38,6 +38,141 @@ impl std::fmt::Display for LifetimeClass {
     }
 }
 
+/// One daemon-owned assignment delivered to a worker harness.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkRequest {
+    /// Stable idempotency key for this logical assignment.
+    pub work_id: String,
+    pub objective: String,
+    /// Process generation and warm-worker assignment fence.
+    pub generation: u64,
+    pub assignment: u64,
+    /// Absolute Unix deadline in milliseconds.
+    pub deadline_ms: u64,
+    pub lifetime_class: LifetimeClass,
+}
+
+/// Non-terminal progress associated with a [`WorkRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkEvent {
+    pub work_id: String,
+    pub generation: u64,
+    pub assignment: u64,
+    #[serde(flatten)]
+    pub kind: WorkEventKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum WorkEventKind {
+    Started,
+    Progress { message: String },
+}
+
+/// Exactly one terminal outcome for a logical work assignment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkResult {
+    pub work_id: String,
+    pub objective: String,
+    pub generation: u64,
+    pub assignment: u64,
+    #[serde(flatten)]
+    pub outcome: WorkOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum WorkOutcome {
+    Completed {
+        result: String,
+        #[serde(default)]
+        artifacts: Vec<String>,
+        #[serde(default)]
+        context: String,
+        #[serde(default)]
+        suggested_reuse: bool,
+    },
+    Blocked {
+        reason: String,
+    },
+    Failed {
+        message: String,
+    },
+    Cancelled {
+        reason: String,
+    },
+    TimedOut {
+        deadline_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkReviewRequest {
+    pub review_id: String,
+    pub coordinator_generation: u64,
+    pub candidate: WorkResult,
+    pub worker: WorkReviewContext,
+    pub deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkReviewContext {
+    pub worker_id: String,
+    pub current_lifetime_class: LifetimeClass,
+    pub turns_used: u32,
+    pub turn_budget: Option<u32>,
+    pub purpose: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkReviewDecision {
+    pub review_id: String,
+    pub coordinator_generation: u64,
+    pub work_id: String,
+    pub generation: u64,
+    pub assignment: u64,
+    #[serde(flatten)]
+    pub recommendation: WorkReviewRecommendation,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "recommendation", rename_all = "snake_case")]
+pub enum WorkReviewRecommendation {
+    Accept { lifecycle: LifecycleRecommendation },
+    Rework { revised_objective: Option<String> },
+    Inconclusive { failure: WorkReviewFailure },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "lifecycle", rename_all = "snake_case")]
+pub enum LifecycleRecommendation {
+    KeepCurrent,
+    Release,
+    Retain { lifetime_class: LifetimeClass },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkReviewFailure {
+    InvalidRequest,
+    ModelUnavailable,
+    TimedOut,
+    ProviderError,
+    MalformedOutput,
+    TruncatedOutput,
+    CoordinatorUnavailable,
+}
+
+impl WorkOutcome {
+    pub fn completed_result(&self) -> Option<&str> {
+        match self {
+            Self::Completed { result, .. } => Some(result),
+            _ => None,
+        }
+    }
+}
+
 /// A single agent's view of state, as seen by the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
@@ -255,6 +390,9 @@ pub enum ApiRequest {
     /// connection stays open and the daemon writes a sequence of `Event`
     /// responses until the agent finishes.
     AgentSubscribe { id: String },
+    /// Subscribe to one logical work assignment. Terminal results are replayed
+    /// even if its warm worker has since accepted another assignment.
+    WorkSubscribe { work_id: String },
     /// Send a chat message to a running harness (ghost in `--chat` mode).
     AgentChat { id: String, text: String },
     /// Send a user chat message to the foreground. The foreground replies
@@ -319,6 +457,15 @@ pub enum AgentEvent {
         artifacts: Vec<String>,
         context: String,
         suggested_reuse: bool,
+    },
+    WorkCandidate {
+        candidate: WorkResult,
+    },
+    WorkProgress {
+        event: WorkEvent,
+    },
+    WorkResult {
+        result: WorkResult,
     },
     WorkerReleaseRequested {
         reason: String,
@@ -548,6 +695,47 @@ mod tests {
             }
             _ => panic!("expected worker completion"),
         }
+    }
+
+    #[test]
+    fn work_protocol_preserves_identity_and_separates_failure_from_evidence() {
+        let request = WorkRequest {
+            work_id: "work-1".into(),
+            objective: "verify the latest release".into(),
+            generation: 4,
+            assignment: 2,
+            deadline_ms: 123_456,
+            lifetime_class: LifetimeClass::Short,
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<WorkRequest>(&wire).unwrap(), request);
+
+        let result = WorkResult {
+            work_id: request.work_id,
+            objective: request.objective,
+            generation: request.generation,
+            assignment: request.assignment,
+            outcome: WorkOutcome::TimedOut {
+                deadline_ms: request.deadline_ms,
+            },
+        };
+        let wire = serde_json::to_string(&AgentEvent::WorkResult {
+            result: result.clone(),
+        })
+        .unwrap();
+        assert!(wire.contains(r#""outcome":"timed_out""#));
+        assert!(!wire.contains(r#""result":""#));
+        assert!(result.outcome.completed_result().is_none());
+    }
+
+    #[test]
+    fn work_subscription_has_a_stable_wire_shape() {
+        let request = ApiRequest::WorkSubscribe {
+            work_id: "work-1".into(),
+        };
+        let wire = r#"{"cmd":"work_subscribe","work_id":"work-1"}"#;
+        assert_eq!(serde_json::to_string(&request).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<ApiRequest>(wire).unwrap(), request);
     }
 
     #[test]

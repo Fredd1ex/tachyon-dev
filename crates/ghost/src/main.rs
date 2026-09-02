@@ -12,7 +12,10 @@ use ghost::harness::backend::{Backend, ExecRequest, Local};
 use ghost::harness::browser_setup;
 use ghost::model::{from_agent_config, ChatMessage, Content, Model, Role, TokenUsage, ToolCall};
 use ghost::role::AgentRole;
-use tachyon_api::types::{Actor, AgentEvent, EventEnvelope};
+use tachyon_api::types::{
+    Actor, AgentEvent, EventEnvelope, WorkEvent, WorkEventKind, WorkOutcome, WorkRequest,
+    WorkResult,
+};
 use tokio::io::AsyncBufReadExt;
 
 static EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -100,7 +103,7 @@ async fn run_task(
                 role,
                 agent_id.as_deref(),
             );
-            emit_answer(&answer, &task, role, agent_id.as_deref());
+            emit_answer(&answer, &task, None, role, agent_id.as_deref());
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -155,7 +158,26 @@ async fn run_chat(
         if text.is_empty() {
             continue;
         }
-        messages.push(ChatMessage::new(Role::User, text));
+        let request = serde_json::from_str::<WorkRequest>(text).ok();
+        let objective = request
+            .as_ref()
+            .map(|request| request.objective.as_str())
+            .unwrap_or(text);
+        if let Some(request) = &request {
+            emit_event(
+                AgentEvent::WorkProgress {
+                    event: WorkEvent {
+                        work_id: request.work_id.clone(),
+                        generation: request.generation,
+                        assignment: request.assignment,
+                        kind: WorkEventKind::Started,
+                    },
+                },
+                role,
+                agent_id.as_deref(),
+            );
+        }
+        messages.push(ChatMessage::new(Role::User, objective));
         match run_loop(&model, &mut messages, backend, role, agent_id.as_deref()).await {
             Ok((answer, usage)) => {
                 emit_event(
@@ -168,9 +190,34 @@ async fn run_chat(
                     role,
                     agent_id.as_deref(),
                 );
-                emit_answer(&answer, text, role, agent_id.as_deref());
+                emit_answer(
+                    &answer,
+                    objective,
+                    request.as_ref(),
+                    role,
+                    agent_id.as_deref(),
+                );
             }
-            Err(error) => println!("[ghost:error] {error}"),
+            Err(error) => {
+                if let Some(request) = &request {
+                    emit_event(
+                        AgentEvent::WorkCandidate {
+                            candidate: WorkResult {
+                                work_id: request.work_id.clone(),
+                                objective: request.objective.clone(),
+                                generation: request.generation,
+                                assignment: request.assignment,
+                                outcome: WorkOutcome::Failed {
+                                    message: error.clone(),
+                                },
+                            },
+                        },
+                        role,
+                        agent_id.as_deref(),
+                    );
+                }
+                println!("[ghost:error] {error}");
+            }
         }
         compact_completed_history(&mut messages);
         next_commit = next_commit.saturating_add(1);
@@ -404,9 +451,30 @@ fn browser_request(line: &str) -> Result<ExecRequest, String> {
     })
 }
 
-fn emit_answer(answer: &str, task: &str, role: AgentRole, agent_id: Option<&str>) {
+fn emit_answer(
+    answer: &str,
+    task: &str,
+    request: Option<&WorkRequest>,
+    role: AgentRole,
+    agent_id: Option<&str>,
+) {
     if let Some(worker_id) = agent_id {
-        emit_event(
+        let event = if let Some(request) = request {
+            AgentEvent::WorkCandidate {
+                candidate: WorkResult {
+                    work_id: request.work_id.clone(),
+                    objective: request.objective.clone(),
+                    generation: request.generation,
+                    assignment: request.assignment,
+                    outcome: WorkOutcome::Completed {
+                        result: answer.into(),
+                        artifacts: Vec::new(),
+                        context: "live Ghost and IPython session remain available".into(),
+                        suggested_reuse: true,
+                    },
+                },
+            }
+        } else {
             AgentEvent::WorkerCompleted {
                 worker_id: worker_id.into(),
                 objective: task.into(),
@@ -414,10 +482,9 @@ fn emit_answer(answer: &str, task: &str, role: AgentRole, agent_id: Option<&str>
                 artifacts: Vec::new(),
                 context: "live Ghost and IPython session remain available".into(),
                 suggested_reuse: true,
-            },
-            role,
-            agent_id,
-        );
+            }
+        };
+        emit_event(event, role, agent_id);
     }
     emit_event(
         AgentEvent::Reply {

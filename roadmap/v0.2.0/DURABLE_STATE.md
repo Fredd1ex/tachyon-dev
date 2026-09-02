@@ -13,8 +13,9 @@ Instrumentation must distinguish storage volume from context assembly.
 
 ## Target
 
-After the orchestration/runtime migration stabilizes, use redb as Tachyond's
-embedded authoritative state store.
+Use redb as the authoritative durable state engine. Markdown agent/task files
+are a temporary compatibility store and must be removed from the runtime write
+path after migration.
 
 Durable data is split into two ownership and retention domains:
 
@@ -28,15 +29,28 @@ Durable data is split into two ownership and retention domains:
    notifications, and commitments. This domain is bounded by lifecycle-aware
    retention and compaction policies.
 
-The domains may share one transactional database, but they use separate tables,
-APIs, context budgets, and garbage-collection rules. User memory is not task
-state, and operational history is not automatically promoted into user memory.
+The domains use separate databases, APIs, context budgets, and
+garbage-collection rules:
+
+1. `user-memory.redb` contains user facts, preferences, provenance, confidence,
+   consent, sensitivity, corrections, revocations, and expiry.
+2. `runtime.redb` contains agent management, workers, tasks, dependencies,
+   leases, generations, attempts, events, schedules, commitments,
+   notifications, checkpoints, terminal outcomes, and artifact references.
+
+No transaction may require atomic writes across both databases. User memory is
+not task state, and operational history is not automatically promoted into user
+memory. Promotion is an explicit validated operation through the user-memory
+API.
 
 Suggested tables:
 
 ```text
+# user-memory.redb
 user_facts:         fact_id -> UserFactRecord
 user_fact_index:    (subject, predicate, updated_at) -> fact_id
+
+# runtime.redb
 tasks:              task_id -> TaskRecord
 task_events:        (task_id, sequence) -> TaskEvent
 workers:            worker_id -> WorkerRecord
@@ -59,7 +73,9 @@ records. The database should not become a blob store for arbitrary tool output.
 3. Records are versioned and migrations are explicit.
 4. Startup never scans hundreds of task files after cutover.
 5. Existing Markdown task files are imported once, idempotently, then archived
-   or removed only with explicit user approval.
+   or removed only with explicit user approval. After cutover, Markdown is not
+   an authoritative or writable agent-management store; it may only be a
+   derived diagnostic or export format.
 6. Memory snapshots remain derived projections, not task-state authority.
 7. Context assembly queries bounded records by task/turn IDs; it never lists
    and injects the whole database.
@@ -101,6 +117,9 @@ engine alone does not prevent state or token growth.
 
 ## Timing
 
-Do not migrate storage while process roles, protocol types, and state ownership
-are still moving. First complete the model/runtime and Conversation extraction;
-then define stable record schemas from the finalized protocol types.
+Finish the v0.2.0 command/event ownership boundary first, then define versioned
+record schemas from those protocol types. Implement `runtime.redb` as part of
+the v0.4.0 kernel before durable scheduling, retries, commitments, or restart
+reconciliation are considered complete. Implement `user-memory.redb`
+independently so memory semantics can evolve without coupling user facts to
+agent lifecycle transactions.

@@ -2168,6 +2168,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tachyon-background"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tachyon-api",
+ "tachyon-model",
+ "tachyon-orchestrator",
+ "tachyon-util",
+ "tokio",
+]
+
+[[package]]
 name = "tachyon-client"
 version = "0.1.0"
 dependencies = [

@@ -235,5 +235,8 @@ Make the typed asynchronous boundary authoritative:
 5. Remove Background compatibility from Ghost and then remove remaining line
    marker adapters after replay tests pass.
 
-The redb durable-state migration remains deferred until these command/event
-types and ownership boundaries stabilize.
+The redb durable-state migration follows stabilization of these command/event
+types and ownership boundaries. It is required for the v0.4.0 kernel and uses
+two independent stores: `runtime.redb` for agent/task management and
+`user-memory.redb` for durable user memory. Markdown agent records are imported
+once and removed from the authoritative runtime write path after cutover.

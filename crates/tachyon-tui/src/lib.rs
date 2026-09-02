@@ -41,6 +41,7 @@ use ratatui::Terminal;
 
 use tachyon_api::types::{
     Actor, AgentEvent, AgentInfo, AgentState, ApiResponse, DaemonInfo, EventEnvelope, EventStream,
+    WorkOutcome,
 };
 use tachyon_api::{InteractionEvent, InteractionEventEnvelope, FOREGROUND_ID};
 
@@ -1776,6 +1777,28 @@ fn apply_agent_event(thread: &mut Thread, event: AgentEvent) {
                 ItemKind::SpawnResult,
                 format!("worker {worker_id}: {objective}\n{result}"),
                 turn,
+            );
+        }
+        AgentEvent::WorkCandidate { .. } => {}
+        AgentEvent::WorkProgress { event } => thread.add_turn(
+            ItemKind::System,
+            format!("work {}: {:?}", event.work_id, event.kind),
+            None,
+        ),
+        AgentEvent::WorkResult { result } => {
+            let (kind, text) = match result.outcome {
+                WorkOutcome::Completed { result: text, .. } => (ItemKind::SpawnResult, text),
+                WorkOutcome::Blocked { reason } => (ItemKind::Error, format!("blocked: {reason}")),
+                WorkOutcome::Failed { message } => (ItemKind::Error, message),
+                WorkOutcome::Cancelled { reason } => {
+                    (ItemKind::Error, format!("cancelled: {reason}"))
+                }
+                WorkOutcome::TimedOut { .. } => (ItemKind::Error, "timed out".into()),
+            };
+            thread.add_turn(
+                kind,
+                format!("work {}: {}\n{text}", result.work_id, result.objective),
+                None,
             );
         }
         AgentEvent::WorkerReleaseRequested { reason } => thread.add_turn(

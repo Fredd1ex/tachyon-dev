@@ -16,3 +16,5 @@ pub use types::*;
 
 /// Stable daemon registry and process identity for the foreground runtime.
 pub const FOREGROUND_ID: &str = "foreground";
+/// Stable daemon-owned identity for the semantic result reviewer.
+pub const BACKGROUND_ID: &str = "background";
