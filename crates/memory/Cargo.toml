@@ -3,7 +3,7 @@ name = "tachyon-memory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Markdown-first durable memory service for Tachyon"
+description = "Curated redb-backed memory service for Tachyon"
 
 [lib]
 path = "src/lib.rs"
@@ -13,8 +13,11 @@ name = "tachyon-memory"
 path = "src/main.rs"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-toml.workspace = true
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 dirs = "6"
+
+[dev-dependencies]
+tempfile.workspace = true

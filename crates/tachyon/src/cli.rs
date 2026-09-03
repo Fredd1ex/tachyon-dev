@@ -75,6 +75,9 @@ pub enum Command {
     /// Attach to an agent's live output.
     Attach(IdArgs),
 
+    /// Query canonical conversation history by Unix millisecond range.
+    History(HistoryArgs),
+
     /// Manage the Tachyon daemon.
     Daemon(DaemonArgs),
 
@@ -161,6 +164,21 @@ pub struct ExecArgs {
 pub struct AttachArgs {
     /// The agent id to attach to.
     pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct HistoryArgs {
+    /// Inclusive Unix timestamp in milliseconds.
+    #[arg(long)]
+    pub since_ms: u64,
+
+    /// Exclusive Unix timestamp in milliseconds.
+    #[arg(long)]
+    pub until_ms: u64,
+
+    /// Maximum records to return.
+    #[arg(short, long, default_value_t = 100)]
+    pub limit: u32,
 }
 
 #[derive(Args, Debug)]

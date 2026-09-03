@@ -1710,6 +1710,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2282,10 +2291,11 @@ name = "tachyon-memory"
 version = "0.2.0"
 dependencies = [
  "dirs",
+ "redb",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
- "toml",
 ]
 
 [[package]]
@@ -2341,11 +2351,13 @@ name = "tachyond"
 version = "0.2.0"
 dependencies = [
  "nix",
+ "redb",
+ "serde",
  "serde_json",
  "signal-hook",
  "tachyon-api",
- "tachyon-memory",
  "tachyon-util",
+ "tempfile",
 ]
 
 [[package]]

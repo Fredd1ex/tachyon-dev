@@ -421,6 +421,35 @@ pub enum ApiRequest {
     /// Subscribe to the foreground conversation stream.
     #[serde(alias = "orchestrator_subscribe")]
     ForegroundSubscribe,
+    /// Query canonical user-visible history in the half-open time range.
+    HistoryQuery {
+        since_ms: u64,
+        until_ms: u64,
+        #[serde(default = "default_history_limit")]
+        limit: u32,
+    },
+}
+
+fn default_history_limit() -> u32 {
+    100
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryRole {
+    User,
+    Assistant,
+    Notification,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub event_id: String,
+    pub conversation_id: String,
+    pub turn_id: Option<String>,
+    pub occurred_at_ms: u64,
+    pub role: HistoryRole,
+    pub text: String,
 }
 
 /// The kind of a streamed event line.
@@ -441,6 +470,15 @@ pub struct ArtifactRegistration {
     pub description: String,
     pub size_bytes: u64,
     pub sha256: String,
+    pub task_id: Option<String>,
+    pub work_id: Option<String>,
+    pub generation: Option<u64>,
+    pub assignment: Option<u64>,
+    pub attempt_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolTelemetryIdentity {
     pub task_id: Option<String>,
     pub work_id: Option<String>,
     pub generation: Option<u64>,
@@ -514,6 +552,16 @@ pub enum AgentEvent {
         id: String,
         output: String,
     },
+    ToolTelemetry {
+        tool_name: String,
+        call_id: Option<String>,
+        duration_ms: u64,
+        success: bool,
+        truncated: bool,
+        bytes_out: u64,
+        error_code: Option<String>,
+        identity: ToolTelemetryIdentity,
+    },
     ArtifactRegistered {
         artifact: ArtifactRegistration,
     },
@@ -579,6 +627,8 @@ pub enum ApiResponse {
     Agents { agents: Vec<AgentInfo> },
     /// Response to `AgentLogs`.
     Logs { id: String, lines: Vec<String> },
+    /// Canonical user-visible history in chronological order.
+    History { entries: Vec<HistoryEntry> },
     /// Response to `AgentExec`.
     Exec {
         id: String,
@@ -811,6 +861,31 @@ mod tests {
             r#"{"event_id":42,"session_id":"session-1","conversation_id":"conversation-1","turn_id":"turn-3","task_id":"task-child","parent_task_id":"task-parent","tool_call_id":"call-7","actor":{"kind":"worker","id":"worker-1"},"sequence":9,"occurred_at_ms":1725000000123,"kind":"tool_finished","turn":3,"id":"call-7","output":"complete"}"#
         );
         assert_eq!(serde_json::from_str::<EventEnvelope>(&wire).unwrap(), event);
+    }
+
+    #[test]
+    fn tool_telemetry_round_trips_with_runtime_and_call_identity() {
+        let event = AgentEvent::ToolTelemetry {
+            tool_name: "grep".into(),
+            call_id: Some("model-call-2".into()),
+            duration_ms: 38,
+            success: true,
+            truncated: false,
+            bytes_out: 420,
+            error_code: None,
+            identity: ToolTelemetryIdentity {
+                task_id: Some("task-1".into()),
+                work_id: Some("work-1".into()),
+                generation: Some(2),
+                assignment: Some(3),
+                attempt_id: None,
+            },
+        };
+
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(wire.contains(r#""kind":"tool_telemetry""#));
+        assert!(wire.contains(r#""call_id":"model-call-2""#));
+        assert_eq!(serde_json::from_str::<AgentEvent>(&wire).unwrap(), event);
     }
 
     #[test]

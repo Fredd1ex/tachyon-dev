@@ -249,6 +249,7 @@ mod tests {
             workspace_root: root.clone(),
             cwd: root.clone(),
             identity: ToolIdentity {
+                call_id: None,
                 task_id: Some("task-1".into()),
                 work_id: Some("work-1".into()),
                 generation: Some(2),

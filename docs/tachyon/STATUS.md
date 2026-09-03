@@ -20,8 +20,8 @@ the source of truth for the intended system and MVP requirements.
 - Separate `tachyon-tui` crate and shared `tachyon-client` IPC crate.
 - Initial `tachyon-orchestrator` domain crate for tasks, attention, conversation,
   scheduler, and control concepts.
-- Markdown-first `tachyon-memory` store with TOML front matter, atomic task
-  writes, task listing, and a Tachyond-started Unix-socket service.
+- Authoritative `runtime.redb` task persistence, `history.redb` temporal message
+  indexes, a durable history outbox, and curated `memories.redb` records.
 - Separate scheduling and answerability classification for queued follow-ups,
   with conservative delegation when answerability cannot be established.
 - Bounded deferred input and ordered conversation commits.
@@ -40,9 +40,10 @@ the source of truth for the intended system and MVP requirements.
   cancelling work.
 - Worker output is visible, but task identity and parentage are inferred rather
   than carried by structured events.
-- Agent state exists in Tachyond memory but is not durable across daemon restart.
-- Memory is started and stopped by Tachyond, but restart/recovery and typed
-  Tachyond-to-Memory integration are not complete.
+- Runtime task state and persistent-worker recovery are durable; work requests,
+  schedules, and complete restart reconciliation remain partial.
+- The redb-backed Memory service has typed CRUD and revocation, but the Memory
+  Agent, scoped retrieval, and proposal-validation integration are incomplete.
 - Warm worker sessions can be reused by orchestration policy, with default
   keep-alive semantics. Explicit retention commands, durable leases, and
   semantic completion/release events are still pending; the current idle TTL

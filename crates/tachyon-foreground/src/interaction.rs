@@ -18,20 +18,34 @@ pub async fn chat_with_delegation(
     model: &Model,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
+    publish_direct: bool,
     on_delta: &mut (dyn FnMut(&str) + Send),
 ) -> std::result::Result<Completion, ModelError> {
     let mut visible = VisibleResponseStream::default();
+    let mut buffered = String::new();
     let mut relay = |delta: &str| {
         if let Some(delta) = visible.push(delta) {
-            on_delta(&delta);
+            buffered.push_str(&delta);
         }
     };
     let completion = model.chat(messages, Some(tools), &mut relay).await;
     drop(relay);
     if let Some(delta) = visible.finish() {
-        on_delta(&delta);
+        buffered.push_str(&delta);
+    }
+    if completion
+        .as_ref()
+        .is_ok_and(|completion| should_publish_direct(completion, publish_direct))
+        && !visible.protocol_blocked
+        && !buffered.is_empty()
+    {
+        on_delta(&buffered);
     }
     completion
+}
+
+fn should_publish_direct(completion: &Completion, publish_direct: bool) -> bool {
+    publish_direct && completion.tool_calls.is_empty()
 }
 
 #[derive(Default)]
@@ -263,8 +277,8 @@ fn bounded_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        answerability_tool, parse_answerability_tool_call, policy_context, synthesis_context,
-        VisibleResponseStream, ANSWERABILITY_TOOL_NAME,
+        answerability_tool, parse_answerability_tool_call, policy_context, should_publish_direct,
+        synthesis_context, VisibleResponseStream, ANSWERABILITY_TOOL_NAME,
     };
     use tachyon_model::{ChatMessage, Completion, Content, Role, TokenUsage, ToolCall};
     use tachyon_orchestrator::conversation::policy::Answerability;
@@ -328,6 +342,21 @@ mod tests {
         );
         assert_eq!(stream.push("SML｜tool_calls>secret"), None);
         assert_eq!(stream.finish(), None);
+    }
+
+    #[test]
+    fn tool_capable_prose_is_published_only_for_confirmed_direct_answers() {
+        let direct = Completion {
+            text: "A direct answer.".into(),
+            tool_calls: Vec::new(),
+            usage: TokenUsage::default(),
+            finish_reason: Some("stop".into()),
+        };
+        assert!(should_publish_direct(&direct, true));
+        assert!(!should_publish_direct(&direct, false));
+
+        let delegated = answerability_completion(r#"{"outcome":"AnswerFromContext"}"#);
+        assert!(!should_publish_direct(&delegated, true));
     }
 
     #[test]

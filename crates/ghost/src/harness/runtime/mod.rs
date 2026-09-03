@@ -48,6 +48,35 @@ pub const MAX_RETURN_LINES: usize = 2_000;
 pub const DEFAULT_MODEL_CONTENT_BYTES: usize = 12_000;
 pub const SANITIZED_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+pub fn native_registry() -> ToolRegistry {
+    let mut registry = ToolRegistry::default();
+    registry
+        .register(ReadTool::new())
+        .expect("unique built-in tool");
+    registry
+        .register(WriteTool::new())
+        .expect("unique built-in tool");
+    registry
+        .register(EditTool::new())
+        .expect("unique built-in tool");
+    registry
+        .register(LsTool::new())
+        .expect("unique built-in tool");
+    registry
+        .register(FindTool::new())
+        .expect("unique built-in tool");
+    registry
+        .register(GrepTool::new())
+        .expect("unique built-in tool");
+    registry
+        .register(ExecTool::new())
+        .expect("unique built-in tool");
+    registry
+        .register(ArtifactTool::new())
+        .expect("unique built-in tool");
+    registry
+}
+
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send + 'a>>;
 
 pub trait Tool: Send + Sync {
@@ -70,11 +99,29 @@ pub enum Capability {
 
 #[derive(Clone, Debug, Default)]
 pub struct ToolIdentity {
+    pub call_id: Option<String>,
     pub task_id: Option<String>,
     pub work_id: Option<String>,
     pub generation: Option<u64>,
     pub assignment: Option<u64>,
     pub attempt_id: Option<String>,
+}
+
+impl ToolContext {
+    pub fn for_call(&self, call_id: impl Into<String>) -> Self {
+        let mut identity = self.identity.clone();
+        identity.call_id = Some(call_id.into());
+        Self {
+            workspace_root: self.workspace_root.clone(),
+            cwd: self.cwd.clone(),
+            identity,
+            deadline: self.deadline,
+            cancellation: self.cancellation.clone(),
+            policy: Arc::clone(&self.policy),
+            event_sink: Arc::clone(&self.event_sink),
+            output_store: Arc::clone(&self.output_store),
+        }
+    }
 }
 
 #[derive(Clone)]

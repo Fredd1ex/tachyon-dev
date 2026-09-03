@@ -1,5 +1,6 @@
 //! Worker-only execution capabilities owned by the Ghost harness.
 
+pub mod agent;
 pub mod backend;
 pub mod browser_setup;
 pub mod prompt;

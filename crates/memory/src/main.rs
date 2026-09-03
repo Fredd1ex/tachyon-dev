@@ -8,8 +8,11 @@ use tachyon_memory::protocol::{MemoryRequest, MemoryResponse};
 use tachyon_memory::MemoryStore;
 
 fn main() -> std::io::Result<()> {
-    let (root, socket) = args();
-    let store = MemoryStore::open(root).map_err(std::io::Error::other)?;
+    let (database, socket, initialize) = args();
+    let store = MemoryStore::open(database).map_err(std::io::Error::other)?;
+    if initialize {
+        return Ok(());
+    }
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -55,20 +58,26 @@ fn handle_connection(stream: UnixStream, store: &MemoryStore) {
 
 fn dispatch(request: MemoryRequest, store: &MemoryStore) -> MemoryResponse {
     match request {
-        MemoryRequest::ReadTask { id } => match store.read_task(&id) {
-            Ok(document) => MemoryResponse::Task { document },
+        MemoryRequest::Get { id } => match store.get(&id) {
+            Ok(record) => MemoryResponse::Memory { record },
             Err(error) => MemoryResponse::Error {
                 message: error.to_string(),
             },
         },
-        MemoryRequest::WriteTask { document } => match store.write_task(&document) {
+        MemoryRequest::Put { record } => match store.put(&record) {
             Ok(()) => MemoryResponse::Ok,
             Err(error) => MemoryResponse::Error {
                 message: error.to_string(),
             },
         },
-        MemoryRequest::ListTasks => match store.list_tasks() {
-            Ok(documents) => MemoryResponse::Tasks { documents },
+        MemoryRequest::List => match store.list() {
+            Ok(records) => MemoryResponse::Memories { records },
+            Err(error) => MemoryResponse::Error {
+                message: error.to_string(),
+            },
+        },
+        MemoryRequest::Revoke { id, revoked_at_ms } => match store.revoke(&id, revoked_at_ms) {
+            Ok(()) => MemoryResponse::Ok,
             Err(error) => MemoryResponse::Error {
                 message: error.to_string(),
             },
@@ -76,14 +85,16 @@ fn dispatch(request: MemoryRequest, store: &MemoryStore) -> MemoryResponse {
     }
 }
 
-fn args() -> (PathBuf, PathBuf) {
-    let mut root = None;
+fn args() -> (PathBuf, PathBuf, bool) {
+    let mut database = None;
     let mut socket = None;
+    let mut initialize = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--root" => root = args.next().map(PathBuf::from),
+            "--database" => database = args.next().map(PathBuf::from),
             "--socket" => socket = args.next().map(PathBuf::from),
+            "--initialize" => initialize = true,
             _ => {}
         }
     }
@@ -95,7 +106,8 @@ fn args() -> (PathBuf, PathBuf) {
                 .join("tachyon")
         });
     (
-        root.unwrap_or_else(|| data.join("memory")),
+        database.unwrap_or_else(|| data.join("databases/memories.redb")),
         socket.unwrap_or_else(|| data.join("state/memory.sock")),
+        initialize,
     )
 }

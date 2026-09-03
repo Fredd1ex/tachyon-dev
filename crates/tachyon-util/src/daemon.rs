@@ -30,6 +30,24 @@ pub fn workspaces_dir() -> PathBuf {
     data_dir().join("workspaces")
 }
 
+/// Authoritative databases. Portable imports and exports live outside this
+/// directory and must go through their versioned APIs.
+pub fn databases_dir() -> PathBuf {
+    data_dir().join("databases")
+}
+
+pub fn runtime_database_path() -> PathBuf {
+    databases_dir().join("runtime.redb")
+}
+
+pub fn history_database_path() -> PathBuf {
+    databases_dir().join("history.redb")
+}
+
+pub fn memories_database_path() -> PathBuf {
+    databases_dir().join("memories.redb")
+}
+
 pub fn pidfile_path() -> PathBuf {
     runtime_dir().join("tachyond.pid")
 }
@@ -44,6 +62,7 @@ pub fn ensure_layout() -> std::io::Result<()> {
     fs::create_dir_all(runtime_dir())?;
     fs::create_dir_all(logs_dir())?;
     fs::create_dir_all(workspaces_dir())?;
+    fs::create_dir_all(databases_dir())?;
     Ok(())
 }
 

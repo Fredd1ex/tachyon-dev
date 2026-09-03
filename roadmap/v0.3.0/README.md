@@ -6,7 +6,7 @@ Estimated progress: **75%**. Status: **Partial**.
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| generic tool registry | Implemented | Object-safe Tokio dispatch, startup duplicate rejection, policy filtering, deadlines, cancellation, structured envelopes, output bounds, telemetry hooks, and bounded durable output storage are integrated into Ghost's model loop. |
+| generic tool registry | Implemented | Object-safe Tokio dispatch, startup duplicate rejection, policy filtering, deadlines, cancellation, structured envelopes, output bounds, correlated telemetry events, and bounded durable output storage are integrated into Ghost's model loop. |
 | read / write / edit | Implemented | Workspace-confined bounded `read`, atomic create/replace `write`, and exact unique-match `edit` are native and asynchronous. Writes preserve permissions, reject symlink targets, revalidate before replacement, and sync by policy. |
 | ls / find / grep | Implemented | Deterministic `ls`, ignore-aware glob `find`, and regex/fixed-string `grep` are native and bounded. `grep` caches `rg` discovery for accelerated candidate filtering with tested native parity and spawn-failure fallback; optional `fd` acceleration remains. |
 | robust exec | Partial | Registry-dispatched direct/shell execution now has scrubbed policy environment, bounded concurrent head/tail capture, output references, effective deadlines, cancellation, TERM-to-KILL process-group cleanup, descendant cleanup, and structured outcomes. Streaming work updates, resource limits, and hard isolation remain. |
@@ -20,7 +20,7 @@ Estimated progress: **75%**. Status: **Partial**.
 | checkpoint/resume | Partial | Conversation, worker, and IPython checkpoints exist, but active work cannot resume exactly. |
 | structured findings | Partial | Event transport is structured; findings, claims, sources, confidence, and uncertainty remain free-form prose. |
 | bounded subagents | Partial | Recursive spawning is prevented and one delegation can fan out to at most eight workers; aggregate resources across concurrent turns are not yet bounded. |
-| harness benchmarks | Missing | No deterministic research benchmark suite or release threshold exists. |
+| harness benchmarks | Partial | A scripted production-loop fixture now verifies list/find/search/read/edit/exec/artifact behavior without a provider. Broader orchestration scenarios, fault injection, metrics, and release thresholds remain. |
 
 ## Exit Criteria
 
@@ -47,5 +47,5 @@ Estimated progress: **75%**. Status: **Partial**.
 2. Add bounded read/search access for durable output references.
 3. Add bounded streaming work updates and resource limits to `exec`.
 4. Specify and implement the separate bounded quick-web retrieval tool.
-5. Add typed attempt IDs, deterministic harness scenarios, parity tests, and
-   fault injection.
+5. Extend the deterministic dogfood fixture with completion gates, typed
+   attempt IDs, orchestration scenarios, parity tests, and fault injection.

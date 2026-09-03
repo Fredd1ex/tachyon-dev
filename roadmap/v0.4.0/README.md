@@ -13,25 +13,28 @@ Estimated progress: **18%**. Status: **Early**.
 | retries | Missing | Connection polling exists, but no durable attempt policy, backoff, or retry classification. |
 | cancellation escalation | Partial | Work deadlines produce typed timeout outcomes, fence stale generations, and terminate the worker; cooperative cancellation and shared TERM-to-KILL escalation remain. |
 | task dependencies | Partial | Dependency fields and basic admission gating exist; graph validation and failure propagation do not. |
-| persistent state | Partial | Markdown task projections exist today; authoritative redb stores are required. |
+| persistent state | Partial | `runtime.redb` is authoritative for task writes and indexed persistent-worker restore; history, memory, and remaining runtime records are still required. |
 | restart reconciliation | Partial | Some persistent workers can be reconstructed, but stale sockets, orphan work, event replay, and foreground recovery are unresolved. |
 | priority queues | Missing | Priority types are not connected to task scheduling. |
 | better tracing | Partial | Correlated typed events and JSONL logs exist, but durable causal tracing and replay do not. |
 
 ## redb Storage Requirement
 
-v0.4.0 replaces Markdown agent tracking with two separate redb databases:
+v0.4.0 replaces Markdown agent tracking with three separate redb databases:
 
-- `user-memory.redb` owns durable user facts, preferences, corrections,
+- `memories.redb` owns durable user facts, preferences, corrections,
   provenance, confidence, consent, sensitivity, revocation, and expiry.
+- `history.redb` owns conversations, user-visible activity, temporal indexes,
+  durable summaries, and source references.
 - `runtime.redb` owns agents, workers, tasks, dependencies, leases,
   generations, attempts, events, schedules, commitments, notifications,
   checkpoints, terminal outcomes, and artifact references.
 
 Tachyond is the sole writer for authoritative runtime and agent-management
-state. The Memory service owns user-memory writes behind a typed API. No
-transaction may require atomic writes across both databases. Promotion from an
-operational observation into user memory is an explicit, validated operation.
+state. A runtime outbox and idempotent projector feed `history.redb`. The Memory
+service owns curated-memory writes behind a typed API. No transaction may
+require atomic writes across databases. Promotion from history into user memory
+is an explicit, validated operation.
 
 Markdown must not remain an authoritative or writable agent/task store after
 cutover. Existing Markdown task records may be imported once, idempotently, and
@@ -59,6 +62,5 @@ Detailed storage requirements are in
 1. Finalize runtime records from the v0.2.0 typed protocol.
 2. Implement `runtime.redb` and one-time Markdown import.
 3. Move task/agent reads and writes off Markdown.
-4. Implement `user-memory.redb` as an independent ownership domain.
-5. Build restart reconciliation on durable events and snapshots.
-6. Add durable queues, retries, cancellation escalation, and cron.
+4. Build restart reconciliation on durable events and snapshots.
+5. Add durable queues, retries, cancellation escalation, and cron.

@@ -9,18 +9,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use futures_util::future::join_all;
+use ghost::harness::agent::{run_loop as run_agent_loop, AgentLoopEvent, AgentLoopEventSink};
 use ghost::harness::backend::Local;
 use ghost::harness::browser_setup;
 use ghost::harness::runtime::{
-    AgentBrowserTool, ArtifactTool, BrowserAvailability, EditTool, ExecTool, FindTool, GrepTool,
-    IpythonTool, LsTool, ReadTool, ToolContext, ToolEventSink, ToolIdentity, ToolOutputStore,
-    ToolPolicy, ToolRegistry, ToolTelemetry, WorkspaceOutputStore, WriteTool, MAX_RETURN_BYTES,
+    native_registry, AgentBrowserTool, BrowserAvailability, IpythonTool, ToolContext,
+    ToolEventSink, ToolIdentity, ToolOutputStore, ToolPolicy, ToolRegistry, ToolTelemetry,
+    WorkspaceOutputStore, MAX_RETURN_BYTES,
 };
-use ghost::model::{from_agent_config, ChatMessage, Content, Model, Role, TokenUsage, ToolCall};
+use ghost::model::{from_agent_config, ChatMessage, Content, Model, Role, TokenUsage};
 use ghost::role::AgentRole;
+#[cfg(test)]
+use ghost::{harness::agent::normalized_call_signature, model::ToolCall};
 use tachyon_api::types::{
-    Actor, AgentEvent, ArtifactRegistration, EventEnvelope, WorkEvent, WorkEventKind, WorkOutcome,
+    Actor, AgentEvent, ArtifactRegistration, EventEnvelope,
+    ToolTelemetryIdentity as ApiToolTelemetryIdentity, WorkEvent, WorkEventKind, WorkOutcome,
     WorkRequest, WorkResult,
 };
 use tokio::io::AsyncBufReadExt;
@@ -52,7 +55,32 @@ impl GhostToolEventSink {
 }
 
 impl ToolEventSink for GhostToolEventSink {
-    fn emit(&self, _event: ToolTelemetry) {}
+    fn emit(&self, event: ToolTelemetry) {
+        let error_code = event
+            .error_code
+            .and_then(|code| serde_json::to_value(code).ok())
+            .and_then(|value| value.as_str().map(str::to_owned));
+        emit_event(
+            AgentEvent::ToolTelemetry {
+                tool_name: event.tool_name,
+                call_id: event.identity.call_id,
+                duration_ms: event.duration.as_millis().min(u64::MAX as u128) as u64,
+                success: event.success,
+                truncated: event.truncated,
+                bytes_out: event.bytes_out.min(u64::MAX as usize) as u64,
+                error_code,
+                identity: ApiToolTelemetryIdentity {
+                    task_id: event.identity.task_id,
+                    work_id: event.identity.work_id,
+                    generation: event.identity.generation,
+                    assignment: event.identity.assignment,
+                    attempt_id: event.identity.attempt_id,
+                },
+            },
+            self.role,
+            self.agent_id.as_deref(),
+        );
+    }
 
     fn register_artifact(&self, artifact: ArtifactRegistration) -> Result<(), String> {
         let mut paths = self
@@ -139,31 +167,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-        let mut registry = ToolRegistry::default();
-        registry
-            .register(ReadTool::new())
-            .expect("unique built-in tool");
-        registry
-            .register(WriteTool::new())
-            .expect("unique built-in tool");
-        registry
-            .register(EditTool::new())
-            .expect("unique built-in tool");
-        registry
-            .register(LsTool::new())
-            .expect("unique built-in tool");
-        registry
-            .register(FindTool::new())
-            .expect("unique built-in tool");
-        registry
-            .register(GrepTool::new())
-            .expect("unique built-in tool");
-        registry
-            .register(ExecTool::new())
-            .expect("unique built-in tool");
-        registry
-            .register(ArtifactTool::new())
-            .expect("unique built-in tool");
+        let mut registry = native_registry();
         registry
             .register(IpythonTool::new(Arc::clone(&backend)))
             .expect("unique built-in tool");
@@ -448,76 +452,8 @@ async fn run_loop(
     role: AgentRole,
     agent_id: Option<&str>,
 ) -> Result<(String, TokenUsage), String> {
-    let tools = registry.definitions(&context.policy);
-    let mut usage = TokenUsage::default();
-    let mut last_batch = None;
-    let mut repeats = 0;
-    for _ in 0..max_iterations() {
-        let mut relay = |_delta: &str| {};
-        let completion = model
-            .chat(messages, Some(&tools), &mut relay)
-            .await
-            .map_err(|error| error.to_string())?;
-        usage += completion.usage;
-        let answer = completion.text.trim().to_string();
-        let calls = completion.tool_calls.clone();
-        if calls.is_empty() {
-            if answer.is_empty() {
-                return Err("model returned an empty response".into());
-            }
-            messages.push(completion.to_message());
-            return Ok((answer, usage));
-        }
-        let batch = calls
-            .iter()
-            .map(normalized_call_signature)
-            .collect::<Vec<_>>();
-        if last_batch.as_ref() == Some(&batch) {
-            repeats += 1;
-        } else {
-            repeats = 0;
-            last_batch = Some(batch);
-        }
-        if repeats >= 3 {
-            return Err("repeated identical tool-call batch".into());
-        }
-        for call in &calls {
-            emit_event(
-                AgentEvent::ToolStarted {
-                    turn: None,
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                },
-                role,
-                agent_id,
-            );
-            println!("[tool:{}] {} {}", call.id, call.name, call.arguments);
-        }
-        messages.push(completion.to_message());
-        let outputs = join_all(calls.iter().map(|call| run_tool(call, registry, context))).await;
-        for (call, result) in calls.into_iter().zip(outputs) {
-            let output = result.to_json(MAX_RETURN_BYTES);
-            emit_event(
-                AgentEvent::ToolFinished {
-                    turn: None,
-                    id: call.id.clone(),
-                    output: output.clone(),
-                },
-                role,
-                agent_id,
-            );
-            println!("[tool-result:{}] {}", call.id, truncate(&output, 600));
-            messages.push(ChatMessage {
-                role: Role::Tool,
-                content: vec![Content::ToolResult {
-                    id: call.id,
-                    output: result.to_json(context.policy.max_model_content_bytes),
-                }],
-            });
-        }
-    }
-    Err("max iterations reached".into())
+    let sink = GhostAgentLoopSink { role, agent_id };
+    run_agent_loop(model, messages, registry, context, max_iterations(), &sink).await
 }
 
 fn max_iterations() -> usize {
@@ -536,13 +472,6 @@ fn tool_context_chars() -> usize {
         .unwrap_or(DEFAULT_TOOL_CONTEXT_CHARS)
 }
 
-fn normalized_call_signature(call: &ToolCall) -> String {
-    let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|_| call.arguments.trim().to_string());
-    format!("{}|{arguments}", call.name)
-}
-
 fn compact_completed_history(messages: &mut Vec<ChatMessage>) {
     messages.retain(|message| match message.role {
         Role::System | Role::User => true,
@@ -554,24 +483,41 @@ fn compact_completed_history(messages: &mut Vec<ChatMessage>) {
     });
 }
 
-async fn run_tool(
-    call: &ToolCall,
-    registry: &ToolRegistry,
-    context: &ToolContext,
-) -> ghost::harness::runtime::ToolResult {
-    let input = match serde_json::from_str(&call.arguments) {
-        Ok(input) => input,
-        Err(error) => {
-            return ghost::harness::runtime::ToolError::invalid(format!(
-                "invalid JSON arguments: {error}"
-            ))
-            .into_result();
+struct GhostAgentLoopSink<'a> {
+    role: AgentRole,
+    agent_id: Option<&'a str>,
+}
+
+impl AgentLoopEventSink for GhostAgentLoopSink<'_> {
+    fn emit(&self, event: AgentLoopEvent) {
+        match event {
+            AgentLoopEvent::ToolStarted(call) => {
+                emit_event(
+                    AgentEvent::ToolStarted {
+                        turn: None,
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    },
+                    self.role,
+                    self.agent_id,
+                );
+                println!("[tool:{}] {} {}", call.id, call.name, call.arguments);
+            }
+            AgentLoopEvent::ToolFinished { id, output } => {
+                emit_event(
+                    AgentEvent::ToolFinished {
+                        turn: None,
+                        id: id.clone(),
+                        output: output.clone(),
+                    },
+                    self.role,
+                    self.agent_id,
+                );
+                println!("[tool-result:{id}] {}", truncate(&output, 600));
+            }
         }
-    };
-    registry
-        .execute(&call.name, context, input)
-        .await
-        .unwrap_or_else(ghost::harness::runtime::ToolError::into_result)
+    }
 }
 
 fn tool_context(

@@ -25,12 +25,15 @@ should be represented as typed commands and owned durably by Tachyond.
 
 - `runtime.redb` becomes the authoritative store for agents, workers, tasks,
   scheduling, events, generations, and lifecycle state in v0.4.0.
-- `user-memory.redb` separately owns user facts, preferences, provenance,
+- `history.redb` owns user-visible conversations, activity summaries, temporal
+  indexes, and source references.
+- `memories.redb` separately owns user facts, preferences, provenance,
   consent, correction, and revocation.
 - Markdown agent/task files are removed from the authoritative write path after
   one idempotent import. Markdown may remain only as an export or diagnostic
   projection.
-- No transaction requires atomic writes across the two databases.
+- No transaction requires atomic writes across databases; a runtime outbox
+  feeds history idempotently.
 
 See [`v0.4.0/`](v0.4.0/) for the implementation milestone and
 [`v0.2.0/DURABLE_STATE.md`](v0.2.0/DURABLE_STATE.md) for the detailed storage
@@ -42,7 +45,8 @@ contract.
 2. Add v0.3.0 typed outcomes, findings, artifacts, cancellation, and bounded
    execution to Ghost.
 3. Implement `runtime.redb` and stop writing agent state to Markdown.
-4. Implement `user-memory.redb` independently with bounded retrieval.
-5. Make Tachyond an idempotent durable scheduler with restart reconciliation.
-6. Introduce the independent Background Coordinator and research task graphs.
-7. Build evaluation, replay, fault-injection, and benchmark gates.
+4. Add portable history and memory import/export commands.
+5. Implement `memories.redb` independently with bounded retrieval.
+6. Make Tachyond an idempotent durable scheduler with restart reconciliation.
+7. Introduce the independent Background Coordinator and research task graphs.
+8. Build evaluation, replay, fault-injection, and benchmark gates.

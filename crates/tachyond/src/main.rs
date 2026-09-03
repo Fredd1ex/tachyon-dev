@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-mod memory;
+mod history_store;
+mod runtime_store;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -14,17 +15,19 @@ use nix::unistd::Pid;
 
 use tachyon_api::types::{
     AgentEvent as StructuredAgentEvent, AgentInfo, AgentState, ApiRequest, ApiResponse,
-    BackgroundCoordinatorInfo, DaemonInfo, EventEnvelope, EventStream, LifecycleRecommendation,
-    LifetimeClass, PendingWorkReviewInfo, WorkOutcome, WorkRequest, WorkResult, WorkReviewContext,
-    WorkReviewDecision, WorkReviewFailure, WorkReviewRecommendation, WorkReviewRequest,
-    PROTO_VERSION,
+    BackgroundCoordinatorInfo, DaemonInfo, EventEnvelope, EventStream, HistoryRole,
+    LifecycleRecommendation, LifetimeClass, PendingWorkReviewInfo, WorkOutcome, WorkRequest,
+    WorkResult, WorkReviewContext, WorkReviewDecision, WorkReviewFailure, WorkReviewRecommendation,
+    WorkReviewRequest, PROTO_VERSION,
 };
 use tachyon_api::{
-    InteractionCommand, InteractionCommandEnvelope, InteractionMetadata, BACKGROUND_ID,
-    FOREGROUND_ID,
+    InteractionCommand, InteractionCommandEnvelope, InteractionEvent, InteractionEventEnvelope,
+    InteractionMetadata, BACKGROUND_ID, FOREGROUND_ID,
 };
-use tachyon_memory::{TaskDocument, TaskMetadata, TaskState};
 use tachyon_util::guard;
+
+use crate::history_store::HistoryStore;
+use crate::runtime_store::{HistoryProjection, RuntimeStore, RuntimeTaskRecord};
 
 const DEFAULT_BACKGROUND_REVIEW_TIMEOUT_SECS: u64 = 20;
 
@@ -75,8 +78,8 @@ struct Registry {
     review_tx: Option<mpsc::SyncSender<WorkReviewRequest>>,
     background_online: bool,
     background_generation: u64,
-    memory: Option<memory::MemoryClient>,
-    memory_path: std::path::PathBuf,
+    runtime_store: Option<Arc<RuntimeStore>>,
+    history_store: Option<Arc<HistoryStore>>,
 }
 
 impl Default for Registry {
@@ -88,8 +91,8 @@ impl Default for Registry {
             review_tx: None,
             background_online: false,
             background_generation: 0,
-            memory: None,
-            memory_path: tachyon_util::daemon::runtime_dir().join("memory.sock"),
+            runtime_store: None,
+            history_store: None,
         }
     }
 }
@@ -318,205 +321,156 @@ fn reap_warm_workers(registry: &Arc<Mutex<Registry>>) {
     }
 }
 
-fn memory_state(state: AgentState) -> Option<TaskState> {
-    match state {
-        AgentState::Running | AgentState::Created | AgentState::Starting => {
-            Some(TaskState::Running)
-        }
-        AgentState::Waiting => Some(TaskState::Waiting),
-        AgentState::Staged => Some(TaskState::Waiting),
-        AgentState::Completed => Some(TaskState::Completed),
-        AgentState::Failed | AgentState::Interrupted => Some(TaskState::Failed),
-        AgentState::Terminated => Some(TaskState::Terminated),
-        AgentState::Released => Some(TaskState::Released),
-    }
-}
-
-fn task_document(info: &AgentInfo, depends_on: &[String], note: &str) -> Option<TaskDocument> {
-    Some(TaskDocument {
-        metadata: TaskMetadata {
-            id: info.id.clone(),
-            kind: "agent".into(),
-            objective: info.task.clone(),
-            state: memory_state(info.state)?,
-            depends_on: depends_on.to_vec(),
-            created_at: info.created_secs.to_string(),
-            updated_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs().to_string())
-                .unwrap_or_else(|_| info.created_secs.to_string()),
-            sensitivity: "normal".into(),
-        },
-        body: format!(
-            "# Agent\n\nTask: {}\n\nWorkspace: {}\n\nState: {}\n\nSession: {}\n\nLifetime: {}\n\nRetained: {}\n\nLeaseUntil: {}\n\nPurpose: {}\n\nOwner: {}\n\nLastActivity: {}\n\nCheckpoint: {}\n\nTurns: {}\n\nTurnBudget: {}\n\nTaskType: {}\n\nDescription: {}\n\nPersistent: {}\n\nStageUntil: {}\n\nLogicalTask: {}\n\nOriginTurn: {}\n\nParentTask: {}\n\nToolCall: {}\n\n{}",
-            info.task,
-            info.workspace,
-            info.state,
-            info.session_id,
-            info.lifetime_class,
-            info.retained,
-            info.lease_until_secs.map(|v| v.to_string()).unwrap_or_default(),
-            info.purpose,
-            info.owner,
-            info.last_activity_secs,
-            info.checkpoint_available,
-            info.turns_used,
-            info.turn_budget.map(|v| v.to_string()).unwrap_or_default(),
-            info.task_type,
-            info.description,
-            info.persistent,
-            info.stage_until_secs.map(|v| v.to_string()).unwrap_or_default(),
-            info.logical_task_id.as_deref().unwrap_or_default(),
-            info.origin_turn_id.as_deref().unwrap_or_default(),
-            info.parent_task_id.as_deref().unwrap_or_default(),
-            info.tool_call_id.as_deref().unwrap_or_default(),
-            note
-        ),
-    })
-}
-
 fn persist_task(registry: &Arc<Mutex<Registry>>, info: &AgentInfo, note: &str) {
     if info.id == FOREGROUND_ID {
         return;
     }
-    let (client, path) = {
+    let (runtime_store, runtime_task) = {
         let reg = registry.lock().unwrap();
-        (reg.memory.clone(), reg.memory_path.clone())
+        let task = reg.tasks.get(&info.id);
+        (
+            reg.runtime_store.clone(),
+            RuntimeTaskRecord {
+                schema_version: 1,
+                updated_at_ms: unix_now_ms(),
+                info: info.clone(),
+                depends_on: task.map(|task| task.depends_on.clone()).unwrap_or_default(),
+                generation: task.map(|task| task.generation).unwrap_or_default(),
+                assignment: task.map(|task| task.assignment).unwrap_or_default(),
+                warm: task.is_some_and(|task| task.warm),
+                ready: task.is_some_and(|task| task.ready),
+                owner: task.and_then(|task| task.owner.clone()),
+                last_used_secs: task.map(|task| task.last_used_secs).unwrap_or_default(),
+                control_socket: task.and_then(|task| task.control_socket.clone()),
+                terminal_usage: task.and_then(|task| task.terminal_usage.clone()),
+                terminal_result: task.and_then(|task| task.terminal_result.clone()),
+            },
+        )
     };
-    let Some(client) = client else { return };
-    let depends_on = registry
-        .lock()
-        .unwrap()
-        .tasks
-        .get(&info.id)
-        .map(|task| task.depends_on.clone())
-        .unwrap_or_default();
-    let Some(document) = task_document(info, &depends_on, note) else {
+    let Some(store) = runtime_store else {
+        eprintln!("tachyond: runtime store missing for task {}", info.id);
         return;
     };
-    if let Err(error) = client.write_task(&document) {
-        eprintln!(
-            "tachyond: memory write {} ({}): {error}",
-            info.id,
-            path.display()
-        );
+    if let Err(error) = store.persist_task_transition(&runtime_task, note, None) {
+        eprintln!("tachyond: runtime write {}: {error}", info.id);
     }
 }
 
-fn restore_memory_tasks(registry: &Arc<Mutex<Registry>>) {
-    let client = registry.lock().unwrap().memory.clone();
-    let Some(client) = client else { return };
-    let documents = match client.list_tasks() {
-        Ok(documents) => documents,
-        Err(error) => {
-            eprintln!("tachyond: memory restore unavailable: {error}");
-            return;
+fn history_projection(data: &str) -> Option<HistoryProjection> {
+    let envelope = serde_json::from_str::<InteractionEventEnvelope>(data).ok()?;
+    let (role, text) = match envelope.event {
+        InteractionEvent::UserTurnAccepted { text } => (HistoryRole::User, text),
+        InteractionEvent::ConversationFinished { text } => (HistoryRole::Assistant, text),
+        InteractionEvent::UserVisibleNotificationPublished { text } => {
+            (HistoryRole::Notification, text)
         }
+        InteractionEvent::ConversationDelta { .. }
+        | InteractionEvent::ConversationIntentProduced { .. }
+        | InteractionEvent::ForegroundRequestTimedOut { .. } => return None,
     };
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(HistoryProjection {
+        schema_version: 1,
+        event_id: envelope.metadata.message_id,
+        conversation_id: envelope.metadata.conversation_id,
+        turn_id: envelope.metadata.turn_id,
+        occurred_at_ms: envelope.metadata.occurred_at_ms,
+        role,
+        text,
+    })
+}
+
+fn project_pending_history(registry: &Arc<Mutex<Registry>>) -> Result<(), String> {
+    let (runtime, history) = {
+        let registry = registry.lock().unwrap();
+        (
+            registry
+                .runtime_store
+                .clone()
+                .ok_or_else(|| "runtime store unavailable".to_string())?,
+            registry.history_store.clone(),
+        )
+    };
+    let Some(history) = history else {
+        return Ok(());
+    };
+    for projection in runtime.pending_history()? {
+        history.apply(&projection)?;
+        runtime.acknowledge_history(&projection.event_id, unix_now_ms())?;
+    }
+    Ok(())
+}
+
+fn persist_interaction_history(registry: &Arc<Mutex<Registry>>, data: &str) {
+    let Some(projection) = history_projection(data) else {
+        return;
+    };
+    let runtime = registry.lock().unwrap().runtime_store.clone();
+    let Some(runtime) = runtime else {
+        eprintln!("tachyond: runtime store missing for history event");
+        return;
+    };
+    if let Err(error) = runtime.enqueue_history(&projection) {
+        eprintln!("tachyond: enqueue history {}: {error}", projection.event_id);
+        return;
+    }
+    if let Err(error) = project_pending_history(registry) {
+        eprintln!("tachyond: project history: {error}");
+    }
+}
+
+fn restore_runtime_tasks(registry: &Arc<Mutex<Registry>>) -> Result<(), String> {
+    let store = registry
+        .lock()
+        .unwrap()
+        .runtime_store
+        .clone()
+        .ok_or_else(|| "runtime store unavailable".to_string())?;
+    let records = store.list_tasks()?;
     let mut reg = registry.lock().unwrap();
-    for document in documents {
-        if document.metadata.id == FOREGROUND_ID {
+    for record in records {
+        if record.info.id == FOREGROUND_ID {
             continue;
         }
-        let workspace = document
-            .body
-            .lines()
-            .find_map(|line| line.strip_prefix("Workspace: "))
-            .unwrap_or("")
-            .to_string();
-        let field = |name: &str| {
-            document
-                .body
-                .lines()
-                .find_map(|line| line.strip_prefix(&format!("{name}: ")))
-                .unwrap_or("")
-        };
-        let lifetime_class =
-            serde_json::from_str::<LifetimeClass>(&format!("\"{}\"", field("Lifetime")))
-                .unwrap_or_default();
         // Only persistent sessions are eligible for daemon restart recovery.
         // Short and long workers remain historical records and are not revived.
-        if lifetime_class != LifetimeClass::Persistent {
+        if record.info.lifetime_class != LifetimeClass::Persistent {
             continue;
         }
-        let mut state = match document.metadata.state {
-            TaskState::Completed => AgentState::Completed,
-            TaskState::Failed => AgentState::Failed,
-            TaskState::Terminated => AgentState::Terminated,
-            TaskState::Released => AgentState::Released,
-            TaskState::Waiting => AgentState::Waiting,
-            TaskState::Ready | TaskState::Running | TaskState::Paused => AgentState::Created,
-        };
-        let created_secs = document.metadata.created_at.parse().unwrap_or(0);
-        let depends_on = document.metadata.depends_on.clone();
-        let retained = field("Retained") == "true";
-        if state == AgentState::Completed && retained {
-            state = AgentState::Created;
+        let mut info = record.info;
+        if matches!(info.state, AgentState::Running | AgentState::Starting)
+            || (info.state == AgentState::Completed && info.retained)
+        {
+            info.state = AgentState::Created;
         }
-        let lease_until_secs = field("LeaseUntil").parse().ok();
-        let turns_used = field("Turns").parse().unwrap_or(0);
-        let turn_budget = field("TurnBudget").parse().ok();
-        let stage_until_secs = field("StageUntil").parse().ok();
-        if stage_until_secs.is_some_and(|deadline| deadline > unix_now()) {
-            state = AgentState::Staged;
+        if info
+            .stage_until_secs
+            .is_some_and(|deadline| deadline > unix_now())
+        {
+            info.state = AgentState::Staged;
         }
-        let info = AgentInfo {
-            id: document.metadata.id.clone(),
-            task: document.metadata.objective.clone(),
-            state,
-            pid: None,
-            workspace,
-            created_secs,
-            retained,
-            lease_until_secs,
-            session_id: {
-                let value = field("Session");
-                if value.is_empty() {
-                    document.metadata.id.clone()
-                } else {
-                    value.into()
-                }
-            },
-            lifetime_class,
-            purpose: field("Purpose").to_string(),
-            owner: field("Owner").to_string(),
-            last_activity_secs: field("LastActivity").parse().unwrap_or(created_secs),
-            checkpoint_available: false,
-            turns_used,
-            turn_budget,
-            task_type: field("TaskType").to_string(),
-            description: field("Description").to_string(),
-            persistent: lifetime_class == LifetimeClass::Persistent,
-            sandboxed: false,
-            stage_until_secs,
-            logical_task_id: (!field("LogicalTask").is_empty())
-                .then(|| field("LogicalTask").to_string()),
-            origin_turn_id: (!field("OriginTurn").is_empty())
-                .then(|| field("OriginTurn").to_string()),
-            parent_task_id: (!field("ParentTask").is_empty())
-                .then(|| field("ParentTask").to_string()),
-            tool_call_id: (!field("ToolCall").is_empty()).then(|| field("ToolCall").to_string()),
-        };
-        let task_owner = info.owner.clone();
-        let task_activity = info.last_activity_secs;
-        let control_socket = format!("{}/.tachyon/agent.sock", info.workspace);
+        info.pid = None;
+        let fallback_control_socket = format!("{}/.tachyon/agent.sock", info.workspace);
         reg.tasks.entry(info.id.clone()).or_insert_with(|| Task {
             info,
-            depends_on,
+            depends_on: record.depends_on,
             process: None,
             stdin: None,
             subs: Vec::new(),
-            generation: 0,
-            assignment: 0,
-            warm: retained,
+            generation: record.generation,
+            assignment: record.assignment,
+            warm: record.warm,
             ready: false,
-            owner: Some(task_owner),
-            last_used_secs: task_activity,
-            control_socket: Some(control_socket),
-            terminal_usage: None,
-            terminal_result: None,
+            owner: record.owner,
+            last_used_secs: record.last_used_secs,
+            control_socket: record.control_socket.or(Some(fallback_control_socket)),
+            terminal_usage: record.terminal_usage,
+            terminal_result: record.terminal_result,
         });
     }
+    Ok(())
 }
 
 fn dependencies_satisfied(registry: &Registry, depends_on: &[String]) -> bool {
@@ -803,6 +757,7 @@ fn correlate_event(data: &str, info: &AgentInfo) -> String {
     if matches!(
         envelope.kind,
         StructuredAgentEvent::Usage { .. }
+            | StructuredAgentEvent::ToolTelemetry { .. }
             | StructuredAgentEvent::ArtifactRegistered { .. }
             | StructuredAgentEvent::WorkerCompleted { .. }
             | StructuredAgentEvent::WorkCandidate { .. }
@@ -1211,6 +1166,7 @@ fn push_event(registry: &Arc<Mutex<Registry>>, id: &str, stream: EventStream, da
             "Work assignment reached a terminal outcome.",
         );
     }
+    persist_interaction_history(registry, &correlated_data);
     log_event(id, &stream, &correlated_data);
     if completed {
         start_ready_tasks(registry);
@@ -1412,38 +1368,30 @@ fn main() -> std::process::ExitCode {
         eprintln!("tachyond: failed to register SIGINT handler: {e}");
     }
 
+    let runtime_store = match RuntimeStore::open(&tachyon_util::daemon::runtime_database_path()) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            eprintln!("tachyond: runtime store unavailable: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let history_store = match HistoryStore::open(&tachyon_util::daemon::history_database_path()) {
+        Ok(store) => Some(Arc::new(store)),
+        Err(error) => {
+            eprintln!("tachyond: history store unavailable; projections will queue: {error}");
+            None
+        }
+    };
+
     let pid = std::process::id();
     if let Err(e) = tachyon_util::daemon::write_pid(pid) {
         eprintln!("tachyond: failed to write pid file: {e}");
         return std::process::ExitCode::FAILURE;
     }
 
-    let memory_socket = tachyon_util::daemon::runtime_dir().join("memory.sock");
-    let mut memory = match spawn_memory() {
-        Ok(child) => {
-            eprintln!("tachyond: memory service started");
-            Some(child)
-        }
-        Err(e) => {
-            eprintln!("tachyond: failed to start memory service: {e}");
-            None
-        }
-    };
-
-    let memory_client =
-        match memory::MemoryClient::connect(&memory_socket, std::time::Duration::from_secs(3)) {
-            Ok(client) => Some(client),
-            Err(error) => {
-                eprintln!(
-                    "tachyond: memory unavailable at {}: {error}",
-                    memory_socket.display()
-                );
-                None
-            }
-        };
     let reg = Arc::new(Mutex::new(Registry {
-        memory: memory_client,
-        memory_path: memory_socket.clone(),
+        runtime_store: Some(runtime_store),
+        history_store,
         ..Registry::default()
     }));
     let (review_tx, review_rx) = mpsc::sync_channel(64);
@@ -1453,7 +1401,14 @@ fn main() -> std::process::ExitCode {
     let background = std::thread::spawn(move || {
         supervise_background(background_registry, review_rx, background_shutdown)
     });
-    restore_memory_tasks(&reg);
+    if let Err(error) = project_pending_history(&reg) {
+        eprintln!("tachyond: replay history outbox: {error}");
+    }
+    if let Err(error) = restore_runtime_tasks(&reg) {
+        eprintln!("tachyond: runtime restore failed: {error}");
+        tachyon_util::daemon::clear_pid();
+        return std::process::ExitCode::FAILURE;
+    }
     start_ready_tasks(&reg);
 
     // Spawn the foreground runtime.
@@ -1567,11 +1522,6 @@ fn main() -> std::process::ExitCode {
 
     shutdown_tasks(&reg);
     let _ = background.join();
-    if let Some(child) = memory.as_mut() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    let _ = std::fs::remove_file(tachyon_util::daemon::runtime_dir().join("memory.sock"));
     tachyon_util::daemon::clear_pid();
     let _ = std::fs::remove_file(tachyon_util::daemon::socket_path());
     println!("tachyond: stopped");
@@ -1788,6 +1738,23 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
                     socket: tachyon_util::daemon::socket_path().display().to_string(),
                     background,
                 },
+            }
+        }
+        HistoryQuery {
+            since_ms,
+            until_ms,
+            limit,
+        } => {
+            if since_ms >= until_ms {
+                return ApiResponse::error("history range must have since_ms < until_ms");
+            }
+            let history = registry.lock().unwrap().history_store.clone();
+            let Some(history) = history else {
+                return ApiResponse::error("history store unavailable");
+            };
+            match history.activity_between(*since_ms, *until_ms, (*limit).clamp(1, 1000) as usize) {
+                Ok(entries) => ApiResponse::History { entries },
+                Err(error) => ApiResponse::error(format!("history query failed: {error}")),
             }
         }
         AgentStart {
@@ -2796,17 +2763,6 @@ fn supervise_background(
     }
 }
 
-/// Resolve the supervised Memory service binary.
-fn memory_path() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("TACHYON_MEMORY_BIN") {
-        return std::path::PathBuf::from(p);
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|d| d.join("tachyon-memory")))
-        .unwrap_or_else(|| "tachyon-memory".into())
-}
-
 fn supervisor_path() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("TACHYON_AGENT_SUPERVISOR_BIN") {
         return p.into();
@@ -2834,21 +2790,6 @@ fn spawn_supervised_ghost(id: &str, workspace: &str) -> std::io::Result<Child> {
             workspace,
         ])
         .current_dir(workspace)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-}
-
-/// Spawn the Markdown-first Memory service under Tachyond supervision.
-fn spawn_memory() -> std::io::Result<Child> {
-    let root = tachyon_util::daemon::data_dir().join("memory");
-    let socket = tachyon_util::daemon::runtime_dir().join("memory.sock");
-    Command::new(memory_path())
-        .arg("--root")
-        .arg(root)
-        .arg("--socket")
-        .arg(socket)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -4102,6 +4043,112 @@ mod tests {
     }
 
     #[test]
+    fn history_projection_keeps_only_canonical_visible_messages() {
+        let metadata = InteractionMetadata {
+            protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
+            message_id: "message-1".into(),
+            correlation_id: "command-1".into(),
+            causation_id: None,
+            conversation_id: "conversation-1".into(),
+            turn_id: Some("1".into()),
+            generation: 0,
+            occurred_at_ms: 123,
+        };
+        let accepted = InteractionEventEnvelope {
+            metadata: metadata.clone(),
+            event: InteractionEvent::UserTurnAccepted {
+                text: "hello".into(),
+            },
+        };
+        let projection = history_projection(&serde_json::to_string(&accepted).unwrap()).unwrap();
+        assert_eq!(projection.role, HistoryRole::User);
+        assert_eq!(projection.text, "hello");
+
+        let delta = InteractionEventEnvelope {
+            metadata,
+            event: InteractionEvent::ConversationDelta {
+                text: "partial".into(),
+            },
+        };
+        assert!(history_projection(&serde_json::to_string(&delta).unwrap()).is_none());
+    }
+
+    #[test]
+    fn history_outbox_projects_and_acknowledges() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Mutex::new(Registry {
+            runtime_store: Some(Arc::new(
+                RuntimeStore::open(&directory.path().join("runtime.redb")).unwrap(),
+            )),
+            history_store: Some(Arc::new(
+                HistoryStore::open(&directory.path().join("history.redb")).unwrap(),
+            )),
+            ..Registry::default()
+        }));
+        let event = InteractionEventEnvelope {
+            metadata: InteractionMetadata {
+                protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
+                message_id: "message-1".into(),
+                correlation_id: "command-1".into(),
+                causation_id: None,
+                conversation_id: "conversation-1".into(),
+                turn_id: Some("1".into()),
+                generation: 0,
+                occurred_at_ms: 123,
+            },
+            event: InteractionEvent::ConversationFinished {
+                text: "answer".into(),
+            },
+        };
+        persist_interaction_history(&registry, &serde_json::to_string(&event).unwrap());
+        let guard = registry.lock().unwrap();
+        assert!(guard
+            .runtime_store
+            .as_ref()
+            .unwrap()
+            .pending_history()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn persistent_workers_restore_from_runtime_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.redb");
+        {
+            let registry = Arc::new(Mutex::new(Registry {
+                runtime_store: Some(Arc::new(RuntimeStore::open(&path).unwrap())),
+                ..Registry::default()
+            }));
+            let mut worker = task("persistent", AgentState::Running);
+            worker.info.lifetime_class = LifetimeClass::Persistent;
+            worker.info.persistent = true;
+            worker.info.retained = true;
+            worker.generation = 4;
+            worker.assignment = 3;
+            registry
+                .lock()
+                .unwrap()
+                .tasks
+                .insert("persistent".into(), worker);
+            let info = registry.lock().unwrap().tasks["persistent"].info.clone();
+            persist_task(&registry, &info, "running");
+        }
+
+        let registry = Arc::new(Mutex::new(Registry {
+            runtime_store: Some(Arc::new(RuntimeStore::open(&path).unwrap())),
+            ..Registry::default()
+        }));
+        restore_runtime_tasks(&registry).unwrap();
+        let guard = registry.lock().unwrap();
+        let restored = &guard.tasks["persistent"];
+        assert_eq!(restored.info.state, AgentState::Created);
+        assert_eq!(restored.generation, 4);
+        assert_eq!(restored.assignment, 3);
+        assert!(restored.process.is_none());
+    }
+
+    #[test]
     fn completed_worker_can_be_demoted_to_a_fresh_short_budget() {
         let registry = Arc::new(Mutex::new(Registry::default()));
         let mut worker = task("worker", AgentState::Completed);
@@ -4122,58 +4169,9 @@ mod tests {
     }
 
     #[test]
-    fn waiting_maps_to_waiting_memory_state() {
-        assert_eq!(memory_state(AgentState::Waiting), Some(TaskState::Waiting));
-    }
-
-    #[test]
     fn lifecycle_states_map_to_expected_unix_signals() {
         assert_eq!(lifecycle_signal(AgentState::Terminated), Signal::SIGTERM);
         assert_eq!(lifecycle_signal(AgentState::Interrupted), Signal::SIGINT);
-    }
-
-    #[test]
-    fn lifecycle_terminal_states_are_preserved_in_memory_mapping() {
-        assert_eq!(
-            memory_state(AgentState::Completed),
-            Some(TaskState::Completed)
-        );
-        assert_eq!(memory_state(AgentState::Failed), Some(TaskState::Failed));
-        assert_eq!(
-            memory_state(AgentState::Interrupted),
-            Some(TaskState::Failed)
-        );
-        assert_eq!(
-            memory_state(AgentState::Terminated),
-            Some(TaskState::Terminated)
-        );
-        assert_eq!(
-            memory_state(AgentState::Released),
-            Some(TaskState::Released)
-        );
-        assert!(AgentState::Released.is_terminal());
-    }
-
-    #[test]
-    fn persisted_task_contains_session_policy_metadata() {
-        let mut worker = task("research", AgentState::Waiting);
-        worker.info.session_id = "session-research".into();
-        worker.info.retained = true;
-        worker.info.purpose = "research".into();
-        worker.info.turn_budget = Some(3);
-        worker.info.logical_task_id = Some("task-7".into());
-        worker.info.origin_turn_id = Some("7".into());
-        worker.info.parent_task_id = Some("task-parent".into());
-        worker.info.tool_call_id = Some("call-7".into());
-        let document = task_document(&worker.info, &[], "retained").expect("document");
-        assert!(document.body.contains("Session: session-research"));
-        assert!(document.body.contains("Retained: true"));
-        assert!(document.body.contains("Purpose: research"));
-        assert!(document.body.contains("TurnBudget: 3"));
-        assert!(document.body.contains("LogicalTask: task-7"));
-        assert!(document.body.contains("OriginTurn: 7"));
-        assert!(document.body.contains("ParentTask: task-parent"));
-        assert!(document.body.contains("ToolCall: call-7"));
     }
 
     #[test]
@@ -4262,6 +4260,60 @@ mod tests {
         };
         assert_eq!(artifact.task_id.as_deref(), Some("task-7"));
         assert_eq!(artifact.work_id.as_deref(), Some("work-1"));
+    }
+
+    #[test]
+    fn tool_telemetry_keeps_local_call_and_gains_daemon_correlation() {
+        let mut worker = task("research", AgentState::Running);
+        worker.info.logical_task_id = Some("task-7".into());
+        worker.info.origin_turn_id = Some("7".into());
+        worker.info.parent_task_id = Some("task-parent".into());
+        worker.info.tool_call_id = Some("delegation-call".into());
+        let event = EventEnvelope {
+            event_id: 1,
+            session_id: "worker".into(),
+            conversation_id: None,
+            turn_id: None,
+            task_id: None,
+            parent_task_id: None,
+            tool_call_id: None,
+            actor: tachyon_api::types::Actor::Worker {
+                id: "worker".into(),
+            },
+            sequence: 1,
+            occurred_at_ms: 1,
+            kind: StructuredAgentEvent::ToolTelemetry {
+                tool_name: "read".into(),
+                call_id: Some("model-call".into()),
+                duration_ms: 4,
+                success: true,
+                truncated: false,
+                bytes_out: 12,
+                error_code: None,
+                identity: tachyon_api::types::ToolTelemetryIdentity {
+                    task_id: None,
+                    work_id: Some("work-7".into()),
+                    generation: Some(1),
+                    assignment: Some(2),
+                    attempt_id: None,
+                },
+            },
+        };
+
+        let enriched: EventEnvelope = serde_json::from_str(&correlate_event(
+            &serde_json::to_string(&event).unwrap(),
+            &worker.info,
+        ))
+        .unwrap();
+        assert_eq!(enriched.task_id.as_deref(), Some("task-7"));
+        assert_eq!(enriched.turn_id.as_deref(), Some("7"));
+        assert_eq!(enriched.parent_task_id.as_deref(), Some("task-parent"));
+        assert_eq!(enriched.tool_call_id.as_deref(), Some("delegation-call"));
+        assert!(matches!(
+            enriched.kind,
+            StructuredAgentEvent::ToolTelemetry { call_id: Some(call_id), .. }
+                if call_id == "model-call"
+        ));
     }
 
     #[test]

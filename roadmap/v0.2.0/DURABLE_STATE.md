@@ -17,14 +17,17 @@ Use redb as the authoritative durable state engine. Markdown agent/task files
 are a temporary compatibility store and must be removed from the runtime write
 path after migration.
 
-Durable data is split into two ownership and retention domains:
+Durable data is split into three ownership and retention domains:
 
 1. **User memory** stores durable facts and preferences about the user, such as
    communication preferences, stable personal context, and explicit choices.
    Records carry provenance, confidence, sensitivity, timestamps, and an
    explicit supersession/revocation path. Runtime cleanup must never delete
    these records merely because a task or worker expired.
-2. **Operational memory** stores the state Tachyon needs to schedule and recover
+2. **History** stores the user-visible record of conversations and completed
+   activity. It supports bounded date, conversation, project, task, and artifact
+   queries without exposing internal reasoning or raw tool traffic.
+3. **Operational memory** stores the state Tachyon needs to schedule and recover
    work: interactions, tasks, workers, events, generations, checkpoints,
    notifications, and commitments. This domain is bounded by lifecycle-aware
    retention and compaction policies.
@@ -32,23 +35,34 @@ Durable data is split into two ownership and retention domains:
 The domains use separate databases, APIs, context budgets, and
 garbage-collection rules:
 
-1. `user-memory.redb` contains user facts, preferences, provenance, confidence,
+1. `memories.redb` contains user facts, preferences, provenance, confidence,
    consent, sensitivity, corrections, revocations, and expiry.
-2. `runtime.redb` contains agent management, workers, tasks, dependencies,
+2. `history.redb` contains conversations, user-visible messages, activity
+   records, durable summaries, temporal indexes, and source references.
+3. `runtime.redb` contains agent management, workers, tasks, dependencies,
    leases, generations, attempts, events, schedules, commitments,
    notifications, checkpoints, terminal outcomes, and artifact references.
 
-No transaction may require atomic writes across both databases. User memory is
-not task state, and operational history is not automatically promoted into user
-memory. Promotion is an explicit validated operation through the user-memory
-API.
+No transaction may require atomic writes across databases. Runtime transitions
+that produce user-visible history append to a durable runtime outbox in the same
+transaction. An idempotent projector applies those records to `history.redb`.
+User memory is not task state, and conversation history is not automatically
+promoted into user memory. Promotion is an explicit validated operation through
+the user-memory API.
 
 Suggested tables:
 
 ```text
-# user-memory.redb
+# memories.redb
 user_facts:         fact_id -> UserFactRecord
 user_fact_index:    (subject, predicate, updated_at) -> fact_id
+
+# history.redb
+conversations:      conversation_id -> ConversationRecord
+messages:           (conversation_id, sequence) -> MessageRecord
+activity:           activity_id -> ActivityRecord
+activity_by_day:    (day, activity_id) -> ()
+history_sources:    (activity_id, source_id) -> SourceReference
 
 # runtime.redb
 tasks:              task_id -> TaskRecord
@@ -61,10 +75,33 @@ generations:        logical_agent_id -> GenerationRecord
 snapshots:          (logical_agent_id, generation) -> SnapshotRecord
 schedules:          schedule_id -> ScheduleRecord
 retention_marks:    record_id -> RetentionRecord
+history_outbox:     event_id -> HistoryProjection
 ```
 
 Large artifacts and user-readable exports remain files referenced by durable
 records. The database should not become a blob store for arbitrary tool output.
+
+Canonical databases live under `$TACHYON_DATA_DIR/databases` (normally
+`~/.local/share/tachyon/databases`). Project `.tachyon` directories and
+`~/.tachyon/exports` are versioned import/export surfaces, not locations for
+live database files. Binary databases are not merged or synchronized as
+dotfiles; JSONL/TOML exports use stable IDs, hashes, dry-run validation, and
+explicit conflict handling.
+
+## Context Compaction
+
+Tachyond owns token accounting and triggers compaction when an agent reaches a
+configurable soft threshold, initially 65 percent of its context window. A model
+may produce a candidate summary, but Rust validates and installs the resulting
+versioned snapshot with its source cursor and generation. Compaction targets a
+lower watermark and uses hysteresis so it does not run every turn.
+
+Compaction never deletes canonical conversation history, user memory, or task
+events. It replaces only the bounded context projection supplied to an active
+agent. The Memory Agent may retrieve memory and propose summaries or durable
+facts, but it cannot write runtime state directly or manage all three databases.
+Tachyond remains the runtime writer, the history projector owns history writes,
+and the Memory service validates curated-memory writes.
 
 ## Migration Rules
 
@@ -120,6 +157,6 @@ engine alone does not prevent state or token growth.
 Finish the v0.2.0 command/event ownership boundary first, then define versioned
 record schemas from those protocol types. Implement `runtime.redb` as part of
 the v0.4.0 kernel before durable scheduling, retries, commitments, or restart
-reconciliation are considered complete. Implement `user-memory.redb`
+reconciliation are considered complete. Implement `memories.redb`
 independently so memory semantics can evolve without coupling user facts to
 agent lifecycle transactions.

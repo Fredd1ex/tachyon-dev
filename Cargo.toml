@@ -28,6 +28,7 @@ ignore = "0.4"
 globset = "0.4"
 regex = "1"
 sha2 = "0.10"
+redb = "2"
 
 [workspace.dependencies.tachyon-util]
 path = "crates/tachyon-util"

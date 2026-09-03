@@ -1,187 +1,260 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-const CATEGORIES: &[&str] = &[
-    "profile",
-    "preferences",
-    "projects",
-    "tasks",
-    "events",
-    "working",
-    "archive",
-];
+const SCHEMA_VERSION: u64 = 1;
+const METADATA: TableDefinition<&str, u64> = TableDefinition::new("metadata");
+const MEMORIES: TableDefinition<&str, &[u8]> = TableDefinition::new("memories");
+const SUBJECT_PREDICATE_INDEX: TableDefinition<&str, &str> =
+    TableDefinition::new("subject_predicate_index");
+const REVOCATIONS: TableDefinition<&str, u64> = TableDefinition::new("revocations");
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
-    #[error("memory io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("memory metadata error: {0}")]
-    Metadata(#[from] toml::de::Error),
+    #[error("memory storage error: {0}")]
+    Storage(String),
     #[error("memory serialization error: {0}")]
-    Serialization(#[from] toml::ser::Error),
+    Serialization(#[from] serde_json::Error),
     #[error("invalid memory identifier: {0}")]
     InvalidIdentifier(String),
-    #[error("task not found: {0}")]
+    #[error("memory not found: {0}")]
     NotFound(String),
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum TaskState {
-    Ready,
-    Running,
-    Waiting,
-    Paused,
-    Completed,
-    Failed,
-    Terminated,
-    Released,
+    #[error("memory identifier conflicts with an existing record: {0}")]
+    Conflict(String),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct TaskMetadata {
+pub struct MemoryRecord {
+    pub schema_version: u32,
     pub id: String,
-    pub kind: String,
-    pub objective: String,
-    pub state: TaskState,
-    #[serde(default)]
-    pub depends_on: Vec<String>,
-    pub created_at: String,
-    pub updated_at: String,
-    #[serde(default = "default_sensitivity")]
+    pub subject: String,
+    pub predicate: String,
+    pub value: String,
+    pub provenance: String,
+    pub confidence_millis: u16,
     pub sensitivity: String,
-}
-
-fn default_sensitivity() -> String {
-    "normal".into()
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct TaskDocument {
-    pub metadata: TaskMetadata,
-    pub body: String,
+    pub consent: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
+    pub supersedes: Option<String>,
 }
 
 pub struct MemoryStore {
-    root: PathBuf,
+    database: Database,
 }
 
 impl MemoryStore {
-    pub fn open(root: impl Into<PathBuf>) -> Result<Self, MemoryError> {
-        let store = Self { root: root.into() };
-        store.ensure_layout()?;
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                MemoryError::Storage(format!("create {}: {error}", parent.display()))
+            })?;
+        }
+        let database = Database::create(path).map_err(storage)?;
+        let store = Self { database };
+        store.initialize()?;
         Ok(store)
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    pub fn ensure_layout(&self) -> Result<(), MemoryError> {
-        for category in CATEGORIES {
-            fs::create_dir_all(self.root.join(category))?;
+    fn initialize(&self) -> Result<(), MemoryError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let mut metadata = write.open_table(METADATA).map_err(storage)?;
+            let found = metadata
+                .get("schema_version")
+                .map_err(storage)?
+                .map(|value| value.value());
+            match found {
+                Some(SCHEMA_VERSION) => {}
+                Some(version) => {
+                    return Err(MemoryError::Storage(format!(
+                        "unsupported memories schema {version}; expected {SCHEMA_VERSION}"
+                    )));
+                }
+                None => {
+                    metadata
+                        .insert("schema_version", SCHEMA_VERSION)
+                        .map_err(storage)?;
+                }
+            }
+            write.open_table(MEMORIES).map_err(storage)?;
+            write.open_table(SUBJECT_PREDICATE_INDEX).map_err(storage)?;
+            write.open_table(REVOCATIONS).map_err(storage)?;
         }
-        Ok(())
+        write.commit().map_err(storage)
     }
 
-    pub fn write_task(&self, document: &TaskDocument) -> Result<(), MemoryError> {
-        validate_identifier(&document.metadata.id)?;
-        let path = self
-            .root
-            .join("tasks")
-            .join(format!("{}.md", document.metadata.id));
-        let temp = path.with_extension(format!("md.tmp.{}", std::process::id()));
-        let metadata = toml::to_string_pretty(&document.metadata)?;
-        let content = format!("+++\n{metadata}+++\n\n{}\n", document.body.trim_end());
-        fs::write(&temp, content)?;
-        fs::rename(temp, path)?;
-        Ok(())
+    pub fn put(&self, record: &MemoryRecord) -> Result<(), MemoryError> {
+        validate(record)?;
+        let bytes = serde_json::to_vec(record)?;
+        let index_key = format!(
+            "{}:{}:{:020}:{}",
+            record.subject, record.predicate, record.updated_at_ms, record.id
+        );
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let memories = write.open_table(MEMORIES).map_err(storage)?;
+            let existing = memories
+                .get(record.id.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_vec());
+            if let Some(existing) = existing {
+                let existing: MemoryRecord = serde_json::from_slice(&existing)?;
+                if existing == *record {
+                    return Ok(());
+                }
+                return Err(MemoryError::Conflict(record.id.clone()));
+            }
+        }
+        write
+            .open_table(MEMORIES)
+            .map_err(storage)?
+            .insert(record.id.as_str(), bytes.as_slice())
+            .map_err(storage)?;
+        write
+            .open_table(SUBJECT_PREDICATE_INDEX)
+            .map_err(storage)?
+            .insert(index_key.as_str(), record.id.as_str())
+            .map_err(storage)?;
+        write.commit().map_err(storage)
     }
 
-    pub fn read_task(&self, id: &str) -> Result<TaskDocument, MemoryError> {
+    pub fn get(&self, id: &str) -> Result<MemoryRecord, MemoryError> {
         validate_identifier(id)?;
-        let path = self.root.join("tasks").join(format!("{id}.md"));
-        let content = fs::read_to_string(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                MemoryError::NotFound(id.into())
-            } else {
-                MemoryError::Io(error)
-            }
-        })?;
-        parse_task(&content)
+        let read = self.database.begin_read().map_err(storage)?;
+        let revocations = read.open_table(REVOCATIONS).map_err(storage)?;
+        if revocations.get(id).map_err(storage)?.is_some() {
+            return Err(MemoryError::NotFound(id.into()));
+        }
+        let memories = read.open_table(MEMORIES).map_err(storage)?;
+        let value = memories
+            .get(id)
+            .map_err(storage)?
+            .ok_or_else(|| MemoryError::NotFound(id.into()))?;
+        Ok(serde_json::from_slice(value.value())?)
     }
 
-    pub fn list_tasks(&self) -> Result<Vec<TaskDocument>, MemoryError> {
-        let mut tasks = Vec::new();
-        for entry in fs::read_dir(self.root.join("tasks"))? {
-            let entry = entry?;
-            if entry.path().extension().and_then(|ext| ext.to_str()) != Some("md") {
-                continue;
+    pub fn list(&self) -> Result<Vec<MemoryRecord>, MemoryError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let memories = read.open_table(MEMORIES).map_err(storage)?;
+        let revocations = read.open_table(REVOCATIONS).map_err(storage)?;
+        let mut records = Vec::new();
+        for entry in memories.iter().map_err(storage)? {
+            let (id, value) = entry.map_err(storage)?;
+            if revocations.get(id.value()).map_err(storage)?.is_none() {
+                records.push(serde_json::from_slice(value.value())?);
             }
-            tasks.push(parse_task(&fs::read_to_string(entry.path())?)?);
         }
-        tasks.sort_by(|left, right| left.metadata.id.cmp(&right.metadata.id));
-        Ok(tasks)
+        records.sort_by(|left: &MemoryRecord, right| left.id.cmp(&right.id));
+        Ok(records)
+    }
+
+    pub fn revoke(&self, id: &str, revoked_at_ms: u64) -> Result<(), MemoryError> {
+        validate_identifier(id)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let memories = write.open_table(MEMORIES).map_err(storage)?;
+            if memories.get(id).map_err(storage)?.is_none() {
+                return Err(MemoryError::NotFound(id.into()));
+            }
+        }
+        write
+            .open_table(REVOCATIONS)
+            .map_err(storage)?
+            .insert(id, revoked_at_ms)
+            .map_err(storage)?;
+        write.commit().map_err(storage)
     }
 }
 
-fn validate_identifier(id: &str) -> Result<(), MemoryError> {
-    if id.is_empty()
-        || id == "."
-        || id == ".."
-        || id.contains('/')
-        || id.contains('\\')
-        || id.contains("..")
+fn storage(error: impl std::fmt::Display) -> MemoryError {
+    MemoryError::Storage(error.to_string())
+}
+
+fn validate(record: &MemoryRecord) -> Result<(), MemoryError> {
+    validate_identifier(&record.id)?;
+    if record.schema_version != SCHEMA_VERSION as u32
+        || record.subject.trim().is_empty()
+        || record.predicate.trim().is_empty()
+        || record.value.trim().is_empty()
+        || record.provenance.trim().is_empty()
+        || record.consent.trim().is_empty()
+        || record.confidence_millis > 1000
     {
-        return Err(MemoryError::InvalidIdentifier(id.into()));
+        return Err(MemoryError::InvalidIdentifier(record.id.clone()));
     }
     Ok(())
 }
 
-fn parse_task(content: &str) -> Result<TaskDocument, MemoryError> {
-    let Some(rest) = content.strip_prefix("+++\n") else {
-        return Err(MemoryError::InvalidIdentifier(
-            "missing TOML front matter".into(),
-        ));
-    };
-    let Some((metadata, body)) = rest.split_once("\n+++\n") else {
-        return Err(MemoryError::InvalidIdentifier(
-            "unterminated TOML front matter".into(),
-        ));
-    };
-    Ok(TaskDocument {
-        metadata: toml::from_str(metadata)?,
-        body: body.trim_start_matches('\n').trim_end().to_string(),
-    })
+fn validate_identifier(id: &str) -> Result<(), MemoryError> {
+    if id.is_empty() || id == "." || id == ".." || id.contains('/') || id.contains('\\') {
+        return Err(MemoryError::InvalidIdentifier(id.into()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn record(id: &str) -> MemoryRecord {
+        MemoryRecord {
+            schema_version: 1,
+            id: id.into(),
+            subject: "user".into(),
+            predicate: "response_style".into(),
+            value: "concise".into(),
+            provenance: "explicit user statement in conversation-1 turn-2".into(),
+            confidence_millis: 1000,
+            sensitivity: "normal".into(),
+            consent: "stated".into(),
+            created_at_ms: 100,
+            updated_at_ms: 100,
+            expires_at_ms: None,
+            supersedes: None,
+        }
+    }
+
     #[test]
-    fn task_round_trip_uses_markdown_front_matter() {
-        let root = std::env::temp_dir().join(format!("tachyon-memory-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let store = MemoryStore::open(&root).unwrap();
-        let document = TaskDocument {
-            metadata: TaskMetadata {
-                id: "task-weather".into(),
-                kind: "task".into(),
-                objective: "Find the forecast".into(),
-                state: TaskState::Waiting,
-                depends_on: vec!["task-location".into()],
-                created_at: "2026-08-23T00:00:00Z".into(),
-                updated_at: "2026-08-23T00:01:00Z".into(),
-                sensitivity: "normal".into(),
-            },
-            body: "Waiting for the location task.".into(),
-        };
-        store.write_task(&document).unwrap();
-        assert_eq!(store.read_task("task-weather").unwrap(), document);
-        assert_eq!(store.list_tasks().unwrap().len(), 1);
-        let _ = fs::remove_dir_all(root);
+    fn curated_memory_round_trips_and_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("memories.redb");
+        MemoryStore::open(&path)
+            .unwrap()
+            .put(&record("preference-1"))
+            .unwrap();
+        let store = MemoryStore::open(&path).unwrap();
+        assert_eq!(store.get("preference-1").unwrap(), record("preference-1"));
+    }
+
+    #[test]
+    fn stable_ids_are_idempotent_but_cannot_be_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(directory.path().join("memories.redb")).unwrap();
+        let original = record("preference-1");
+        store.put(&original).unwrap();
+        store.put(&original).unwrap();
+        let mut conflicting = original;
+        conflicting.value = "verbose".into();
+        assert!(matches!(
+            store.put(&conflicting),
+            Err(MemoryError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn revoked_memory_is_excluded_from_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(directory.path().join("memories.redb")).unwrap();
+        store.put(&record("preference-1")).unwrap();
+        store.revoke("preference-1", 200).unwrap();
+        assert!(matches!(
+            store.get("preference-1"),
+            Err(MemoryError::NotFound(_))
+        ));
+        assert!(store.list().unwrap().is_empty());
     }
 }

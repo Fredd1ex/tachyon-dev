@@ -1,168 +1,73 @@
 # Memory Service Design
 
-Memory is a separate supervised service. Tachyond manages its lifecycle, but
-Memory owns the memory files and their consistency. Foreground never
-writes Markdown files directly.
+Tachyon separates operational state, user-visible history, and curated user
+memory into independent redb databases under
+`$TACHYON_DATA_DIR/databases` (normally
+`~/.local/share/tachyon/databases`).
 
 ```text
-Tachyond
-  ├── tachyon-foreground
-  ├── worker Ghosts
-  └── Memory service
-        └── Markdown files
+Tachyond -> runtime.redb
+         -> durable outbox -> history projector -> history.redb
+Memory service -> memories.redb
 ```
 
-## Responsibilities
+## Ownership
 
-Memory owns:
+- Tachyond is the only writer for `runtime.redb`.
+- The idempotent history projector is the only writer for `history.redb`.
+- The Memory service validates and commits writes to `memories.redb`.
+- Foreground, Background, and Ghost never open database files directly.
+- No operation assumes an atomic transaction across database files.
 
-- Durable task state and dependencies.
-- Working conversational context.
-- Long-term user profile and preferences.
-- Project and task knowledge.
-- Event/history records.
-- Provenance, timestamps, freshness, and sensitivity metadata.
-- Atomic reads and writes.
-- The searchable metadata index.
+Runtime stores tasks, workers, generations, assignments, transition events,
+leases, snapshots, and the history outbox. History stores only canonical
+user-visible messages and notifications, indexed by conversation, timestamp,
+and UTC day. Streamed deltas, reasoning, tool traffic, and transient status are
+not history.
 
-Tachyond owns:
+Curated memory records contain:
 
-- Starting and supervising Memory.
-- Restarting Memory after failure.
-- Restricting access to the Memory API.
-- Routing Foreground and client requests.
-- Starting a fresh interactive Foreground session after daemon restart unless
-  the user explicitly requests session resumption.
+- Stable record ID
+- Subject, predicate, and value
+- Provenance
+- Confidence
+- Sensitivity and consent
+- Creation and update timestamps
+- Optional expiry and superseded record
+- Durable revocation marker
 
-The Orchestrator owns:
+Stable IDs are idempotent. Reusing an ID for different content fails instead of
+silently rewriting user memory. Revoked records are excluded from reads but
+retain a tombstone so stale imports cannot resurrect them.
 
-- Proposing memory updates.
-- Deciding which context it needs.
-- Deciding whether a task should be retained or released.
+## Memory Agent
 
-Memory validates and commits Orchestrator proposals. The Orchestrator cannot
-grant itself broader memory access.
+The future Memory Agent proposes summaries and facts but does not receive direct
+database access. The Rust Memory service validates its typed proposals. History
+is never automatically promoted into user memory.
 
-## Directory Layout
+Tachyond owns context token accounting. At the configurable soft threshold,
+initially 65 percent, it schedules compaction. A model may generate a candidate
+summary, but Tachyond validates and installs it as a versioned runtime snapshot
+with a source cursor and context epoch. Compaction never deletes canonical
+history or curated memory.
 
-The initial taxonomy is intentionally small and predictable:
+## Portability
 
-```text
-memory/
-├── profile/                 # Stable facts about the user
-├── preferences/             # User preferences and interaction choices
-├── projects/                # Durable project context and summaries
-├── tasks/                   # Durable task state, dependencies, and results
-├── events/                  # Important chronological observations
-├── working/                 # Active sessions and temporary task context
-└── archive/                 # Released or superseded entries
-```
+Live redb files are not dotfiles and must not be merged while open. Versioned
+JSONL/TOML exports belong in `~/.tachyon/exports` or a project's `.tachyon`
+directory. Imports use stable IDs, hashes, schema validation, dry-run reporting,
+and explicit conflict handling.
 
-Categories should not be added casually. A file belongs in the narrowest
-category that makes it easy to find later. Active data stays in `working/` or
-`tasks/`; compacted durable knowledge moves to the appropriate long-term
-category.
+## Progress
 
-## Markdown Format
-
-Memory files use TOML front matter followed by human-readable Markdown:
-
-```markdown
-+++
-id = "task-..."
-kind = "task"
-state = "waiting"
-created_at = "2026-08-23T13:00:00Z"
-updated_at = "2026-08-23T13:05:00Z"
-depends_on = ["task-..."]
-sensitivity = "normal"
-+++
-
-# London Weather
-
-The forecast is pending a worker result.
-```
-
-Required metadata should remain small and machine-oriented. The Markdown body
-holds explanation, evidence, and human-readable context.
-
-## Task Recovery
-
-Task recovery is the first milestone. On restart, Memory reconstructs:
-
-- Task IDs and objectives.
-- Task state: `ready`, `running`, `waiting`, `paused`, `completed`, or `failed`.
-- Explicit dependencies.
-- Evidence references and result freshness.
-- Which tasks can be resumed, recreated, or released.
-
-The Orchestrator can then be replaced without losing logical task continuity.
-
-## Conversation Session Boundary
-
-Interactive conversation history is separate from Tachyond's process lifetime.
-The default user experience is a fresh Orchestrator conversation after a daemon
-restart. Durable memory and task records are not deleted by that restart.
-
-The future memory protocol should support explicit session operations:
-
-```text
-memory.session.create()
-memory.session.resume(session_id)
-memory.session.clear(session_id)
-memory.session.summarize(session_id)
-```
-
-This allows Tachyond to restart cleanly while a replacement Orchestrator can
-resume a selected conversation from Memory when the user wants continuity.
-The TUI should make `new session` and `resume session` visibly different actions.
-
-## Working Memory
-
-Active sessions and temporary context live under `working/`. Working memory is
-not automatically promoted to long-term memory. The Orchestrator proposes a
-summary or fact update; Memory validates its category, metadata, provenance,
-sensitivity, and destination before writing it.
-
-## Access And Consistency
-
-Only Tachyond talks directly to Memory. The initial protocol should support:
-
-```text
-memory.read(scope, query)
-memory.search(scope, query)
-memory.task.create(task)
-memory.task.update(task_id, transition)
-memory.task.dependencies(task_id)
-memory.evidence.attach(task_id, evidence)
-memory.propose_update(candidate)
-memory.release(task_id)
-```
-
-Memory owns all writes and uses temporary files plus atomic rename. It maintains
-a small structured index from front matter and supports scoped text search over
-Markdown content. No database or graph store is required for the initial
-implementation.
-
-## Privacy
-
-Entries carry a sensitivity scope. Memory must filter results before returning
-them:
-
-- `normal` — available to the Orchestrator for the relevant session/task.
-- `private` — only returned through an explicitly authorized request.
-- `user_only` — requires an explicit user-mediated flow.
-
-The TUI should never display private memory merely because it is subscribed to
-the Orchestrator stream.
-
-## Implementation Progress
-
-- [x] File layout and TOML front matter parser.
-- [x] Atomic task file read/write API.
-- [x] Task files with dependencies and state metadata.
-- [x] Unix-socket Memory service started and stopped by Tachyond.
-- [ ] Structured index and scoped text search.
-- [ ] Memory health checks, restart recovery, and typed Tachyond integration.
-- [ ] Orchestrator integration for task recovery.
-- [ ] Validated long-term memory proposals.
+- [x] Authoritative `runtime.redb` task snapshots and transition events.
+- [x] Indexed persistent-worker recovery without Markdown scans.
+- [x] Durable runtime history outbox with idempotent acknowledgement.
+- [x] Versioned `history.redb` conversation and temporal indexes.
+- [x] Versioned `memories.redb` records, conflict checks, and revocations.
+- [x] Bounded daemon-owned temporal history query API and CLI.
+- [ ] Scoped and bounded curated-memory retrieval for agent use.
+- [ ] Memory Agent proposal and validation loop.
+- [ ] Durable 65-percent compaction scheduling and context epochs.
+- [ ] Portable import/export commands.

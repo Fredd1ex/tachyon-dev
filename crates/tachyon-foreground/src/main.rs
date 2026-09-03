@@ -550,8 +550,9 @@ async fn process_turn(
         stage: "ready".into(),
         elapsed_ms: accepted_at.elapsed().as_millis() as u64,
     });
-    let snapshot = conversation.lock().unwrap().messages.clone();
-    let mut local = snapshot;
+    let active_snapshot = active_turns.lock().unwrap().clone();
+    let mut local =
+        available_conversation_snapshot(&conversation.lock().unwrap(), &active_snapshot, turn);
     let follow_up_evidence = accepted_follow_up_evidence(
         &conversation.lock().unwrap().evidence,
         turn.saturating_sub(1),
@@ -574,13 +575,13 @@ async fn process_turn(
         {
             Ok(Ok((outcome, usage, malformed))) => (outcome, usage, malformed, false),
             Ok(Err(_)) => (
-                Answerability::NeedsNewWork,
+                Answerability::AnswerFromContext,
                 TokenUsage::default(),
                 true,
                 false,
             ),
             Err(_) => (
-                Answerability::NeedsNewWork,
+                Answerability::AnswerFromContext,
                 TokenUsage::default(),
                 true,
                 true,
@@ -729,6 +730,41 @@ fn commit_ready_turns(conversation: &mut ConversationState) {
         conversation.messages.extend(messages);
         conversation.next_commit += 1;
     }
+}
+
+fn available_conversation_snapshot(
+    conversation: &ConversationState,
+    active_turns: &BTreeMap<u64, String>,
+    current_turn: u64,
+) -> Vec<ChatMessage> {
+    let mut messages = conversation.messages.clone();
+    for pending in conversation
+        .pending
+        .range(..current_turn)
+        .map(|(_, messages)| messages)
+    {
+        messages.extend(pending.iter().cloned());
+    }
+    let active = active_turns
+        .range(..current_turn)
+        .filter(|(turn, _)| !conversation.pending.contains_key(turn))
+        .map(|(turn, request)| {
+            format!(
+                "Request {turn} (still in progress): {}",
+                truncate(request, 400)
+            )
+        })
+        .collect::<Vec<_>>();
+    if !active.is_empty() {
+        messages.push(ChatMessage::new(
+            Role::System,
+            format!(
+                "Live conversation context. These requests are visible to the user but do not have final answers yet:\n{}",
+                active.join("\n")
+            ),
+        ));
+    }
+    messages
 }
 
 fn chat_checkpoint_path(workspace: &PathBuf, role: AgentRole) -> PathBuf {
@@ -887,6 +923,12 @@ fn context_terms(text: &str) -> std::collections::BTreeSet<String> {
                     | "need"
                     | "have"
                     | "about"
+                    | "conversation"
+                    | "current"
+                    | "currently"
+                    | "summary"
+                    | "summarize"
+                    | "recap"
             )
         })
         .collect()
@@ -1104,6 +1146,7 @@ fn event_turn(event: &AgentEvent) -> Option<u64> {
         | AgentEvent::Error { turn, .. } => *turn,
         AgentEvent::Timing { turn, .. } => Some(*turn),
         AgentEvent::WorkerCompleted { .. }
+        | AgentEvent::ToolTelemetry { .. }
         | AgentEvent::ArtifactRegistered { .. }
         | AgentEvent::WorkCandidate { .. }
         | AgentEvent::WorkProgress { .. }
@@ -1255,6 +1298,7 @@ async fn loop_until_done(
                 model,
                 conversation,
                 tools.as_deref().expect("conversation tools are enabled"),
+                !force_delegation,
                 &mut relay,
             )
             .await
@@ -1616,8 +1660,27 @@ fn compose_worker_response(conversation: &[ChatMessage]) -> String {
 fn usable_acknowledgement(text: &str) -> Option<String> {
     let text = text.trim().replace('\n', " ");
     let lower = text.to_ascii_lowercase();
+    let signals_progress = [
+        "check",
+        "look",
+        "gather",
+        "review",
+        "work",
+        "find",
+        "pull",
+        "get back",
+        "verify",
+        "compare",
+        "investigat",
+        "handle",
+        "help",
+    ]
+    .iter()
+    .any(|term| lower.contains(term));
     if text.is_empty()
-        || text.len() > 240
+        || text.len() > 160
+        || text.matches(['.', '!', '?']).count() > 1
+        || !signals_progress
         || [
             "tool",
             "worker",
@@ -2048,6 +2111,10 @@ mod tests {
             fallback_interaction_decision(active, "tell me a joke"),
             InteractionDecision::AnswerNow
         );
+        assert_eq!(
+            fallback_interaction_decision(active, "summarize our current conversation"),
+            InteractionDecision::AnswerNow
+        );
     }
 
     fn completed_evidence(turn: u64, result: impl Into<String>) -> EvidenceRecord {
@@ -2230,6 +2297,41 @@ mod tests {
                 .map(ChatMessage::plain)
                 .collect::<Vec<_>>(),
             ["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn immediate_turn_context_includes_visible_unfinished_requests() {
+        let conversation = ConversationState {
+            messages: vec![ChatMessage::new(Role::System, "system")],
+            evidence: Vec::new(),
+            pending: BTreeMap::from([(
+                2,
+                durable_turn_messages("second request".into(), "second answer".into()),
+            )]),
+            next_commit: 1,
+        };
+        let active = BTreeMap::from([
+            (1, "first request".into()),
+            (2, "second request".into()),
+            (3, "third request".into()),
+        ]);
+
+        let snapshot = available_conversation_snapshot(&conversation, &active, 3);
+        let text = snapshot
+            .iter()
+            .map(ChatMessage::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("first request"));
+        assert!(text.contains("second answer"));
+        assert!(!text.contains("third request"));
+        assert_eq!(
+            snapshot
+                .iter()
+                .filter(|message| message.plain().contains("second request"))
+                .count(),
+            1
         );
     }
 
@@ -2470,6 +2572,12 @@ mod tests {
         assert_eq!(
             usable_acknowledgement("I am checking the details now."),
             Some("I am checking the details now.".into())
+        );
+        assert_eq!(
+            usable_acknowledgement(
+                "Based on the current conditions, you will not need a coat. It is mild outside."
+            ),
+            None
         );
     }
 

@@ -131,6 +131,11 @@ fn dispatch(cmd: Command, p: &tachyon::style::Palette) -> ExitCode {
             command: args.command,
         },
         Command::Attach(args) => ApiRequest::AgentAttach { id: args.id },
+        Command::History(args) => ApiRequest::HistoryQuery {
+            since_ms: args.since_ms,
+            until_ms: args.until_ms,
+            limit: args.limit,
+        },
         Command::Top(_) => ApiRequest::Top,
         Command::Daemon(_) | Command::Providers(_) => unreachable!("handled above"),
     };
@@ -250,6 +255,14 @@ fn print_response(resp: ApiResponse, p: &tachyon::style::Palette) {
                 for l in lines {
                     println!("{l}");
                 }
+            }
+        }
+        History { entries } => {
+            for entry in entries {
+                println!(
+                    "{}\t{:?}\t{}\t{}",
+                    entry.occurred_at_ms, entry.role, entry.conversation_id, entry.text
+                );
             }
         }
         Exec {

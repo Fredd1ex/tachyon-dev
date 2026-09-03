@@ -31,11 +31,11 @@ tachyon/
 │       ├── HARNESS.md            # Ghost tools and execution behavior
 │       └── SANDBOX.md            # Workspace access and isolation policy
 ├── crates/
-│   ├── memory/                    # Markdown-first durable memory service
+│   ├── memory/                    # Curated redb-backed memory service
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── main.rs            # Standalone Unix-socket service
-│   │       ├── store.rs           # Categories, front matter, atomic task files
+│   │       ├── store.rs           # Versioned facts, indexes, and revocations
 │   │       ├── protocol.rs        # Memory request/response types
 │   │       └── lib.rs             # Memory crate exports
 │   │

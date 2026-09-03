@@ -17,7 +17,7 @@
 //!
 //! Slash commands: /exit, /await, /stop, /release, /replan, /kill
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::sync::mpsc;
@@ -190,46 +190,59 @@ fn sanitize_reply_text(text: &str) -> String {
     }
 }
 
-fn reply_completed_after_later_user(thread: &Thread, item: &Item) -> bool {
-    let Some(reply_turn) = item
-        .turn
-        .as_deref()
-        .and_then(|turn| turn.parse::<u64>().ok())
-    else {
-        return false;
-    };
-    thread.items.iter().any(|candidate| {
-        candidate.kind == ItemKind::User
-            && candidate.timestamp < item.timestamp
-            && candidate
-                .turn
-                .as_deref()
-                .and_then(|turn| turn.parse::<u64>().ok())
-                .is_some_and(|user_turn| user_turn > reply_turn)
+fn ready_earlier_turn(threads: &[Thread]) -> Option<u64> {
+    let thread = threads.iter().find(|thread| thread.is_foreground)?;
+    thread
+        .unread_turns
+        .iter()
+        .filter_map(|turn| turn.parse::<u64>().ok())
+        .min()
+}
+
+fn ready_notice(turn: u64) -> String {
+    format!("  {} response {turn} ready · click to view ", icon::SUCCESS)
+}
+
+fn turn_index_for_id(thread: &Thread, projection: &TurnProjection, turn: u64) -> Option<usize> {
+    projection.cells.iter().position(|cell| {
+        thread.items[cell.prompt]
+            .turn
+            .as_deref()
+            .and_then(|turn| turn.parse::<u64>().ok())
+            == Some(turn)
     })
 }
 
-fn ready_earlier_turn(threads: &[Thread]) -> Option<u64> {
-    let thread = threads.iter().find(|thread| thread.is_foreground)?;
-    let latest_turn = thread
-        .items
+fn mark_ready_turn_seen(threads: &mut [Thread], turn: u64) {
+    if let Some(thread) = threads.iter_mut().find(|thread| thread.is_foreground) {
+        thread.unread_turns.remove(&turn.to_string());
+    }
+}
+
+fn mark_visible_ready_turns_seen(
+    threads: &mut [Thread],
+    projection: &TurnProjection,
+    view: &TranscriptView,
+    scroll: &TranscriptScroll,
+) {
+    let Some(thread) = threads.iter_mut().find(|thread| thread.is_foreground) else {
+        return;
+    };
+    let bottom = scroll.top.saturating_add(view.viewport);
+    let visible = projection
+        .cells
         .iter()
-        .filter(|item| item.kind == ItemKind::User)
-        .filter_map(|item| item.turn.as_deref()?.parse::<u64>().ok())
-        .max()?;
-    let latest_pending = thread.items.iter().any(|item| {
-        item.kind == ItemKind::PendingReply
-            && item.turn.as_deref().and_then(|turn| turn.parse().ok()) == Some(latest_turn)
-    });
-    latest_pending.then_some(())?;
-    thread
-        .items
-        .iter()
-        .filter(|item| {
-            item.kind == ItemKind::Reply && reply_completed_after_later_user(thread, item)
+        .enumerate()
+        .filter(|(index, _)| {
+            let start = view.starts.get(*index).copied().unwrap_or(usize::MAX);
+            let end = start.saturating_add(view.heights.get(*index).copied().unwrap_or(0));
+            start >= scroll.top && end <= bottom
         })
-        .filter_map(|item| item.turn.as_deref()?.parse::<u64>().ok())
-        .max()
+        .filter_map(|(_, cell)| thread.items[cell.prompt].turn.clone())
+        .collect::<Vec<_>>();
+    for turn in visible {
+        thread.unread_turns.remove(&turn);
+    }
 }
 
 /// A single agent thread. The foreground thread is root; workers nest under
@@ -245,6 +258,8 @@ struct Thread {
     revision: u64,
     structure_revision: u64,
     items: Vec<Item>,
+    completed_turns: BTreeSet<String>,
+    unread_turns: BTreeSet<String>,
     usage: HashMap<u64, (u32, u32, u32)>,
     metrics: HashMap<String, TurnMetrics>,
     metric_revisions: HashMap<String, u64>,
@@ -279,6 +294,8 @@ impl Thread {
             revision: 0,
             structure_revision: 0,
             items: Vec::new(),
+            completed_turns: BTreeSet::new(),
+            unread_turns: BTreeSet::new(),
             usage: HashMap::new(),
             metrics: HashMap::new(),
             metric_revisions: HashMap::new(),
@@ -444,6 +461,23 @@ impl Thread {
     fn finish_reply(&mut self, text: String, turn: Option<String>) {
         self.touch();
         self.streaming = false;
+        if let Some(completed_turn) = turn.as_deref() {
+            let newly_completed = self.completed_turns.insert(completed_turn.to_string());
+            let completed_number = completed_turn.parse::<u64>().ok();
+            let has_later_turn = completed_number.is_some_and(|completed_number| {
+                self.items.iter().any(|item| {
+                    item.kind == ItemKind::User
+                        && item
+                            .turn
+                            .as_deref()
+                            .and_then(|turn| turn.parse::<u64>().ok())
+                            .is_some_and(|turn| turn > completed_number)
+                })
+            });
+            if newly_completed && has_later_turn {
+                self.unread_turns.insert(completed_turn.to_string());
+            }
+        }
         let text = sanitize_reply_text(&text);
         if let Some(existing) = self
             .items
@@ -452,6 +486,7 @@ impl Thread {
             .find(|item| item.kind == ItemKind::Reply && item.turn == turn)
         {
             existing.text = text;
+            existing.timestamp = now_seconds();
             existing.revision = self.revision;
             self.last_activity = Instant::now();
             return;
@@ -1228,6 +1263,10 @@ struct SessionThread {
     is_foreground: bool,
     items: Vec<SessionItem>,
     #[serde(default)]
+    completed_turns: BTreeSet<String>,
+    #[serde(default)]
+    unread_turns: BTreeSet<String>,
+    #[serde(default)]
     metrics: HashMap<String, TurnMetrics>,
 }
 
@@ -1283,6 +1322,8 @@ fn save_session(threads: &[Thread]) {
             parent: t.parent.clone(),
             task: t.task.clone(),
             is_foreground: t.is_foreground,
+            completed_turns: t.completed_turns.clone(),
+            unread_turns: t.unread_turns.clone(),
             metrics: t.metrics.clone(),
             items: t
                 .items
@@ -1319,6 +1360,10 @@ fn load_session() -> Vec<Thread> {
         .into_iter()
         .map(|t| {
             let revision = t.items.len() as u64;
+            let mut completed_turns = t.completed_turns;
+            completed_turns.extend(t.metrics.iter().filter_map(|(turn, metrics)| {
+                metrics.completed_ms.is_some().then(|| turn.clone())
+            }));
             Thread {
                 id: t.id,
                 parent: t.parent,
@@ -1354,6 +1399,8 @@ fn load_session() -> Vec<Thread> {
                         }
                     })
                     .collect(),
+                completed_turns,
+                unread_turns: t.unread_turns,
                 usage: HashMap::new(),
                 metrics: t.metrics,
                 metric_revisions: HashMap::new(),
@@ -1631,6 +1678,12 @@ pub fn run() -> io::Result<()> {
                     open_trace,
                     open_worker.as_ref(),
                     &mut turn_projection,
+                );
+                mark_visible_ready_turns_seen(
+                    &mut threads,
+                    &turn_projection,
+                    &transcript_view,
+                    &transcript_scroll,
                 );
                 if pane_open {
                     let popup =
@@ -1978,6 +2031,38 @@ pub fn run() -> io::Result<()> {
                             if m.row == size.height.saturating_sub(1) {
                                 let controls = footer_controls(open_trace, transcript_view.turns);
                                 let controls_start = 12u16;
+                                if let Some(ready_turn) = ready_earlier_turn(&threads) {
+                                    let ready_start =
+                                        11u16.saturating_add(controls.chars().count() as u16);
+                                    let ready_width =
+                                        ready_notice(ready_turn).chars().count() as u16;
+                                    if m.column >= ready_start
+                                        && m.column < ready_start.saturating_add(ready_width)
+                                    {
+                                        let target =
+                                            foreground_thread(&threads).and_then(|(_, thread)| {
+                                                turn_index_for_id(
+                                                    thread,
+                                                    &turn_projection,
+                                                    ready_turn,
+                                                )
+                                            });
+                                        if let Some(turn) = target {
+                                            transcript_scroll.follow = false;
+                                            transcript_scroll.new_activity = false;
+                                            transcript_scroll.top =
+                                                transcript_view.starts[turn].saturating_sub(1).min(
+                                                    transcript_view
+                                                        .total_height
+                                                        .saturating_sub(transcript_view.viewport),
+                                                );
+                                            open_trace = None;
+                                            open_worker = None;
+                                        }
+                                        mark_ready_turn_seen(&mut threads, ready_turn);
+                                        continue;
+                                    }
+                                }
                                 if m.column >= controls_start
                                     && m.column < controls_start + controls.chars().count() as u16
                                 {
@@ -2073,6 +2158,18 @@ pub fn run() -> io::Result<()> {
                                 let row = (m.row - vy) as usize;
                                 let hit = HITS.lock().unwrap().get(row).cloned().flatten();
                                 if let Some(ClickTarget::TraceSummary(turn)) = hit {
+                                    if let Some((_, thread)) = foreground_thread(&threads) {
+                                        if let Some(turn_id) = turn_projection
+                                            .cells
+                                            .get(turn)
+                                            .and_then(|cell| {
+                                                thread.items[cell.prompt].turn.as_deref()
+                                            })
+                                            .and_then(|turn| turn.parse::<u64>().ok())
+                                        {
+                                            mark_ready_turn_seen(&mut threads, turn_id);
+                                        }
+                                    }
                                     toggle_trace(&mut open_trace, turn);
                                     open_worker = None;
                                     continue;
@@ -2234,6 +2331,8 @@ fn find_or_create_thread(
         revision: 0,
         structure_revision: 0,
         items: Vec::new(),
+        completed_turns: BTreeSet::new(),
+        unread_turns: BTreeSet::new(),
         usage: HashMap::new(),
         metrics: HashMap::new(),
         metric_revisions: HashMap::new(),
@@ -2518,6 +2617,28 @@ fn apply_correlated_agent_event(
         }
         AgentEvent::ToolFinished { turn, id, output } => {
             thread.add_tool_result(id, output, projected_turn(turn, envelope_turn));
+        }
+        AgentEvent::ToolTelemetry {
+            tool_name,
+            duration_ms,
+            success,
+            truncated,
+            bytes_out,
+            error_code,
+            ..
+        } => {
+            let outcome = if success { "complete" } else { "failed" };
+            let truncation = if truncated { " · truncated" } else { "" };
+            let error = error_code
+                .map(|code| format!(" · {code}"))
+                .unwrap_or_default();
+            thread.add_turn(
+                ItemKind::System,
+                format!(
+                    "[tool telemetry] {tool_name} {outcome} · {duration_ms}ms · {bytes_out} bytes{truncation}{error}"
+                ),
+                envelope_turn.map(str::to_owned),
+            );
         }
         AgentEvent::Error { turn, message } => {
             thread.add_turn(
@@ -3146,7 +3267,12 @@ fn main_conversation_layout(
     push(Line::raw(""), None);
 
     if let Some(response) = response {
-        if response.kind == ItemKind::PendingReply {
+        let response_complete = response.kind == ItemKind::Reply
+            && response
+                .turn
+                .as_deref()
+                .is_none_or(|turn| thread.completed_turns.contains(turn));
+        if !response_complete {
             push(
                 Line::from(Span::styled(
                     format!(" {} ", names().conversation),
@@ -3213,19 +3339,7 @@ fn main_conversation_layout(
                     .add_modifier(Modifier::BOLD),
             ));
             push(Line::from(header), None);
-            let metadata = if reply_completed_after_later_user(thread, response) {
-                let late = format!(
-                    "󰐖 turn {} · earlier request",
-                    response.turn.as_deref().unwrap_or("?")
-                );
-                if badges.is_empty() {
-                    late
-                } else {
-                    format!("{late} · {badges}")
-                }
-            } else {
-                badges.clone()
-            };
+            let metadata = badges.clone();
             if !metadata.is_empty() {
                 push(Line::raw(""), None);
                 for line in wrap_text(&metadata, body_width) {
@@ -4426,7 +4540,6 @@ fn draw_trace_conversation_legacy(
                     .as_deref()
                     .map(|id| format!("  󰐖 {id}"))
                     .unwrap_or_default();
-                let earlier_request = !show_traces && reply_completed_after_later_user(t, item);
                 let who = format!(
                     "{indent}[{}] {} {label}{turn_suffix}",
                     timestamp_label(item.timestamp),
@@ -4455,19 +4568,7 @@ fn draw_trace_conversation_legacy(
                     ));
                 }
                 let badges = turn_badges(t, item.turn.as_deref(), item.timestamp, show_traces);
-                let metadata = if earlier_request {
-                    let late = format!(
-                        "󰐖 turn {} · earlier request",
-                        item.turn.as_deref().unwrap_or("?")
-                    );
-                    if badges.is_empty() {
-                        late
-                    } else {
-                        format!("{late} · {badges}")
-                    }
-                } else {
-                    badges
-                };
+                let metadata = badges;
                 let trailing = format!("{turn_suffix}  [{}]", timestamp_label(item.timestamp));
                 let padding = (area.width as usize)
                     .saturating_sub(
@@ -5713,8 +5814,7 @@ fn draw_statusline(
     let state = Span::styled(dtext, Style::default().fg(dbg).add_modifier(Modifier::BOLD));
     let activity = worker_activity_summary(agent_infos);
     let controls = footer_controls(open_trace, view.turns);
-    let ready =
-        ready_earlier_turn(threads).map(|turn| format!("  {} turn {turn} ready ", icon::SUCCESS));
+    let ready = ready_earlier_turn(threads).map(ready_notice);
     let session = (session_label == "fresh")
         .then(|| Span::styled(" FRESH ", Style::default().fg(Color::DarkGray)));
     let cwd = Span::styled(
@@ -7658,10 +7758,88 @@ mod tests {
     }
 
     #[test]
+    fn streamed_acknowledgement_stays_pending_until_conversation_finishes() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "slow request".into(), Some("2".into()));
+        thread.add_turn(ItemKind::PendingReply, String::new(), Some("2".into()));
+        thread.add_reply_fragment("Let me check that for you.".into(), Some("2".into()), false);
+        thread.add_turn(ItemKind::User, "tell me a joke".into(), Some("3".into()));
+        thread.add_turn(ItemKind::PendingReply, String::new(), Some("3".into()));
+
+        let cells = build_turn_cells(&thread);
+        let pending = main_conversation_layout(&thread, &cells[0], 100, u64::MAX, false, "working");
+        let pending_text = pending
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(pending_text.contains("󰔟"));
+        assert_eq!(ready_earlier_turn(&[thread]), None);
+
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "slow request".into(), Some("2".into()));
+        thread.add_turn(ItemKind::PendingReply, String::new(), Some("2".into()));
+        thread.add_reply_fragment("Checking now.".into(), Some("2".into()), false);
+        thread.add_turn(ItemKind::User, "tell me a joke".into(), Some("3".into()));
+        thread.add_turn(ItemKind::PendingReply, String::new(), Some("3".into()));
+        thread.finish_reply("Here is the answer.".into(), Some("2".into()));
+
+        assert!(thread.completed_turns.contains("2"));
+        assert_eq!(ready_earlier_turn(&[thread]), Some(2));
+    }
+
+    #[test]
+    fn dismissed_ready_turn_is_not_restored_by_replayed_completion() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "slow request".into(), Some("2".into()));
+        thread.add_turn(ItemKind::PendingReply, String::new(), Some("2".into()));
+        thread.add_turn(ItemKind::User, "new request".into(), Some("3".into()));
+        thread.finish_reply("finished".into(), Some("2".into()));
+        mark_ready_turn_seen(std::slice::from_mut(&mut thread), 2);
+        thread.finish_reply("finished".into(), Some("2".into()));
+
+        assert_eq!(ready_earlier_turn(&[thread]), None);
+        assert!(ready_notice(2).contains("click to view"));
+    }
+
+    #[test]
     fn untyped_foreground_output_does_not_leak_into_model_trace() {
         let mut thread = Thread::new_foreground();
         classify_line(&mut thread, "**Temperature:** raw worker evidence");
         assert!(thread.items.is_empty());
+    }
+
+    #[test]
+    fn typed_tool_telemetry_projects_into_the_correlated_trace() {
+        let mut thread = Thread::new_foreground();
+        apply_correlated_agent_event(
+            &mut thread,
+            AgentEvent::ToolTelemetry {
+                tool_name: "grep".into(),
+                call_id: Some("call-1".into()),
+                duration_ms: 38,
+                success: true,
+                truncated: false,
+                bytes_out: 420,
+                error_code: None,
+                identity: tachyon_api::types::ToolTelemetryIdentity {
+                    task_id: Some("task-1".into()),
+                    work_id: Some("work-1".into()),
+                    generation: Some(1),
+                    assignment: Some(1),
+                    attempt_id: None,
+                },
+            },
+            Some("2"),
+        );
+
+        assert_eq!(thread.items.len(), 1);
+        assert_eq!(thread.items[0].kind, ItemKind::System);
+        assert_eq!(thread.items[0].turn.as_deref(), Some("2"));
+        assert!(thread.items[0]
+            .text
+            .contains("grep complete · 38ms · 420 bytes"));
     }
 
     #[test]
@@ -7701,6 +7879,16 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn conversation_finish_replaces_the_acknowledgement_timestamp() {
+        let mut thread = Thread::new_foreground();
+        thread.add_reply_fragment("Checking now.".into(), Some("2".into()), false);
+        thread.items[0].timestamp = 1;
+        thread.finish_reply("Finished.".into(), Some("2".into()));
+
+        assert!(thread.items[0].timestamp > 1);
     }
 
     #[test]
@@ -8071,7 +8259,7 @@ mod tests {
     }
 
     #[test]
-    fn late_completion_is_identified_as_an_earlier_request() {
+    fn visible_late_completion_clears_its_ready_notice() {
         let mut thread = Thread::new_foreground();
         thread.items.push(Item {
             kind: ItemKind::User,
@@ -8113,15 +8301,26 @@ mod tests {
             timestamp: 3_000,
             revision: 3,
         });
-        assert!(reply_completed_after_later_user(
-            &thread,
-            thread.items.last().unwrap()
-        ));
-        let threads = vec![thread];
+        thread.completed_turns.insert("2".into());
+        thread.unread_turns.insert("2".into());
+        let mut threads = vec![thread];
         assert_eq!(ready_earlier_turn(&threads), Some(2));
-
-        let mut completed = threads;
-        completed[0].items[2].kind = ItemKind::Reply;
-        assert_eq!(ready_earlier_turn(&completed), None);
+        let mut projection = TurnProjection::default();
+        projection.update(&threads[0]);
+        let view = TranscriptView {
+            total_height: 10,
+            viewport: 10,
+            turns: 2,
+            anchor_turn: Some(0),
+            starts: vec![0, 5],
+            heights: vec![5, 5],
+        };
+        mark_visible_ready_turns_seen(
+            &mut threads,
+            &projection,
+            &view,
+            &TranscriptScroll::default(),
+        );
+        assert_eq!(ready_earlier_turn(&threads), None);
     }
 }
