@@ -9,6 +9,7 @@ use tachyon_orchestrator::conversation::policy::{
 use tachyon_orchestrator::conversation::prompt::SYNTHESIS_PROMPT;
 
 const DEFAULT_POLICY_CONTEXT_CHARS: usize = 8_000;
+const ANSWERABILITY_TOOL_NAME: &str = "submit_answerability";
 
 /// Allow a direct response or delegation while filtering accidental protocol
 /// markup from the user-facing stream.
@@ -94,7 +95,7 @@ pub async fn assess_answerability(
     model: &Model,
     context: &str,
     incoming: &str,
-) -> tachyon_model::Result<(Answerability, TokenUsage)> {
+) -> tachyon_model::Result<(Answerability, TokenUsage, bool)> {
     let input =
         format!("Existing conversation and evidence:\n{context}\n\nIncoming message:\n{incoming}");
     let messages = vec![
@@ -102,8 +103,57 @@ pub async fn assess_answerability(
         ChatMessage::new(Role::User, input),
     ];
     let mut relay = |_text: &str| {};
-    let completion = model.chat(&messages, None, &mut relay).await?;
-    Ok((Answerability::parse(&completion.text), completion.usage))
+    let completion = model
+        .chat_requiring_tool(
+            &messages,
+            &[answerability_tool()],
+            (ANSWERABILITY_TOOL_NAME, "outcome"),
+            &mut relay,
+        )
+        .await?;
+    let answerability = parse_answerability_tool_call(&completion);
+    Ok((
+        answerability.unwrap_or(Answerability::NeedsNewWork),
+        completion.usage,
+        answerability.is_none(),
+    ))
+}
+
+fn answerability_tool() -> ToolSpec {
+    ToolSpec::new(
+        ANSWERABILITY_TOOL_NAME,
+        "Submit the internal answerability classification.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "outcome": {
+                    "type": "string",
+                    "enum": ["AnswerFromContext", "NeedsNewWork"]
+                }
+            },
+            "required": ["outcome"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnswerabilityToolOutput {
+    outcome: Answerability,
+}
+
+fn parse_answerability_tool_call(completion: &Completion) -> Option<Answerability> {
+    if !completion.text.trim().is_empty() || completion.tool_calls.len() != 1 {
+        return None;
+    }
+    let call = &completion.tool_calls[0];
+    if call.name != ANSWERABILITY_TOOL_NAME {
+        return None;
+    }
+    serde_json::from_str::<AnswerabilityToolOutput>(&call.arguments)
+        .ok()
+        .map(|output| output.outcome)
 }
 
 /// Convert private worker/tool evidence into the final spoken response. This
@@ -144,7 +194,11 @@ pub fn policy_context(messages: &[ChatMessage]) -> String {
         .map(|(role, text)| format!("{role:?}: {text}"))
         .collect::<Vec<_>>()
         .join("\n");
-    bounded_text(&rendered, policy_context_chars())
+    bounded_policy_text(&rendered)
+}
+
+pub fn bounded_policy_text(text: &str) -> String {
+    bounded_text(text, policy_context_chars())
 }
 
 fn synthesis_context(messages: &[ChatMessage]) -> String {
@@ -168,10 +222,7 @@ fn synthesis_context(messages: &[ChatMessage]) -> String {
         .filter(|text| !text.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    bounded_text(
-        &format!("Request:\n{request}\n\nEvidence:\n{evidence}"),
-        policy_context_chars(),
-    )
+    bounded_policy_text(&format!("Request:\n{request}\n\nEvidence:\n{evidence}"))
 }
 
 fn policy_context_chars() -> usize {
@@ -202,8 +253,62 @@ fn bounded_text(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{policy_context, synthesis_context, VisibleResponseStream};
-    use tachyon_model::{ChatMessage, Content, Role, ToolCall};
+    use super::{
+        answerability_tool, parse_answerability_tool_call, policy_context, synthesis_context,
+        VisibleResponseStream, ANSWERABILITY_TOOL_NAME,
+    };
+    use tachyon_model::{ChatMessage, Completion, Content, Role, TokenUsage, ToolCall};
+    use tachyon_orchestrator::conversation::policy::Answerability;
+
+    fn answerability_completion(arguments: &str) -> Completion {
+        Completion {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "classification-1".into(),
+                name: ANSWERABILITY_TOOL_NAME.into(),
+                arguments: arguments.into(),
+            }],
+            usage: TokenUsage::default(),
+            finish_reason: Some("tool_calls".into()),
+        }
+    }
+
+    #[test]
+    fn answerability_tool_schema_is_strict() {
+        let tool = answerability_tool();
+        assert_eq!(tool.name, ANSWERABILITY_TOOL_NAME);
+        assert_eq!(tool.parameters["required"], serde_json::json!(["outcome"]));
+        assert_eq!(tool.parameters["additionalProperties"], false);
+        assert_eq!(
+            tool.parameters["properties"]["outcome"]["enum"],
+            serde_json::json!(["AnswerFromContext", "NeedsNewWork"])
+        );
+    }
+
+    #[test]
+    fn answerability_tool_parser_accepts_only_exact_structured_output() {
+        assert_eq!(
+            parse_answerability_tool_call(&answerability_completion(
+                r#"{"outcome":"AnswerFromContext"}"#
+            )),
+            Some(Answerability::AnswerFromContext)
+        );
+        for arguments in [
+            r#"{"outcome":"answer_from_context"}"#,
+            r#"{"outcome":"AnswerFromContext","detail":"extra"}"#,
+            r#"{"answerability":"AnswerFromContext"}"#,
+            "AnswerFromContext",
+        ] {
+            assert_eq!(
+                parse_answerability_tool_call(&answerability_completion(arguments)),
+                None
+            );
+        }
+
+        let mut prose = answerability_completion(r#"{"outcome":"AnswerFromContext"}"#);
+        prose.text = "AnswerFromContext".into();
+        assert_eq!(parse_answerability_tool_call(&prose), None);
+    }
 
     #[test]
     fn visible_response_never_streams_dsml_protocol_markup() {

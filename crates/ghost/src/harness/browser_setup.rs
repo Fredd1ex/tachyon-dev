@@ -1,12 +1,42 @@
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 
 const AGENT_BROWSER_VERSION: &str = "0.35.0";
+const BROWSER_SETUP_STAMP_VERSION: u32 = 1;
+const BROWSER_SETUP_STAMP: &str = "browser-setup.verified.json";
+const AGENT_BROWSER_ENGINE: &str = "lightpanda";
+const DEFAULT_MAX_OUTPUT: &str = "30000";
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct BrowserSetupStamp {
+    format_version: u32,
+    agent_browser_contract: String,
+    engine: String,
+    max_output: Vec<u8>,
+    agent_browser: ExecutableStamp,
+    lightpanda: ExecutableStamp,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ExecutableStamp {
+    path: Vec<u8>,
+    device: u64,
+    inode: u64,
+    len: u64,
+    mode: u32,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
 
 pub fn ensure() -> Result<(), String> {
     let tools_root = std::env::var_os("TACHYON_HARNESS_TOOLS_DIR")
@@ -20,6 +50,7 @@ pub fn ensure() -> Result<(), String> {
     })?;
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(tools_root.join("browser-setup.lock"))
@@ -33,6 +64,7 @@ pub fn ensure() -> Result<(), String> {
 }
 
 fn ensure_locked(tools_root: &Path) -> Result<(), String> {
+    let stamp_path = tools_root.join(BROWSER_SETUP_STAMP);
     let agent_browser_root = tools_root.join("agent-browser");
     let managed_agent_browser = agent_browser_root.join("bin/agent-browser");
     let configured_agent_browser = std::env::var("TACHYON_AGENT_BROWSER_BIN").ok();
@@ -45,6 +77,34 @@ fn ensure_locked(tools_root: &Path) -> Result<(), String> {
                 .is_file()
                 .then(|| managed_agent_browser.clone())
         });
+    let lightpanda_root = tools_root.join("lightpanda");
+    let managed_lightpanda = lightpanda_root.join("lightpanda");
+    let configured_lightpanda = std::env::var("TACHYON_LIGHTPANDA_BIN").ok();
+    let mut lightpanda = configured_lightpanda
+        .as_deref()
+        .and_then(executable_on_path)
+        .or_else(|| executable_on_path("lightpanda"))
+        .or_else(|| {
+            managed_lightpanda
+                .is_file()
+                .then(|| managed_lightpanda.clone())
+        });
+
+    if let (Some(agent_browser), Some(lightpanda)) = (&agent_browser, &lightpanda) {
+        let agent_browser = canonicalize_or_original(agent_browser.clone());
+        let lightpanda = canonicalize_or_original(lightpanda.clone());
+        configure_browser_environment(&agent_browser, &lightpanda);
+        if verification_stamp(&agent_browser, &lightpanda)
+            .is_ok_and(|expected| verified_stamp_matches(&stamp_path, &expected))
+        {
+            eprintln!(
+                "ghost: agent-browser ready with Lightpanda at {}",
+                lightpanda.display()
+            );
+            return Ok(());
+        }
+    }
+
     if !agent_browser
         .as_deref()
         .is_some_and(supports_required_agent_browser)
@@ -60,18 +120,6 @@ fn ensure_locked(tools_root: &Path) -> Result<(), String> {
         ));
     }
 
-    let lightpanda_root = tools_root.join("lightpanda");
-    let managed_lightpanda = lightpanda_root.join("lightpanda");
-    let configured_lightpanda = std::env::var("TACHYON_LIGHTPANDA_BIN").ok();
-    let mut lightpanda = configured_lightpanda
-        .as_deref()
-        .and_then(executable_on_path)
-        .or_else(|| executable_on_path("lightpanda"))
-        .or_else(|| {
-            managed_lightpanda
-                .is_file()
-                .then(|| managed_lightpanda.clone())
-        });
     if !lightpanda
         .as_deref()
         .is_some_and(|program| command_succeeds(program, &["version"]))
@@ -87,27 +135,120 @@ fn ensure_locked(tools_root: &Path) -> Result<(), String> {
         ));
     }
 
-    let agent_browser = agent_browser.canonicalize().unwrap_or(agent_browser);
-    let lightpanda = lightpanda.canonicalize().unwrap_or(lightpanda);
-    std::env::set_var("TACHYON_AGENT_BROWSER_BIN", &agent_browser);
-    std::env::set_var("TACHYON_LIGHTPANDA_BIN", &lightpanda);
-    std::env::set_var("AGENT_BROWSER_ENGINE", "lightpanda");
-    std::env::set_var("AGENT_BROWSER_EXECUTABLE_PATH", &lightpanda);
-    if std::env::var_os("AGENT_BROWSER_MAX_OUTPUT").is_none() {
-        std::env::set_var("AGENT_BROWSER_MAX_OUTPUT", "30000");
-    }
-    if !verify_lightpanda_launch(&agent_browser) {
+    let agent_browser = canonicalize_or_original(agent_browser);
+    let lightpanda = canonicalize_or_original(lightpanda);
+    configure_browser_environment(&agent_browser, &lightpanda);
+    verify_and_cache_browser(&stamp_path, &agent_browser, &lightpanda)?;
+    eprintln!(
+        "ghost: agent-browser ready with Lightpanda at {}",
+        lightpanda.display()
+    );
+    Ok(())
+}
+
+fn verify_and_cache_browser(
+    stamp_path: &Path,
+    agent_browser: &Path,
+    lightpanda: &Path,
+) -> Result<(), String> {
+    if !verify_lightpanda_launch(agent_browser) {
         return Err(format!(
             "agent-browser at {} could not launch Lightpanda at {}",
             agent_browser.display(),
             lightpanda.display()
         ));
     }
-    eprintln!(
-        "ghost: agent-browser ready with Lightpanda at {}",
-        lightpanda.display()
-    );
+    if let Err(error) = verification_stamp(agent_browser, lightpanda)
+        .and_then(|stamp| write_verified_stamp(stamp_path, &stamp))
+    {
+        eprintln!("ghost: could not cache browser preflight: {error}");
+    }
     Ok(())
+}
+
+fn canonicalize_or_original(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
+}
+
+fn configure_browser_environment(agent_browser: &Path, lightpanda: &Path) {
+    std::env::set_var("TACHYON_AGENT_BROWSER_BIN", agent_browser);
+    std::env::set_var("TACHYON_LIGHTPANDA_BIN", lightpanda);
+    std::env::set_var("AGENT_BROWSER_ENGINE", AGENT_BROWSER_ENGINE);
+    std::env::set_var("AGENT_BROWSER_EXECUTABLE_PATH", lightpanda);
+    if std::env::var_os("AGENT_BROWSER_MAX_OUTPUT").is_none() {
+        std::env::set_var("AGENT_BROWSER_MAX_OUTPUT", DEFAULT_MAX_OUTPUT);
+    }
+}
+
+fn verification_stamp(
+    agent_browser: &Path,
+    lightpanda: &Path,
+) -> Result<BrowserSetupStamp, String> {
+    Ok(BrowserSetupStamp {
+        format_version: BROWSER_SETUP_STAMP_VERSION,
+        agent_browser_contract: AGENT_BROWSER_VERSION.to_owned(),
+        engine: AGENT_BROWSER_ENGINE.to_owned(),
+        max_output: std::env::var_os("AGENT_BROWSER_MAX_OUTPUT")
+            .unwrap_or_else(|| DEFAULT_MAX_OUTPUT.into())
+            .as_bytes()
+            .to_vec(),
+        agent_browser: executable_stamp(agent_browser)?,
+        lightpanda: executable_stamp(lightpanda)?,
+    })
+}
+
+fn executable_stamp(path: &Path) -> Result<ExecutableStamp, String> {
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve {}: {error}", path.display()))?;
+    let metadata = path
+        .metadata()
+        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    Ok(ExecutableStamp {
+        path: path.as_os_str().as_bytes().to_vec(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        len: metadata.len(),
+        mode: metadata.mode(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+fn verified_stamp_matches(path: &Path, expected: &BrowserSetupStamp) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|contents| serde_json::from_slice::<BrowserSetupStamp>(&contents).ok())
+        .is_some_and(|stamp| stamp == *expected)
+}
+
+fn write_verified_stamp(path: &Path, stamp: &BrowserSetupStamp) -> Result<(), String> {
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temporary);
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| format!("failed to create {}: {error}", temporary.display()))?;
+        serde_json::to_writer(&mut file, stamp)
+            .map_err(|error| format!("failed to serialize browser setup stamp: {error}"))?;
+        file.write_all(b"\n")
+            .map_err(|error| format!("failed to write browser setup stamp: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("failed to sync browser setup stamp: {error}"))?;
+        std::fs::rename(&temporary, path)
+            .map_err(|error| format!("failed to activate browser setup stamp: {error}"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn executable_on_path(program: &str) -> Option<PathBuf> {
@@ -240,19 +381,46 @@ fn lightpanda_download_url() -> Result<&'static str, String> {
 }
 
 fn verify_lightpanda_launch(agent_browser: &Path) -> bool {
-    let session = "tachyon-lightpanda-preflight";
-    let _ = command_succeeds(agent_browser, &["--session", session, "close"]);
-    let opened = command_succeeds(
-        agent_browser,
-        &["--session", session, "open", "about:blank"],
-    );
-    let closed = command_succeeds(agent_browser, &["--session", session, "close"]);
-    opened && closed
+    for attempt in 0..3 {
+        let session = format!(
+            "tachyon-lightpanda-preflight-{}-{attempt}",
+            std::process::id()
+        );
+        let _ = command_succeeds(agent_browser, &["--session", &session, "close"]);
+        let opened = command_succeeds(
+            agent_browser,
+            &["--session", &session, "open", "about:blank"],
+        );
+        let closed = command_succeeds(agent_browser, &["--session", &session, "close"]);
+        if opened && closed {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn executable(path: &Path, contents: &[u8]) {
+        std::fs::write(path, contents).unwrap();
+        let mut permissions = path.metadata().unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn stamp(agent_browser: &Path, lightpanda: &Path) -> BrowserSetupStamp {
+        BrowserSetupStamp {
+            format_version: BROWSER_SETUP_STAMP_VERSION,
+            agent_browser_contract: AGENT_BROWSER_VERSION.to_owned(),
+            engine: AGENT_BROWSER_ENGINE.to_owned(),
+            max_output: DEFAULT_MAX_OUTPUT.as_bytes().to_vec(),
+            agent_browser: executable_stamp(agent_browser).unwrap(),
+            lightpanda: executable_stamp(lightpanda).unwrap(),
+        }
+    }
 
     #[test]
     fn explicit_existing_executable_is_resolved() {
@@ -284,5 +452,77 @@ mod tests {
         assert!(agent_browser_download_url()
             .unwrap()
             .contains("/releases/download/v0.35.0/agent-browser-"));
+    }
+
+    #[test]
+    fn verified_stamp_round_trips_and_malformed_stamp_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let agent_browser = directory.path().join("agent-browser");
+        let lightpanda = directory.path().join("lightpanda");
+        let stamp_path = directory.path().join(BROWSER_SETUP_STAMP);
+        executable(&agent_browser, b"agent");
+        executable(&lightpanda, b"lightpanda");
+        let expected = stamp(&agent_browser, &lightpanda);
+
+        write_verified_stamp(&stamp_path, &expected).unwrap();
+        assert!(verified_stamp_matches(&stamp_path, &expected));
+
+        std::fs::write(&stamp_path, b"not json").unwrap();
+        assert!(!verified_stamp_matches(&stamp_path, &expected));
+    }
+
+    #[test]
+    fn executable_metadata_change_invalidates_verified_stamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let agent_browser = directory.path().join("agent-browser");
+        let lightpanda = directory.path().join("lightpanda");
+        let stamp_path = directory.path().join(BROWSER_SETUP_STAMP);
+        executable(&agent_browser, b"agent");
+        executable(&lightpanda, b"lightpanda");
+        let original = stamp(&agent_browser, &lightpanda);
+        write_verified_stamp(&stamp_path, &original).unwrap();
+
+        executable(&lightpanda, b"changed-lightpanda");
+        let changed = stamp(&agent_browser, &lightpanda);
+        assert_ne!(original, changed);
+        assert!(!verified_stamp_matches(&stamp_path, &changed));
+    }
+
+    #[test]
+    fn version_and_configuration_changes_invalidate_verified_stamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let agent_browser = directory.path().join("agent-browser");
+        let other_agent_browser = directory.path().join("other-agent-browser");
+        let lightpanda = directory.path().join("lightpanda");
+        let stamp_path = directory.path().join(BROWSER_SETUP_STAMP);
+        executable(&agent_browser, b"agent");
+        executable(&other_agent_browser, b"agent");
+        executable(&lightpanda, b"lightpanda");
+        let original = stamp(&agent_browser, &lightpanda);
+        write_verified_stamp(&stamp_path, &original).unwrap();
+
+        let mut changed_version = stamp(&agent_browser, &lightpanda);
+        changed_version.agent_browser_contract = "new-contract".to_owned();
+        assert!(!verified_stamp_matches(&stamp_path, &changed_version));
+
+        let mut changed_config = stamp(&agent_browser, &lightpanda);
+        changed_config.max_output = b"1234".to_vec();
+        assert!(!verified_stamp_matches(&stamp_path, &changed_config));
+
+        let changed_path = stamp(&other_agent_browser, &lightpanda);
+        assert!(!verified_stamp_matches(&stamp_path, &changed_path));
+    }
+
+    #[test]
+    fn failed_preflight_does_not_create_verified_stamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let agent_browser = directory.path().join("agent-browser");
+        let lightpanda = directory.path().join("lightpanda");
+        let stamp_path = directory.path().join(BROWSER_SETUP_STAMP);
+        executable(&agent_browser, b"#!/bin/sh\nexit 1\n");
+        executable(&lightpanda, b"lightpanda");
+
+        assert!(verify_and_cache_browser(&stamp_path, &agent_browser, &lightpanda).is_err());
+        assert!(!stamp_path.exists());
     }
 }

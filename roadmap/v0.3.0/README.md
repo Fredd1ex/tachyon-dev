@@ -1,27 +1,31 @@
 # v0.3.0 - Ghost Research Harness
 
-Estimated progress: **35%**. Status: **Partial**.
+Estimated progress: **75%**. Status: **Partial**.
 
 ## Scope
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| read / write / edit | Partial | Possible through IPython, but no bounded first-class file tools or edit-conflict contract. |
-| ls / glob / grep | Partial | Possible through Python and host tools, but results are unstructured and not harness-controlled. |
-| robust exec | Partial | Exit status and timeouts exist; process-tree cleanup, output caps, cancellation, and generic model-facing exec are incomplete. |
-| IPython | Partial | Persistent sessions, variable reuse, timeout reset, and serializable checkpoints work. Reliability and fallback behavior remain incomplete. |
-| browser | Partial | Browser schema, bootstrap, version checks, and dispatch exist; live research behavior and safety need end-to-end tests. |
-| artifacts | Missing | The completion field exists, but workers do not register or preserve typed artifacts. |
+| generic tool registry | Implemented | Object-safe Tokio dispatch, startup duplicate rejection, policy filtering, deadlines, cancellation, structured envelopes, output bounds, telemetry hooks, and bounded durable output storage are integrated into Ghost's model loop. |
+| read / write / edit | Implemented | Workspace-confined bounded `read`, atomic create/replace `write`, and exact unique-match `edit` are native and asynchronous. Writes preserve permissions, reject symlink targets, revalidate before replacement, and sync by policy. |
+| ls / find / grep | Implemented | Deterministic `ls`, ignore-aware glob `find`, and regex/fixed-string `grep` are native and bounded. `grep` caches `rg` discovery for accelerated candidate filtering with tested native parity and spawn-failure fallback; optional `fd` acceleration remains. |
+| robust exec | Partial | Registry-dispatched direct/shell execution now has scrubbed policy environment, bounded concurrent head/tail capture, output references, effective deadlines, cancellation, TERM-to-KILL process-group cleanup, descendant cleanup, and structured outcomes. Streaming work updates, resource limits, and hard isolation remain. |
+| artifacts | Implemented | Workers register typed regular-file references with incremental SHA-256, bounded metadata, and assignment provenance. Ghost emits registration events; Tachyond correlates and persists their metadata, while completion results retain registered paths without copying bytes. Directory manifests remain deferred. |
+| tool policy and results | Partial | Capability policy, strict decoding, structured errors/results, continuations, hard/model output bounds, durable output references, cancellation, deadlines, and telemetry hooks exist. Bounded reference retrieval and a hard execution sandbox remain. |
+| persistent IPython | Partial | Session reuse, timeout reset, and serializable checkpoints work. Bounded rich output, deterministic recovery, lifecycle cleanup, and explicit restore failures remain. |
+| quick web retrieval | Missing | No lightweight bounded Rust-native HTTP text/JSON path exists; web retrieval currently requires the browser or IPython. |
+| headless Lightpanda research | Partial | The minimal non-Chromium engine has bootstrap, version checks, retries, and registry dispatch with an independent startup-failure boundary. Supervised session reuse, bounded snapshots/downloads, crash recovery, and heavy-research tests remain. |
 | attempts / outcomes / failures | Partial | Lifecycle states and errors exist, but no first-class attempt lineage or typed terminal outcome model exists. |
 | RLM-style context access | Missing | Old context can be dropped or compacted but cannot be queried through handles or ranges. |
 | checkpoint/resume | Partial | Conversation, worker, and IPython checkpoints exist, but active work cannot resume exactly. |
 | structured findings | Partial | Event transport is structured; findings, claims, sources, confidence, and uncertainty remain free-form prose. |
-| bounded subagents | Partial | Recursive spawning is prevented by role policy, but fan-out and aggregate resources are not bounded. |
-| tool policies | Partial | Role allowlists exist; IPython remains a broad host capability without a hard sandbox. |
+| bounded subagents | Partial | Recursive spawning is prevented and one delegation can fan out to at most eight workers; aggregate resources across concurrent turns are not yet bounded. |
 | harness benchmarks | Missing | No deterministic research benchmark suite or release threshold exists. |
 
 ## Exit Criteria
 
+- Implement the eight Rust-native P0 built-ins and immutable generic registry
+  defined in [`GHOST_TOOL_RUNTIME.md`](GHOST_TOOL_RUNTIME.md).
 - Define typed attempts, outcomes, failures, findings, sources, and artifacts.
 - Harden execution with process-group termination, output limits, cancellation,
   resource limits, and adversarial tests.
@@ -29,11 +33,19 @@ Estimated progress: **35%**. Status: **Partial**.
 - Preserve registered artifacts before workspace cleanup.
 - Bound worker fan-out and total resource consumption.
 - Build deterministic harness benchmarks and fault-injection scenarios.
+- Keep persistent IPython, quick web retrieval, and headless Lightpanda research
+  as complementary policy-gated tools with independent failure boundaries.
+
+## Documents
+
+- [`GHOST_TOOL_RUNTIME.md`](GHOST_TOOL_RUNTIME.md) - accepted P0 runtime contract
+  and boundaries for complementary IPython and web tooling.
 
 ## Next Work
 
-1. Implement process-group timeout and cancellation cleanup.
-2. Add typed worker terminal outcomes and attempt IDs.
-3. Implement artifact registration and preservation.
-4. Add first-class bounded file and search tools.
-5. Create deterministic harness scenarios.
+1. Add cached optional `fd` acceleration with native parity tests.
+2. Add bounded read/search access for durable output references.
+3. Add bounded streaming work updates and resource limits to `exec`.
+4. Specify and implement the separate bounded quick-web retrieval tool.
+5. Add typed attempt IDs, deterministic harness scenarios, parity tests, and
+   fault injection.

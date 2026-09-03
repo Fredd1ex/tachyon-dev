@@ -6,21 +6,71 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::join_all;
-use ghost::harness::backend::{Backend, ExecRequest, Local};
+use ghost::harness::backend::Local;
 use ghost::harness::browser_setup;
+use ghost::harness::runtime::{
+    AgentBrowserTool, ArtifactTool, BrowserAvailability, EditTool, ExecTool, FindTool, GrepTool,
+    IpythonTool, LsTool, ReadTool, ToolContext, ToolEventSink, ToolIdentity, ToolOutputStore,
+    ToolPolicy, ToolRegistry, ToolTelemetry, WorkspaceOutputStore, WriteTool, MAX_RETURN_BYTES,
+};
 use ghost::model::{from_agent_config, ChatMessage, Content, Model, Role, TokenUsage, ToolCall};
 use ghost::role::AgentRole;
 use tachyon_api::types::{
-    Actor, AgentEvent, EventEnvelope, WorkEvent, WorkEventKind, WorkOutcome, WorkRequest,
-    WorkResult,
+    Actor, AgentEvent, ArtifactRegistration, EventEnvelope, WorkEvent, WorkEventKind, WorkOutcome,
+    WorkRequest, WorkResult,
 };
 use tokio::io::AsyncBufReadExt;
 
 static EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_TOOL_CONTEXT_CHARS: usize = 12_000;
 const DEFAULT_MAX_ITERATIONS: usize = 100;
+
+struct GhostToolEventSink {
+    role: AgentRole,
+    agent_id: Option<String>,
+    artifacts: Mutex<Vec<String>>,
+}
+
+impl GhostToolEventSink {
+    fn new(role: AgentRole, agent_id: Option<&str>) -> Self {
+        Self {
+            role,
+            agent_id: agent_id.map(str::to_string),
+            artifacts: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn artifact_paths(&self) -> Vec<String> {
+        self.artifacts
+            .lock()
+            .map_or_else(|_| Vec::new(), |paths| paths.clone())
+    }
+}
+
+impl ToolEventSink for GhostToolEventSink {
+    fn emit(&self, _event: ToolTelemetry) {}
+
+    fn register_artifact(&self, artifact: ArtifactRegistration) -> Result<(), String> {
+        let mut paths = self
+            .artifacts
+            .lock()
+            .map_err(|_| "artifact collector lock is poisoned".to_string())?;
+        if !paths.contains(&artifact.path) {
+            paths.push(artifact.path.clone());
+        }
+        drop(paths);
+        emit_event(
+            AgentEvent::ArtifactRegistered { artifact },
+            self.role,
+            self.agent_id.as_deref(),
+        );
+        Ok(())
+    }
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ChatCheckpoint {
@@ -44,12 +94,13 @@ fn main() -> ExitCode {
         eprintln!("ghost: the Background coordinator is daemon-owned and is not hosted by Ghost");
         return ExitCode::FAILURE;
     }
-    if role == AgentRole::Worker {
-        if let Err(error) = browser_setup::ensure() {
-            eprintln!("ghost: browser capability setup failed: {error}");
-            return ExitCode::FAILURE;
+    let browser_availability = match browser_setup::ensure() {
+        Ok(()) => BrowserAvailability::Available,
+        Err(error) => {
+            eprintln!("ghost: browser capability unavailable: {error}");
+            BrowserAvailability::Unavailable(error.to_string())
         }
-    }
+    };
     let workspace = cwd.map(PathBuf::from).unwrap_or_else(|| {
         ghost::harness::backend::ensure_workspace(agent_id.as_deref().unwrap_or("anon"))
             .unwrap_or_else(|_| std::env::temp_dir().join("tachyon-ghost"))
@@ -62,21 +113,97 @@ fn main() -> ExitCode {
         }
     };
     runtime.block_on(async move {
-        let backend = Local::new(&workspace);
+        if let Err(error) = tokio::fs::create_dir_all(&workspace).await {
+            eprintln!(
+                "ghost: cannot create workspace {}: {error}",
+                workspace.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        let workspace = match tokio::fs::canonicalize(&workspace).await {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                eprintln!(
+                    "ghost: cannot resolve workspace {}: {error}",
+                    workspace.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let backend = Arc::new(Local::new(&workspace));
+        let output_store: Arc<dyn ToolOutputStore> =
+            match WorkspaceOutputStore::open(&workspace, 8 * 1024 * 1024, MAX_RETURN_BYTES).await {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    eprintln!("ghost: cannot initialize durable tool output: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(ReadTool::new())
+            .expect("unique built-in tool");
+        registry
+            .register(WriteTool::new())
+            .expect("unique built-in tool");
+        registry
+            .register(EditTool::new())
+            .expect("unique built-in tool");
+        registry
+            .register(LsTool::new())
+            .expect("unique built-in tool");
+        registry
+            .register(FindTool::new())
+            .expect("unique built-in tool");
+        registry
+            .register(GrepTool::new())
+            .expect("unique built-in tool");
+        registry
+            .register(ExecTool::new())
+            .expect("unique built-in tool");
+        registry
+            .register(ArtifactTool::new())
+            .expect("unique built-in tool");
+        registry
+            .register(IpythonTool::new(Arc::clone(&backend)))
+            .expect("unique built-in tool");
+        if matches!(&browser_availability, BrowserAvailability::Available) {
+            registry
+                .register(AgentBrowserTool::new(
+                    Arc::clone(&backend),
+                    browser_availability,
+                ))
+                .expect("unique built-in tool");
+        }
+        let mut policy = ToolPolicy::worker_default(workspace.clone());
+        policy.max_model_content_bytes = tool_context_chars();
+        let policy = Arc::new(policy);
         println!("[ghost] workspace: {}", workspace.display());
         if chat {
-            run_chat(&backend, role, agent_id, &workspace).await
+            run_chat(&registry, policy, output_store, role, agent_id, &workspace).await
         } else {
-            run_task(task.unwrap_or_default(), &backend, role, agent_id).await
+            run_task(
+                task.unwrap_or_default(),
+                &registry,
+                policy,
+                output_store,
+                role,
+                agent_id,
+                &workspace,
+            )
+            .await
         }
     })
 }
 
 async fn run_task(
     task: String,
-    backend: &Local,
+    registry: &ToolRegistry,
+    policy: Arc<ToolPolicy>,
+    output_store: Arc<dyn ToolOutputStore>,
     role: AgentRole,
     agent_id: Option<String>,
+    workspace: &std::path::Path,
 ) -> ExitCode {
     let cfg = tachyon_util::config::Config::load();
     let model = match from_agent_config(&role.config(&cfg)) {
@@ -91,7 +218,18 @@ async fn run_task(
         ChatMessage::new(Role::System, role.system_prompt(&cfg)),
         ChatMessage::new(Role::User, task.clone()),
     ];
-    match run_loop(&model, &mut messages, backend, role, agent_id.as_deref()).await {
+    let event_sink = Arc::new(GhostToolEventSink::new(role, agent_id.as_deref()));
+    let context = tool_context(workspace, policy, output_store, None, event_sink.clone());
+    match run_loop(
+        &model,
+        &mut messages,
+        registry,
+        &context,
+        role,
+        agent_id.as_deref(),
+    )
+    .await
+    {
         Ok((answer, usage)) => {
             emit_event(
                 AgentEvent::Usage {
@@ -103,7 +241,14 @@ async fn run_task(
                 role,
                 agent_id.as_deref(),
             );
-            emit_answer(&answer, &task, None, role, agent_id.as_deref());
+            emit_answer(
+                &answer,
+                &task,
+                None,
+                role,
+                agent_id.as_deref(),
+                event_sink.artifact_paths(),
+            );
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -114,7 +259,9 @@ async fn run_task(
 }
 
 async fn run_chat(
-    backend: &Local,
+    registry: &ToolRegistry,
+    policy: Arc<ToolPolicy>,
+    output_store: Arc<dyn ToolOutputStore>,
     role: AgentRole,
     agent_id: Option<String>,
     workspace: &std::path::Path,
@@ -178,7 +325,24 @@ async fn run_chat(
             );
         }
         messages.push(ChatMessage::new(Role::User, objective));
-        match run_loop(&model, &mut messages, backend, role, agent_id.as_deref()).await {
+        let event_sink = Arc::new(GhostToolEventSink::new(role, agent_id.as_deref()));
+        let context = tool_context(
+            workspace,
+            Arc::clone(&policy),
+            Arc::clone(&output_store),
+            request.as_ref(),
+            event_sink.clone(),
+        );
+        match run_loop(
+            &model,
+            &mut messages,
+            registry,
+            &context,
+            role,
+            agent_id.as_deref(),
+        )
+        .await
+        {
             Ok((answer, usage)) => {
                 emit_event(
                     AgentEvent::Usage {
@@ -196,6 +360,7 @@ async fn run_chat(
                     request.as_ref(),
                     role,
                     agent_id.as_deref(),
+                    event_sink.artifact_paths(),
                 );
             }
             Err(error) => {
@@ -278,11 +443,12 @@ fn ready_event(role: AgentRole) -> Option<AgentEvent> {
 async fn run_loop(
     model: &Model,
     messages: &mut Vec<ChatMessage>,
-    backend: &Local,
+    registry: &ToolRegistry,
+    context: &ToolContext,
     role: AgentRole,
     agent_id: Option<&str>,
 ) -> Result<(String, TokenUsage), String> {
-    let tools = role.tools(false);
+    let tools = registry.definitions(&context.policy);
     let mut usage = TokenUsage::default();
     let mut last_batch = None;
     let mut repeats = 0;
@@ -329,8 +495,9 @@ async fn run_loop(
             println!("[tool:{}] {} {}", call.id, call.name, call.arguments);
         }
         messages.push(completion.to_message());
-        let outputs = join_all(calls.iter().map(|call| run_tool(call, backend, role))).await;
-        for (call, output) in calls.into_iter().zip(outputs) {
+        let outputs = join_all(calls.iter().map(|call| run_tool(call, registry, context))).await;
+        for (call, result) in calls.into_iter().zip(outputs) {
+            let output = result.to_json(MAX_RETURN_BYTES);
             emit_event(
                 AgentEvent::ToolFinished {
                     turn: None,
@@ -345,7 +512,7 @@ async fn run_loop(
                 role: Role::Tool,
                 content: vec![Content::ToolResult {
                     id: call.id,
-                    output: bounded_tool_output(&output, tool_context_chars()),
+                    output: result.to_json(context.policy.max_model_content_bytes),
                 }],
             });
         }
@@ -387,68 +554,59 @@ fn compact_completed_history(messages: &mut Vec<ChatMessage>) {
     });
 }
 
-fn bounded_tool_output(output: &str, max_chars: usize) -> String {
-    if output.chars().count() <= max_chars {
-        return output.to_string();
-    }
-    let head_chars = max_chars * 3 / 4;
-    let tail_chars = max_chars - head_chars;
-    let head = output.chars().take(head_chars).collect::<String>();
-    let tail = output
-        .chars()
-        .rev()
-        .take(tail_chars)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    format!("{head}\n[tool output truncated for model context]\n{tail}")
+async fn run_tool(
+    call: &ToolCall,
+    registry: &ToolRegistry,
+    context: &ToolContext,
+) -> ghost::harness::runtime::ToolResult {
+    let input = match serde_json::from_str(&call.arguments) {
+        Ok(input) => input,
+        Err(error) => {
+            return ghost::harness::runtime::ToolError::invalid(format!(
+                "invalid JSON arguments: {error}"
+            ))
+            .into_result();
+        }
+    };
+    registry
+        .execute(&call.name, context, input)
+        .await
+        .unwrap_or_else(ghost::harness::runtime::ToolError::into_result)
 }
 
-async fn run_tool(call: &ToolCall, backend: &Local, role: AgentRole) -> String {
-    if !role.allows_tool(&call.name) {
-        return format!("{} is not available to the {role:?} role", call.name);
-    }
-    match call.name.as_str() {
-        "ipython" => backend
-            .run_ipython(&arg(&call.arguments, "code"))
-            .await
-            .combined(),
-        "agent_browser" => match browser_request(&arg(&call.arguments, "args")) {
-            Ok(request) => backend.run(&request).await.combined(),
-            Err(error) => error,
+fn tool_context(
+    workspace: &std::path::Path,
+    policy: Arc<ToolPolicy>,
+    output_store: Arc<dyn ToolOutputStore>,
+    request: Option<&WorkRequest>,
+    event_sink: Arc<dyn ToolEventSink>,
+) -> ToolContext {
+    let deadline = request
+        .map(|request| instant_from_unix_ms(request.deadline_ms))
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(5 * 60));
+    ToolContext {
+        workspace_root: workspace.to_path_buf(),
+        cwd: workspace.to_path_buf(),
+        identity: ToolIdentity {
+            work_id: request.map(|request| request.work_id.clone()),
+            generation: request.map(|request| request.generation),
+            assignment: request.map(|request| request.assignment),
+            ..ToolIdentity::default()
         },
-        other => format!("{other} remains available only to the temporary Background coordinator"),
+        deadline,
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        policy,
+        event_sink,
+        output_store,
     }
 }
 
-fn browser_request(line: &str) -> Result<ExecRequest, String> {
-    let args = shell_words::split(line).map_err(|error| error.to_string())?;
-    if args.is_empty() {
-        return Err("no args for agent_browser".into());
-    }
-    let forbidden = [
-        "--engine",
-        "--executable-path",
-        "--provider",
-        "--cdp",
-        "--auto-connect",
-        "--max-output",
-    ];
-    if let Some(argument) = args.iter().find(|argument| {
-        forbidden
-            .iter()
-            .any(|option| argument == option || argument.starts_with(&format!("{option}=")))
-    }) {
-        return Err(format!(
-            "agent_browser cannot override its fixed Lightpanda configuration with {argument}"
-        ));
-    }
-    Ok(ExecRequest {
-        program: std::env::var("TACHYON_AGENT_BROWSER_BIN")
-            .unwrap_or_else(|_| "agent-browser".into()),
-        args,
-    })
+fn instant_from_unix_ms(deadline_ms: u64) -> Instant {
+    let now_wall_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    Instant::now() + Duration::from_millis(deadline_ms.saturating_sub(now_wall_ms))
 }
 
 fn emit_answer(
@@ -457,6 +615,7 @@ fn emit_answer(
     request: Option<&WorkRequest>,
     role: AgentRole,
     agent_id: Option<&str>,
+    artifacts: Vec<String>,
 ) {
     if let Some(worker_id) = agent_id {
         let event = if let Some(request) = request {
@@ -468,7 +627,7 @@ fn emit_answer(
                     assignment: request.assignment,
                     outcome: WorkOutcome::Completed {
                         result: answer.into(),
-                        artifacts: Vec::new(),
+                        artifacts,
                         context: "live Ghost and IPython session remain available".into(),
                         suggested_reuse: true,
                     },
@@ -479,7 +638,7 @@ fn emit_answer(
                 worker_id: worker_id.into(),
                 objective: task.into(),
                 result: answer.into(),
-                artifacts: Vec::new(),
+                artifacts,
                 context: "live Ghost and IPython session remain available".into(),
                 suggested_reuse: true,
             }
@@ -529,18 +688,6 @@ fn emit_event(event: AgentEvent, role: AgentRole, agent_id: Option<&str>) {
     if let Ok(json) = serde_json::to_string(&envelope) {
         println!("{json}");
     }
-}
-
-fn arg(arguments: &str, key: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(arguments)
-        .ok()
-        .and_then(|value| {
-            value
-                .get(key)
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_default()
 }
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -614,16 +761,6 @@ mod tests {
         assert!(
             chat_checkpoint_path(root, AgentRole::Background).ends_with(".tachyon/background.json")
         );
-    }
-
-    #[test]
-    fn tool_output_context_keeps_boundaries() {
-        let output = format!("START{}END", "x".repeat(2_000));
-        let bounded = bounded_tool_output(&output, 1_000);
-        assert!(bounded.starts_with("START"));
-        assert!(bounded.ends_with("END"));
-        assert!(bounded.contains("truncated for model context"));
-        assert!(bounded.chars().count() < output.chars().count());
     }
 
     #[test]

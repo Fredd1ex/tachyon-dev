@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::process::ExitCode;
+use std::{future::Future, process::ExitCode, sync::Arc};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -9,11 +9,13 @@ use tachyon_api::{
     WorkReviewRecommendation, WorkReviewRequest,
 };
 use tachyon_model::{ChatMessage, Model, ModelConfig, Role, ToolSpec};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::task::JoinSet;
 
 const REVIEW_TOOL: &str = "submit_work_review";
-const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 20;
 const MAX_REVIEW_INPUT_CHARS: usize = 32_000;
+const MAX_CONCURRENT_REVIEWS: usize = 4;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,38 +60,93 @@ fn main() -> ExitCode {
 async fn run() -> ExitCode {
     let config = tachyon_util::config::Config::load();
     let background = config.background_config();
-    let persona = background.persona.clone();
-    let model = model_from_config(&config, &background).ok();
-    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
+    let persona = background.persona.clone().map(Arc::<str>::from);
+    let model = model_from_config(&config, &background).ok().map(Arc::new);
     eprintln!("tachyon-background: ready");
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request = match serde_json::from_str::<WorkReviewRequest>(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                eprintln!("tachyon-background: invalid review request: {error}");
-                continue;
-            }
-        };
-        let decision = review(&request, model.as_ref(), persona.as_deref()).await;
-        let encoded = match serde_json::to_vec(&decision) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                eprintln!("tachyon-background: encode review decision: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        if stdout.write_all(&encoded).await.is_err()
-            || stdout.write_all(b"\n").await.is_err()
-            || stdout.flush().await.is_err()
-        {
-            return ExitCode::FAILURE;
-        }
+    let result = process_reviews(
+        tokio::io::stdin(),
+        tokio::io::BufWriter::new(tokio::io::stdout()),
+        move |request| {
+            let model = model.clone();
+            let persona = persona.clone();
+            async move { review(&request, model.as_deref(), persona.as_deref()).await }
+        },
+    )
+    .await;
+    if let Err(error) = result {
+        eprintln!("tachyon-background: review stream failed: {error}");
+        return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+async fn process_reviews<R, W, F, Fut>(
+    reader: R,
+    mut writer: W,
+    review_fn: F,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: Fn(WorkReviewRequest) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = WorkReviewDecision> + Send + 'static,
+{
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    let mut reviews = JoinSet::new();
+    loop {
+        if reviews.len() == MAX_CONCURRENT_REVIEWS {
+            write_next_decision(&mut reviews, &mut writer).await?;
+            continue;
+        }
+        tokio::select! {
+            result = reviews.join_next(), if !reviews.is_empty() => {
+                write_joined_decision(result, &mut writer).await?;
+            }
+            line = lines.next_line() => {
+                let Some(line) = line? else { break };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let request = match serde_json::from_str::<WorkReviewRequest>(&line) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        eprintln!("tachyon-background: invalid review request: {error}");
+                        continue;
+                    }
+                };
+                let review_fn = review_fn.clone();
+                reviews.spawn(async move { review_fn(request).await });
+            }
+        }
+    }
+    while !reviews.is_empty() {
+        write_next_decision(&mut reviews, &mut writer).await?;
+    }
+    Ok(())
+}
+
+async fn write_next_decision<W: AsyncWrite + Unpin>(
+    reviews: &mut JoinSet<WorkReviewDecision>,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let result = reviews
+        .join_next()
+        .await
+        .ok_or_else(|| std::io::Error::other("review task set was empty"))?;
+    write_joined_decision(Some(result), writer).await
+}
+
+async fn write_joined_decision<W: AsyncWrite + Unpin>(
+    result: Option<Result<WorkReviewDecision, tokio::task::JoinError>>,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let decision = result
+        .ok_or_else(|| std::io::Error::other("review task set was empty"))?
+        .map_err(std::io::Error::other)?;
+    let encoded = serde_json::to_vec(&decision).map_err(std::io::Error::other)?;
+    writer.write_all(&encoded).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await
 }
 
 async fn review(
@@ -132,11 +189,10 @@ async fn review(
         ChatMessage::new(Role::User, input),
     ];
     let tool = review_tool();
-    let remaining_ms = request.deadline_ms.saturating_sub(unix_now_ms()).max(1);
-    let configured_ms = review_timeout().as_millis() as u64;
+    let timeout = review_execution_timeout(request.deadline_ms, unix_now_ms(), review_timeout());
     let mut relay = |_delta: &str| {};
     let completion = match tokio::time::timeout(
-        std::time::Duration::from_millis(remaining_ms.min(configured_ms)),
+        timeout,
         model.chat_requiring_tool(
             &messages,
             std::slice::from_ref(&tool),
@@ -304,13 +360,25 @@ fn inconclusive(
 }
 
 fn review_timeout() -> std::time::Duration {
-    std::time::Duration::from_secs(
-        std::env::var("TACHYON_BACKGROUND_REVIEW_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(DEFAULT_REVIEW_TIMEOUT_SECS)
-            .max(1),
-    )
+    let configured = std::env::var("TACHYON_BACKGROUND_REVIEW_TIMEOUT_SECS").ok();
+    review_timeout_from(configured.as_deref())
+}
+
+fn review_timeout_from(configured: Option<&str>) -> std::time::Duration {
+    let seconds = configured
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_REVIEW_TIMEOUT_SECS)
+        .max(1);
+    std::time::Duration::from_secs(seconds)
+}
+
+fn review_execution_timeout(
+    deadline_ms: u64,
+    started_ms: u64,
+    configured: std::time::Duration,
+) -> std::time::Duration {
+    let remaining_ms = deadline_ms.saturating_sub(started_ms).max(1);
+    std::time::Duration::from_millis(remaining_ms.min(configured.as_millis() as u64))
 }
 
 fn unix_now_ms() -> u64 {
@@ -323,7 +391,9 @@ fn unix_now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use tachyon_api::{WorkResult, WorkReviewContext};
+    use tokio::sync::{mpsc, Semaphore};
 
     fn request(outcome: WorkOutcome) -> WorkReviewRequest {
         WorkReviewRequest {
@@ -361,6 +431,101 @@ mod tests {
                 failure: WorkReviewFailure::InvalidRequest
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn review_stream_runs_with_a_small_bound_and_preserves_correlation() {
+        let (service, client) = tokio::io::duplex(16_384);
+        let (service_reader, service_writer) = tokio::io::split(service);
+        let (client_reader, mut client_writer) = tokio::io::split(client);
+        let gate = Arc::new(Semaphore::new(0));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let service_gate = Arc::clone(&gate);
+        let service = tokio::spawn(process_reviews(
+            service_reader,
+            service_writer,
+            move |request| {
+                let gate = Arc::clone(&service_gate);
+                let started_tx = started_tx.clone();
+                async move {
+                    started_tx.send(request.review_id.clone()).unwrap();
+                    gate.acquire().await.unwrap().forget();
+                    inconclusive(&request, WorkReviewFailure::ProviderError, "test")
+                }
+            },
+        ));
+
+        let expected = (0..MAX_CONCURRENT_REVIEWS + 2)
+            .map(|index| format!("review-{index}"))
+            .collect::<HashSet<_>>();
+        for review_id in &expected {
+            let mut request = request(WorkOutcome::Completed {
+                result: "verified".into(),
+                artifacts: Vec::new(),
+                context: String::new(),
+                suggested_reuse: false,
+            });
+            request.review_id = review_id.clone();
+            client_writer
+                .write_all(&serde_json::to_vec(&request).unwrap())
+                .await
+                .unwrap();
+            client_writer.write_all(b"\n").await.unwrap();
+        }
+        client_writer.shutdown().await.unwrap();
+
+        for _ in 0..MAX_CONCURRENT_REVIEWS {
+            started_rx.recv().await.unwrap();
+        }
+        tokio::task::yield_now().await;
+        assert!(started_rx.try_recv().is_err());
+
+        gate.add_permits(expected.len());
+        service.await.unwrap().unwrap();
+        let mut output = tokio::io::BufReader::new(client_reader).lines();
+        let mut actual = HashSet::new();
+        while let Some(line) = output.next_line().await.unwrap() {
+            let decision: WorkReviewDecision = serde_json::from_str(&line).unwrap();
+            assert_eq!(decision.work_id, "work-1");
+            assert_eq!(decision.generation, 3);
+            assert_eq!(decision.assignment, 4);
+            actual.insert(decision.review_id);
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn expired_completed_candidate_fails_closed_without_a_model() {
+        let mut request = request(WorkOutcome::Completed {
+            result: "verified".into(),
+            artifacts: Vec::new(),
+            context: String::new(),
+            suggested_reuse: false,
+        });
+        request.deadline_ms = unix_now_ms().saturating_sub(1);
+        let decision = review(&request, None, None).await;
+        assert!(matches!(
+            decision.recommendation,
+            WorkReviewRecommendation::Inconclusive {
+                failure: WorkReviewFailure::InvalidRequest
+            }
+        ));
+    }
+
+    #[test]
+    fn review_deadline_allows_twenty_seconds_and_execution_uses_the_remainder() {
+        assert_eq!(
+            review_timeout_from(None),
+            std::time::Duration::from_secs(20)
+        );
+        assert_eq!(
+            review_timeout_from(Some("7")),
+            std::time::Duration::from_secs(7)
+        );
+        assert_eq!(
+            review_execution_timeout(20_000, 11_000, review_timeout_from(None)),
+            std::time::Duration::from_secs(9)
+        );
     }
 
     #[test]

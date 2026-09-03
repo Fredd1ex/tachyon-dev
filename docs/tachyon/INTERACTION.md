@@ -495,8 +495,10 @@ evidence is already available.
   lines are emitted only for one-shot CLI output so a reply cannot render twice.
 - A worker released after successful completion must not be counted as failed,
   even if its process exits with a termination signal during cleanup.
-- The Agents tab renders the Background Coordinator as one compact row. Its
-  summary must not introduce an extra column or wrap the worker table layout.
+- The Agents tab renders the Background Coordinator as one compact row, shows
+  whether it is idle, restarting, or reviewing, and reports the nearest review
+  deadline. Worker rows identify pending semantic review without treating a
+  candidate result as completed evidence.
 
 ### Background Priorities And Interrupts
 

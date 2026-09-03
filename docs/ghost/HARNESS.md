@@ -1,6 +1,8 @@
 # Ghost — Agent Harness Design
 
-> **Control flow (see `docs/ARCHITECTURE.md` and `docs/INTERACTION.md`).** Ghost
+> **Control flow (see
+> [`../tachyon/ARCHITECTURE.md`](../tachyon/ARCHITECTURE.md) and
+> [`../tachyon/INTERACTION.md`](../tachyon/INTERACTION.md)).** Ghost
 > is the worker harness with temporary Background compatibility:
 >
 > - **foreground** — runs in the separate `tachyon-foreground` binary and owns
@@ -18,6 +20,14 @@ Ghost is the worker execution harness. Tachyond separately supervises
 Foreground, and workers can execute in parallel. Local execution is
 transitional; durable task state and hard isolation remain future work.
 
+> **Version boundary:** v0.2 retains `ipython` and `agent_browser` as
+> complementary research tools. v0.3 implementation has added the generic
+> registry plus all eight native P0 built-ins: `read`, `write`, `edit`, `ls`,
+> `find`, `grep`, `exec`, and `artifact`. Persistent IPython and headless
+> Lightpanda remain complementary tools.
+> See
+> [`roadmap/v0.3.0/GHOST_TOOL_RUNTIME.md`](../../roadmap/v0.3.0/GHOST_TOOL_RUNTIME.md).
+
 Inspired by `mini-swe-agent` (minimality, linear history, stateless per-action
 execution) and `SWE-ReX` (disentangle agent logic from infrastructure; parallel
 scaling).
@@ -26,10 +36,10 @@ scaling).
 
 | Topic | Decision |
 |---|---|
-| Tools | Exactly 2 first-class tools: `ipython`, `agent_browser` |
+| Tools | Registry-dispatched native `read`/`write`/`edit`/`ls`/`find`/`grep`/`exec`/`artifact` plus complementary persistent IPython and headless Lightpanda; quick web remains v0.3 work |
 | Wire protocol | OpenAI-compatible (`/chat/completions`) function calling via OpenRouter |
 | Streaming | SSE streaming from day one |
-| Execution model | Stateless per-command (mini-swe-agent), behind an `ExecBackend` trait |
+| Execution model | Stateless bounded core calls; persistent IPython is a separate complementary analysis environment |
 | Backend swap | Local now; Firecracker/Docker later — Ghost never knows the difference |
 | API keys | Managed by the CLI (`tachyon config`); Ghost reads from shared config |
 | Control channel | Tachyond IPC for lifecycle and event streaming |
@@ -38,24 +48,26 @@ scaling).
 ## Current Limitations
 
 - Local workspace isolation is not a hard security boundary.
-- Worker retention and durable task state are not implemented.
-- Structured Tachyond events and interruption are not implemented yet.
-- No persistent/interactive shell sessions. Each command is independent.
-- No `read`/`write`/`edit`/`grep`/web-fetch tools — IPython provides local Python and shell access.
+- Assignment cancellation is enforced by the runtime, but daemon control-channel
+  interruption is not wired through Ghost's stdin work loop yet.
+- Quick-web retrieval remains v0.3 work.
+- Host `exec` is not a hard security boundary until Microsandbox is available.
+- Durable output references are persisted but do not yet have model-facing
+  bounded read/search operations.
 
 ## Two key ideas borrowed
 
 ### 1. Stateless execution (mini-swe-agent)
 
-Every tool action is an **independent** process execution, never a stateful
-session. This gives us:
+Core native tool calls are bounded and independent. Persistent IPython is an
+explicit complementary stateful analysis session. This gives the core:
 
 - Trivial to sandbox: swap the backend, not the harness (see ExecBackend).
 - Effortless parallel scaling (Tachyond / Phase 2).
 - Stability: no long-lived shell that can wedge.
 
-IPython is the unified local execution environment. Each call remains a fresh
-process for now; persistent notebook sessions are future work.
+IPython reuses one worker-local session and checkpoints serializable values;
+timeouts terminate the session so the next call starts cleanly.
 
 ### 2. Disentangle agent logic from infrastructure (SWE-ReX)
 
@@ -74,25 +86,34 @@ sandbox. The agent loop never changes.
 ```text
 crates/ghost/src/
 ├── main.rs            # entrypoint; wires everything, runs standalone
-├── config.rs          # reads shared tachyon config (CLI-managed)
-├── model/
-│   ├── mod.rs         # ModelClient trait (streaming)
-│   └── openai.rs      # OpenAI-compatible client over reqwest (SSE)
-├── conversation.rs    # messages, linear history, token budget, truncation
-├── loop.rs            # the agent loop
-├── tools/
-│   ├── mod.rs         # Tool trait + registry
-│   ├── ipython.rs     # unified Python + shell execution tool
-│   └── browser.rs     # agent_browser tool (invokes agent-browser binary)
-├── exec.rs            # ExecBackend trait + Local backend
-├── control.rs         # lifecycle event + control message types
-├── events.rs          # event emission (standalone: tracing)
-└── error.rs           # error types
+├── model.rs           # OpenAI-compatible streaming client and message types
+├── role.rs            # worker role configuration and prompt selection
+└── harness/
+    ├── backend.rs     # Local execution and persistent IPython
+    ├── browser_setup.rs
+    ├── prompt.rs
+    ├── tools.rs       # complementary tool schemas
+    └── runtime/
+        ├── mod.rs     # shared contracts, policy, results, and output store trait
+        ├── registry.rs
+        ├── path.rs
+        ├── read.rs
+        ├── write.rs
+        ├── edit.rs
+        ├── ls.rs
+        ├── traversal.rs
+        ├── find.rs
+        ├── grep.rs
+        ├── exec.rs
+        ├── artifact.rs
+        ├── adapters.rs
+        └── output_store.rs
 ```
 
-## The two tools
+## The two current complementary tools
 
-Both are declared as OpenAI function-call tools and dispatched by name.
+Both are declared as OpenAI function-call tools and dispatched through the same
+registry as Rust-native tools.
 
 | Tool | Function | Runs | Purpose |
 |---|---|---|---|
@@ -108,11 +129,13 @@ Design notes:
   executable *in the environment*, not a native integration — consistent with
   "live off the land." Surface the raw CLI args; the model learns the subcommands
   from the system prompt. `agent-browser read <url>` is the primary research path.
-- **Extensibility**: this set is intentionally small but *not* final. The tool
-  registry (`tools/mod.rs`) is structured like opencode's — a `Tool` trait, a
-  named registry, dispatch by name — so richer tools (`edit`, `read`, `grep`,
-  `websearch`, `apply_patch`, MCP servers) can be added later without a redesign
-  if real-world use shows the 3-tool set is insufficient.
+  Calls use the native bounded process lifecycle, a 20-second execution cap, and
+  an 8 KiB capture cap. Successful binary/engine preflight is cached across
+  worker starts and invalidated when executable metadata or configuration changes.
+- **Extensibility**: the object-safe registry now dispatches native
+  `read`/`write`/`edit`/`ls`/`find`/`grep`, IPython, and headless Lightpanda.
+  Future built-ins register without changing the model loop. No Chromium-class
+  browser is required.
 
 ```json
 {
@@ -268,7 +291,7 @@ persona = "Focused, task-oriented, and concise in execution reports."
 - SSE stream parsed as Server-Sent Events; accumulate deltas into an assistant
   message (`content` and `tool_calls`), call `on_delta` for progress.
 - `Authorization: Bearer <key from environment or OS credential store>`.
-- Sends the tool schemas from `tools/mod.rs` as `tools`.
+- Sends policy-filtered schemas generated from the immutable runtime registry.
 
 Runtime overrides via env where useful (`TACHYON_MAX_ITERATIONS`,
 `TACHYON_TOOL_OUTPUT_CONTEXT_CHARS`, `GHOST_TIMEOUT`, `GHOST_OUTPUT_LIMIT`,
@@ -281,15 +304,17 @@ are resolved separately.
 1. Build conversation: system prompt + user task
 2. Call model (streaming) → assistant message
 3. If no tool_calls → StopReason::Completed, done
-4. For each tool_call: dispatch to ipython/agent_browser via ExecBackend → ToolResult
+4. Dispatch each tool call concurrently through ToolRegistry → structured ToolResult
 5. Append assistant + bounded tool results to the active conversation
 6. Check max iterations (default 100) → StopReason::MaxIterations
 7. Truncate to token budget if needed
 8. Goto 2
 ```
 
-Full tool output remains available in diagnostic events. Only the model-context
-copy is bounded. At completed assignment boundaries, raw tool protocol is
+Bounded full tool envelopes remain available in diagnostic events. Oversized
+model results are also atomically persisted under `.tachyon/tool-output` and
+receive an opaque output reference. Only the smaller model-context copy is
+inserted into history. At completed assignment boundaries, raw tool protocol is
 removed from warm-worker history while objectives and final findings remain.
 
 Interruption (Ctrl-C / later control channel): cancel in-flight exec + generation,
@@ -326,10 +351,24 @@ States capabilities + boundaries. Tool descriptions must be **accurate** — the
 are the model's only source for what it can do, so each matches its schema and
 the agent-browser subcommands it should use:
 
-- Two tools: `ipython`, `agent_browser`. The environment provides the
-  rest (git, rg, fd, compilers).
-- `ipython(code)`: run Python normally or shell commands with the `!command`
-  syntax. Each call is independent; persist state to files when needed.
+- Ten current tools: native `read`/`write`/`edit`/`ls`/`find`/`grep`/`exec`/
+  `artifact` plus complementary `ipython` and `agent_browser`.
+- `read(path, offset, limit)` and `ls(path, limit)`: bounded workspace inspection.
+- `find(pattern, path, limit, hidden)`: case-sensitive `*`, `**`, `?`, and `[]`
+  globs. Patterns containing `/` match paths relative to the search root;
+  other patterns match basenames. Standard ignore files are respected.
+- `grep(pattern, path, context, limit, fixed_string, hidden)`: bounded Rust
+  regex syntax or literal matching over UTF-8 files with binary skipping.
+  Cached `rg` discovery accelerates candidate filtering with native fallback.
+- `exec(argv | command, cwd, timeout_ms)`: bounded direct execution or explicit
+  non-login shell execution with scrubbed environment and process-group cleanup.
+- `artifact(path, kind, description)`: incrementally hash and register an
+  existing regular-file deliverable with assignment provenance; file bytes stay
+  in the workspace.
+- `write(path, content, create_parents)` and `edit(path, old, new)`: atomic,
+  workspace-confined file changes; edits require exactly one match.
+- `ipython(code)`: persistent Python analysis or shell commands with the
+  `!command` syntax; serializable values are checkpointed.
 - `agent_browser(args)`: web research + automation. Use `agent-browser read
   <url>` to fetch page text/markdown for research; use `agent-browser snapshot`,
   `click`, `fill`, `screenshot` etc. for interactive automation. Output may

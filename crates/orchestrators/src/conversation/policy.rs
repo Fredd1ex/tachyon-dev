@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub const CLASSIFICATION_PROMPT: &str = "Return only `AnswerNow` if the message can be handled independently of active work; otherwise return `WaitForActiveTurn`.";
 
-pub const ANSWERABILITY_PROMPT: &str = "Return only `AnswerFromContext` if the supplied context supports an accurate answer, including simple inference. Otherwise return `NeedsNewWork`, especially for missing, stale, or contradictory evidence.";
+pub const ANSWERABILITY_PROMPT: &str = "Decide whether the request can be answered accurately from conversation and accepted evidence using ordinary reasoning. Choose `AnswerFromContext` for supported advice, interpretation, comparison, explanation, summary, or transformation. Choose `NeedsNewWork` when an essential fact is missing, contradictory, stale, or the request asks for newer, future, or different-scope information. Judge only what was asked: do not demand an unrequested forecast or additional detail. Call the required tool exactly once; emit no prose.";
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub enum InteractionDecision {
@@ -65,6 +65,20 @@ pub fn execution_policy(answerability: Option<Answerability>) -> ExecutionPolicy
     }
 }
 
+pub fn follow_up_execution_policy(
+    requires_dependency: bool,
+    has_accepted_evidence: bool,
+    answerability: Option<Answerability>,
+) -> ExecutionPolicy {
+    if has_accepted_evidence {
+        return execution_policy(Some(answerability.unwrap_or(Answerability::NeedsNewWork)));
+    }
+    if requires_dependency {
+        return execution_policy(Some(Answerability::NeedsNewWork));
+    }
+    ExecutionPolicy::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +119,29 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_policy_only_disables_tools_for_accepted_answerable_evidence() {
+        assert_eq!(
+            follow_up_execution_policy(false, true, Some(Answerability::AnswerFromContext)),
+            ExecutionPolicy {
+                answer_from_context: true,
+                force_delegation: false,
+            }
+        );
+        for policy in [
+            follow_up_execution_policy(true, false, None),
+            follow_up_execution_policy(false, true, None),
+            follow_up_execution_policy(false, true, Some(Answerability::NeedsNewWork)),
+        ] {
+            assert!(policy.force_delegation);
+            assert!(!policy.answer_from_context);
+        }
+        assert_eq!(
+            follow_up_execution_policy(false, false, None),
+            ExecutionPolicy::default()
+        );
+    }
+
+    #[test]
     fn classifier_output_fails_closed() {
         assert_eq!(
             InteractionDecision::parse("AnswerNow"),
@@ -115,5 +152,34 @@ mod tests {
             Answerability::parse("explanation"),
             Answerability::NeedsNewWork
         );
+    }
+
+    #[test]
+    fn answerability_prompt_covers_supported_synthesis_and_new_evidence_boundaries() {
+        for request in [
+            "advice",
+            "interpretation",
+            "comparison",
+            "explanation",
+            "summary",
+            "transformation",
+        ] {
+            assert!(ANSWERABILITY_PROMPT.contains(request));
+        }
+        for boundary in [
+            "missing",
+            "contradictory",
+            "stale",
+            "newer",
+            "future",
+            "different-scope",
+        ] {
+            assert!(ANSWERABILITY_PROMPT.contains(boundary));
+        }
+        assert!(ANSWERABILITY_PROMPT.contains("accepted evidence"));
+        assert!(ANSWERABILITY_PROMPT.contains("unrequested forecast"));
+        assert!(ANSWERABILITY_PROMPT.contains("additional detail"));
+        assert!(ANSWERABILITY_PROMPT.contains("required tool exactly once"));
+        assert!(ANSWERABILITY_PROMPT.len() <= 600);
     }
 }

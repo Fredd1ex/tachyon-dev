@@ -13,10 +13,11 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 
 use tachyon_api::types::{
-    AgentEvent as StructuredAgentEvent, AgentInfo, AgentState, ApiRequest, ApiResponse, DaemonInfo,
-    EventEnvelope, EventStream, LifecycleRecommendation, LifetimeClass, WorkOutcome, WorkRequest,
-    WorkResult, WorkReviewContext, WorkReviewDecision, WorkReviewFailure, WorkReviewRecommendation,
-    WorkReviewRequest, PROTO_VERSION,
+    AgentEvent as StructuredAgentEvent, AgentInfo, AgentState, ApiRequest, ApiResponse,
+    BackgroundCoordinatorInfo, DaemonInfo, EventEnvelope, EventStream, LifecycleRecommendation,
+    LifetimeClass, PendingWorkReviewInfo, WorkOutcome, WorkRequest, WorkResult, WorkReviewContext,
+    WorkReviewDecision, WorkReviewFailure, WorkReviewRecommendation, WorkReviewRequest,
+    PROTO_VERSION,
 };
 use tachyon_api::{
     InteractionCommand, InteractionCommandEnvelope, InteractionMetadata, BACKGROUND_ID,
@@ -24,6 +25,8 @@ use tachyon_api::{
 };
 use tachyon_memory::{TaskDocument, TaskMetadata, TaskState};
 use tachyon_util::guard;
+
+const DEFAULT_BACKGROUND_REVIEW_TIMEOUT_SECS: u64 = 20;
 
 /// One streamed event, broadcast to subscribers.
 #[derive(Clone)]
@@ -70,6 +73,7 @@ struct Registry {
     works: HashMap<String, WorkRecord>,
     foreground_id: Option<String>,
     review_tx: Option<mpsc::SyncSender<WorkReviewRequest>>,
+    background_online: bool,
     background_generation: u64,
     memory: Option<memory::MemoryClient>,
     memory_path: std::path::PathBuf,
@@ -82,6 +86,7 @@ impl Default for Registry {
             works: HashMap::new(),
             foreground_id: None,
             review_tx: None,
+            background_online: false,
             background_generation: 0,
             memory: None,
             memory_path: tachyon_util::daemon::runtime_dir().join("memory.sock"),
@@ -792,9 +797,13 @@ fn correlate_event(data: &str, info: &AgentInfo) -> String {
     };
     envelope.task_id = info.logical_task_id.clone().or(envelope.task_id);
     envelope.parent_task_id = info.parent_task_id.clone().or(envelope.parent_task_id);
+    if let StructuredAgentEvent::ArtifactRegistered { artifact } = &mut envelope.kind {
+        artifact.task_id = info.logical_task_id.clone().or(artifact.task_id.take());
+    }
     if matches!(
         envelope.kind,
         StructuredAgentEvent::Usage { .. }
+            | StructuredAgentEvent::ArtifactRegistered { .. }
             | StructuredAgentEvent::WorkerCompleted { .. }
             | StructuredAgentEvent::WorkCandidate { .. }
             | StructuredAgentEvent::WorkResult { .. }
@@ -861,8 +870,7 @@ fn handle_work_candidate(
             "review:{}:{}:{}:{}",
             candidate.work_id, candidate.generation, candidate.assignment, envelope.event_id
         );
-        let deadline_ms =
-            unix_now_ms().saturating_add(background_review_timeout().as_millis() as u64);
+        let deadline_ms = background_review_deadline_ms(unix_now_ms(), background_review_timeout());
         let Some(work) = reg.works.get_mut(&candidate.work_id) else {
             return;
         };
@@ -954,6 +962,14 @@ fn fail_pending_review(
 }
 
 fn apply_work_review(registry: &Arc<Mutex<Registry>>, decision: WorkReviewDecision) {
+    apply_work_review_at(registry, decision, unix_now_ms());
+}
+
+fn apply_work_review_at(
+    registry: &Arc<Mutex<Registry>>,
+    decision: WorkReviewDecision,
+    now_ms: u64,
+) {
     let (request, lifecycle) = {
         let mut reg = registry.lock().unwrap();
         let Some(work) = reg.works.get_mut(&decision.work_id) else {
@@ -967,6 +983,7 @@ fn apply_work_review(registry: &Arc<Mutex<Registry>>, decision: WorkReviewDecisi
             || request.coordinator_generation != decision.coordinator_generation
             || request.candidate.generation != decision.generation
             || request.candidate.assignment != decision.assignment
+            || request.deadline_ms <= now_ms
             || work.terminal_result.is_some()
         {
             return;
@@ -1742,15 +1759,37 @@ fn write_response<W: Write>(writer: &mut W, resp: &ApiResponse) -> std::io::Resu
 fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
     use ApiRequest::*;
     match req {
-        DaemonStatus => ApiResponse::DaemonStatus {
-            info: DaemonInfo {
-                pid: std::process::id(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                proto_version: PROTO_VERSION.into(),
-                provider_ready: tachyon_util::config::Config::load().provider_ready(),
-                socket: tachyon_util::daemon::socket_path().display().to_string(),
-            },
-        },
+        DaemonStatus => {
+            let background = {
+                let reg = registry.lock().unwrap();
+                BackgroundCoordinatorInfo {
+                    online: reg.background_online,
+                    generation: reg.background_generation,
+                    pending_reviews: reg
+                        .works
+                        .values()
+                        .filter_map(|work| {
+                            let review = work.review.as_ref()?;
+                            Some(PendingWorkReviewInfo {
+                                work_id: review.request.candidate.work_id.clone(),
+                                worker_id: review.request.worker.worker_id.clone(),
+                                deadline_ms: review.request.deadline_ms,
+                            })
+                        })
+                        .collect(),
+                }
+            };
+            ApiResponse::DaemonStatus {
+                info: DaemonInfo {
+                    pid: std::process::id(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    proto_version: PROTO_VERSION.into(),
+                    provider_ready: tachyon_util::config::Config::load().provider_ready(),
+                    socket: tachyon_util::daemon::socket_path().display().to_string(),
+                    background,
+                },
+            }
+        }
         AgentStart {
             task,
             cwd,
@@ -2697,6 +2736,7 @@ fn supervise_background(
             let _ = child.wait();
             continue;
         };
+        registry.lock().unwrap().background_online = true;
         if let Some(stdout) = child.stdout.take() {
             let decision_registry = Arc::clone(&registry);
             std::thread::spawn(move || {
@@ -2734,17 +2774,22 @@ fn supervise_background(
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    registry.lock().unwrap().background_online = false;
+                    return;
+                }
             }
             if child.try_wait().ok().flatten().is_some() {
                 restart = true;
             }
         }
         if shutdown.load(Ordering::SeqCst) {
+            registry.lock().unwrap().background_online = false;
             let _ = child.kill();
             let _ = child.wait();
             return;
         }
+        registry.lock().unwrap().background_online = false;
         let _ = child.kill();
         let _ = child.wait();
         std::thread::sleep(std::time::Duration::from_millis(250));
@@ -3374,12 +3419,20 @@ fn worker_result_timeout() -> std::time::Duration {
 }
 
 fn background_review_timeout() -> std::time::Duration {
-    let seconds = std::env::var("TACHYON_BACKGROUND_REVIEW_TIMEOUT_SECS")
-        .ok()
+    let configured = std::env::var("TACHYON_BACKGROUND_REVIEW_TIMEOUT_SECS").ok();
+    background_review_timeout_from(configured.as_deref())
+}
+
+fn background_review_timeout_from(configured: Option<&str>) -> std::time::Duration {
+    let seconds = configured
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(10)
+        .unwrap_or(DEFAULT_BACKGROUND_REVIEW_TIMEOUT_SECS)
         .max(1);
     std::time::Duration::from_secs(seconds)
+}
+
+fn background_review_deadline_ms(now_ms: u64, timeout: std::time::Duration) -> u64 {
+    now_ms.saturating_add(timeout.as_millis() as u64)
 }
 
 fn decode_structured_event(data: &str) -> Option<StructuredAgentEvent> {
@@ -3884,6 +3937,72 @@ mod tests {
     }
 
     #[test]
+    fn review_after_old_timeout_before_current_deadline_is_accepted_and_fenced() {
+        let (registry, _review_rx) = review_registry(LifetimeClass::Short);
+        let rx = registry.lock().unwrap().subscribe_work("work-1").unwrap();
+        handle_work_candidate(&registry, "worker", completed_candidate());
+
+        let started_ms = 1_000;
+        let deadline_ms =
+            background_review_deadline_ms(started_ms, background_review_timeout_from(None));
+        let request = {
+            let mut reg = registry.lock().unwrap();
+            let review = reg
+                .works
+                .get_mut("work-1")
+                .unwrap()
+                .review
+                .as_mut()
+                .unwrap();
+            review.request.deadline_ms = deadline_ms;
+            review.request.clone()
+        };
+        assert_eq!(deadline_ms, 21_000);
+
+        let mut decision = WorkReviewDecision {
+            review_id: request.review_id.clone(),
+            coordinator_generation: request.coordinator_generation,
+            work_id: request.candidate.work_id.clone(),
+            generation: request.candidate.generation,
+            assignment: request.candidate.assignment + 1,
+            recommendation: WorkReviewRecommendation::Accept {
+                lifecycle: LifecycleRecommendation::KeepCurrent,
+            },
+            rationale: "sufficient evidence".into(),
+        };
+        apply_work_review_at(&registry, decision.clone(), started_ms + 10_001);
+        assert!(rx.try_recv().is_err());
+        assert!(registry.lock().unwrap().works["work-1"].review.is_some());
+
+        decision.assignment = request.candidate.assignment;
+        apply_work_review_at(&registry, decision, started_ms + 10_001);
+        let event = rx.recv().unwrap();
+        let envelope: EventEnvelope = serde_json::from_str(&event.data).unwrap();
+        assert!(matches!(
+            envelope.kind,
+            StructuredAgentEvent::WorkResult {
+                result: WorkResult {
+                    outcome: WorkOutcome::Completed { .. },
+                    ..
+                }
+            }
+        ));
+        assert!(registry.lock().unwrap().works["work-1"].review.is_none());
+    }
+
+    #[test]
+    fn background_review_timeout_default_and_override_are_stable() {
+        assert_eq!(
+            background_review_timeout_from(None),
+            std::time::Duration::from_secs(20)
+        );
+        assert_eq!(
+            background_review_timeout_from(Some("8")),
+            std::time::Duration::from_secs(8)
+        );
+    }
+
+    #[test]
     fn rework_decision_fails_closed_without_publishing_candidate_evidence() {
         let (registry, _review_rx) = review_registry(LifetimeClass::Long);
         let rx = registry.lock().unwrap().subscribe_work("work-1").unwrap();
@@ -4096,6 +4215,53 @@ mod tests {
         assert_eq!(enriched.turn_id.as_deref(), Some("7"));
         assert_eq!(enriched.parent_task_id.as_deref(), Some("task-parent"));
         assert_eq!(enriched.tool_call_id.as_deref(), Some("call-7"));
+    }
+
+    #[test]
+    fn artifact_registration_uses_daemon_owned_task_identity() {
+        let mut worker = task("research", AgentState::Running);
+        worker.info.logical_task_id = Some("task-7".into());
+        let event = EventEnvelope {
+            event_id: 1,
+            session_id: "worker".into(),
+            conversation_id: None,
+            turn_id: None,
+            task_id: None,
+            parent_task_id: None,
+            tool_call_id: None,
+            actor: tachyon_api::types::Actor::Worker {
+                id: "worker".into(),
+            },
+            sequence: 1,
+            occurred_at_ms: 1,
+            kind: StructuredAgentEvent::ArtifactRegistered {
+                artifact: tachyon_api::types::ArtifactRegistration {
+                    id: "artifact-1".into(),
+                    path: "report.txt".into(),
+                    kind: "report".into(),
+                    description: "Report".into(),
+                    size_bytes: 3,
+                    sha256: "abc".into(),
+                    task_id: None,
+                    work_id: Some("work-1".into()),
+                    generation: Some(2),
+                    assignment: Some(3),
+                    attempt_id: None,
+                },
+            },
+        };
+
+        let enriched: EventEnvelope = serde_json::from_str(&correlate_event(
+            &serde_json::to_string(&event).unwrap(),
+            &worker.info,
+        ))
+        .unwrap();
+        assert_eq!(enriched.task_id.as_deref(), Some("task-7"));
+        let StructuredAgentEvent::ArtifactRegistered { artifact } = enriched.kind else {
+            panic!("expected artifact registration");
+        };
+        assert_eq!(artifact.task_id.as_deref(), Some("task-7"));
+        assert_eq!(artifact.work_id.as_deref(), Some("work-1"));
     }
 
     #[test]

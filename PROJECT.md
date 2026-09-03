@@ -3,8 +3,10 @@
 > **Persistent interaction over disposable computation.**
 
 > This file is the canonical product vision and architecture specification. For
-> the implementation that currently exists, see [`docs/STATUS.md`](docs/STATUS.md);
-> for runtime ownership and boundaries, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+> the implementation that currently exists, see
+> [`docs/tachyon/STATUS.md`](docs/tachyon/STATUS.md); for runtime ownership and
+> boundaries, see
+> [`docs/tachyon/ARCHITECTURE.md`](docs/tachyon/ARCHITECTURE.md).
 
 Tachyon is an experimental Rust-native runtime for persistent, asynchronous AI systems.
 

@@ -1,6 +1,6 @@
 # Tachyon Roadmap
 
-Progress snapshot: 2026-08-30.
+Progress snapshot: 2026-09-01.
 
 Estimates measure working, tested behavior rather than types, prompts, or
 documentation alone. Each milestone has its own tracker with scope, status,
@@ -10,16 +10,16 @@ exit criteria, dependencies, and next work.
 
 | Milestone | Progress | Status | Tracker |
 | --- | ---: | --- | --- |
-| v0.2.0 Architectural separation | 35% | Partial | [`v0.2.0/`](v0.2.0/) |
+| v0.2.0 Architectural separation | 45% | Partial | [`v0.2.0/`](v0.2.0/) |
 | v0.3.0 Ghost research harness | 35% | Partial | [`v0.3.0/`](v0.3.0/) |
 | v0.4.0 Tachyond kernel | 18% | Early | [`v0.4.0/`](v0.4.0/) |
 | v0.5.0 Memory and continuity | 25% | Early | [`v0.5.0/`](v0.5.0/) |
-| v0.6.0 Research orchestration | 20% | Early | [`v0.6.0/`](v0.6.0/) |
+| v0.6.0 Research orchestration | 25% | Early | [`v0.6.0/`](v0.6.0/) |
 | v0.7+ Evaluation and hardening | 15% | Early | [`v0.7.0/`](v0.7.0/) |
 
-The project has substantial foundations, but it is not yet through v0.2.0.
-The main blocker is ownership: Foreground still performs work that should be
-represented as typed commands and owned durably by Tachyond.
+The package version is v0.2.0, while the architectural milestone remains
+partial. The main blocker is ownership: Foreground still performs work that
+should be represented as typed commands and owned durably by Tachyond.
 
 ## Storage Direction
 

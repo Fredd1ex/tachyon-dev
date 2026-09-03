@@ -118,17 +118,24 @@ executes the selected action; it does not infer that an idle process is safe to
 free merely because it is not currently consuming CPU.
 
 The TUI agent pane and trace/chat worker-start notices should expose the
-lifetime class, retention state, and short-session budget. For example:
+lifetime class, retention state, and the applicable countdown or budget. For
+example:
 
 ```text
 research  long  waiting  retained
 weather   short completed retained  turns 1/3
+cleanup   short staged   retained  kill in 42s
 ```
 
 Long and persistent sessions expose their retention state directly. Short
 sessions disappear after their third completed assignment unless the
 Coordinator promotes them; any idle completed session may also be explicitly
 released or reclassified after result verification.
+
+Where no wall-clock termination exists, the pane states the actual policy:
+Long workers end at daemon shutdown, Persistent workers require manual release,
+and Short workers report completed assignments remaining. Explicit leases and
+staged cleanup use live countdowns from daemon-owned timestamps.
 
 The `staged` state is the manual-intervention window. A staged worker remains
 alive until `stage_until_secs`; `agent_retain` returns it to `waiting` and

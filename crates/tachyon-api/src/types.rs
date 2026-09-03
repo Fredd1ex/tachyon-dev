@@ -296,6 +296,24 @@ pub struct DaemonInfo {
     pub provider_ready: bool,
     /// Path to the daemon's socket.
     pub socket: String,
+    /// Independently supervised semantic result reviewer state.
+    #[serde(default)]
+    pub background: BackgroundCoordinatorInfo,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackgroundCoordinatorInfo {
+    pub online: bool,
+    pub generation: u64,
+    #[serde(default)]
+    pub pending_reviews: Vec<PendingWorkReviewInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingWorkReviewInfo {
+    pub work_id: String,
+    pub worker_id: String,
+    pub deadline_ms: u64,
 }
 
 /// All requests the daemon accepts. Mirrors the CLI subcommands 1:1.
@@ -415,6 +433,21 @@ pub enum EventStream {
     Exit,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactRegistration {
+    pub id: String,
+    pub path: String,
+    pub kind: String,
+    pub description: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub task_id: Option<String>,
+    pub work_id: Option<String>,
+    pub generation: Option<u64>,
+    pub assignment: Option<u64>,
+    pub attempt_id: Option<String>,
+}
+
 /// Structured Ghost event carried in `ApiResponse::Event.data` as JSON.
 /// Legacy line markers remain temporarily for daemon supervision compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -480,6 +513,9 @@ pub enum AgentEvent {
         turn: Option<u64>,
         id: String,
         output: String,
+    },
+    ArtifactRegistered {
+        artifact: ArtifactRegistration,
     },
     Error {
         turn: Option<u64>,
@@ -668,6 +704,15 @@ mod tests {
         assert_eq!(info.origin_turn_id, None);
         assert_eq!(info.parent_task_id, None);
         assert_eq!(info.tool_call_id, None);
+    }
+
+    #[test]
+    fn daemon_status_defaults_background_state_for_older_daemons() {
+        let info: DaemonInfo = serde_json::from_str(
+            r#"{"pid":7,"version":"0.1.4","proto_version":"0.1","provider_ready":true,"socket":"/tmp/tachyon.sock"}"#,
+        )
+        .unwrap();
+        assert_eq!(info.background, BackgroundCoordinatorInfo::default());
     }
 
     #[test]

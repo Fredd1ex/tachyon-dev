@@ -9,9 +9,10 @@
 //! Keys:
 //!   Enter        submit input / toggle collapse on focused thread
 //!   Tab          toggle floating agent pane
-//!   Up / Down    move focus between threads
-//!   Up/PageUp    scroll chat up (hold) / PageUp
-//!   End          jump to bottom
+//!   Up / Down    select adjacent turns and expand traces
+//!   PageUp/Down  page within or select trace turns
+//!   End          return to the latest turn
+//!   Ctrl+O       toggle inline traces for the current turn
 //!   Ctrl+C / Esc / /exit  quit
 //!
 //! Slash commands: /exit, /await, /stop, /release, /replan, /kill
@@ -41,7 +42,7 @@ use ratatui::Terminal;
 
 use tachyon_api::types::{
     Actor, AgentEvent, AgentInfo, AgentState, ApiResponse, DaemonInfo, EventEnvelope, EventStream,
-    WorkOutcome,
+    LifetimeClass, WorkOutcome,
 };
 use tachyon_api::{InteractionEvent, InteractionEventEnvelope, FOREGROUND_ID};
 
@@ -103,7 +104,7 @@ fn name_block_background(color: Color) -> Color {
 }
 
 /// A kind of conversation line.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq)]
 enum ItemKind {
     User,         // the human user's message
     PendingReply, // reserved assistant position for an accepted user turn
@@ -130,6 +131,7 @@ struct Item {
     tool_id: Option<String>,
     turn: Option<String>,
     timestamp: u64,
+    revision: u64,
 }
 
 fn sanitize_reply_text(text: &str) -> String {
@@ -197,9 +199,11 @@ struct Thread {
     streaming: bool,
     last_activity: Instant,
     revision: u64,
+    structure_revision: u64,
     items: Vec<Item>,
     usage: HashMap<u64, (u32, u32, u32)>,
     metrics: HashMap<String, TurnMetrics>,
+    metric_revisions: HashMap<String, u64>,
 }
 
 #[derive(Clone, Default, Hash, serde::Serialize, serde::Deserialize)]
@@ -229,9 +233,11 @@ impl Thread {
             streaming: false,
             last_activity: Instant::now(),
             revision: 0,
+            structure_revision: 0,
             items: Vec::new(),
             usage: HashMap::new(),
             metrics: HashMap::new(),
+            metric_revisions: HashMap::new(),
         }
     }
 
@@ -240,15 +246,16 @@ impl Thread {
     }
 
     fn reserve_reply(&mut self) {
-        self.touch();
+        self.touch_structure();
         self.items.push(Item {
             kind: ItemKind::PendingReply,
-            text: "waiting".into(),
+            text: String::new(),
             hidden: false,
             output: None,
             tool_id: None,
             turn: None,
             timestamp: now_seconds(),
+            revision: self.revision,
         });
     }
 
@@ -266,6 +273,7 @@ impl Thread {
             {
                 last.output = Some(text);
                 last.hidden = true;
+                last.revision = self.revision;
                 self.streaming = false;
                 self.last_activity = Instant::now();
                 return;
@@ -301,8 +309,10 @@ impl Thread {
                 if last.kind == ItemKind::ToolResult && last.text.chars().count() > 400 {
                     last.hidden = true;
                 }
+                last.revision = self.revision;
             }
         } else {
+            self.structure_revision = self.structure_revision.wrapping_add(1);
             match &kind {
                 ItemKind::ToolResult => {
                     // Start long tool output collapsed (a clickable header);
@@ -315,6 +325,7 @@ impl Thread {
                         tool_id: None,
                         turn,
                         timestamp,
+                        revision: self.revision,
                     });
                 }
                 _ => self.items.push(Item {
@@ -325,6 +336,7 @@ impl Thread {
                     tool_id: None,
                     turn,
                     timestamp,
+                    revision: self.revision,
                 }),
             }
         }
@@ -344,6 +356,7 @@ impl Thread {
                 existing.text.push('\n');
             }
             existing.text.push_str(&text);
+            existing.revision = self.revision;
             return;
         }
         if let Some(existing) = self
@@ -355,6 +368,7 @@ impl Thread {
             existing.kind = ItemKind::Reply;
             existing.text = text;
             existing.timestamp = now_seconds();
+            existing.revision = self.revision;
             return;
         }
         let item = Item {
@@ -365,6 +379,7 @@ impl Thread {
             tool_id: None,
             turn: turn.clone(),
             timestamp: now_seconds(),
+            revision: self.revision,
         };
         let index = turn
             .as_deref()
@@ -379,6 +394,7 @@ impl Thread {
             })
             .unwrap_or(self.items.len());
         self.items.insert(index, item);
+        self.structure_revision = self.structure_revision.wrapping_add(1);
     }
 
     fn finish_reply(&mut self, text: String, turn: Option<String>) {
@@ -392,6 +408,7 @@ impl Thread {
             .find(|item| item.kind == ItemKind::Reply && item.turn == turn)
         {
             existing.text = text;
+            existing.revision = self.revision;
             self.last_activity = Instant::now();
             return;
         }
@@ -399,8 +416,27 @@ impl Thread {
         self.streaming = false;
     }
 
-    fn add_tool(&mut self, text: String, id: String, turn: Option<String>) {
+    fn update_pending_reply_status(&mut self, turn: Option<String>, phase: &str, message: &str) {
+        let Some(turn) = turn else {
+            return;
+        };
+        let Some(index) = self.items.iter().rposition(|item| {
+            item.kind == ItemKind::PendingReply && item.turn.as_deref() == Some(&turn)
+        }) else {
+            return;
+        };
         self.touch();
+        let pending = &mut self.items[index];
+        pending.text = if message.trim().is_empty() {
+            phase.to_string()
+        } else {
+            message.trim().to_string()
+        };
+        pending.revision = self.revision;
+    }
+
+    fn add_tool(&mut self, text: String, id: String, turn: Option<String>) {
+        self.touch_structure();
         self.streaming = false;
         self.items.push(Item {
             kind: ItemKind::Tool,
@@ -410,6 +446,7 @@ impl Thread {
             tool_id: Some(id),
             turn,
             timestamp: now_seconds(),
+            revision: self.revision,
         });
     }
 
@@ -427,6 +464,7 @@ impl Thread {
                 None => text,
             });
             tool.hidden = true;
+            tool.revision = self.revision;
             return;
         }
         self.add(ItemKind::ToolResult, text);
@@ -438,6 +476,11 @@ impl Thread {
 
     fn touch(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn touch_structure(&mut self) {
+        self.touch();
+        self.structure_revision = self.structure_revision.wrapping_add(1);
     }
 }
 
@@ -471,40 +514,406 @@ enum PaneTab {
     Agents,
 }
 
-/// Per-render-row click target: maps a visible conversation row to an item in
-/// `threads[thread].items[item]`. Rows without a target are `None`.
-type Hit = Option<(usize, usize)>;
-static HITS: std::sync::Mutex<Vec<Hit>> = std::sync::Mutex::new(Vec::new());
-/// (area.y, area.height, top_scroll) of the last conversation render, used to
-/// map a mouse click row back to the hitmap.
-static VIEW: std::sync::Mutex<(u16, u16, usize)> = std::sync::Mutex::new((0, 0, 0));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClickTarget {
+    TraceSummary(usize),
+    Item(usize, usize),
+}
 
-struct ConversationCache {
-    signature: u64,
+/// Per-render-row click target. Rows without a target are `None`.
+type Hit = Option<ClickTarget>;
+static HITS: std::sync::Mutex<Vec<Hit>> = std::sync::Mutex::new(Vec::new());
+/// (area.y, area.height) of the last conversation render.
+static VIEW: std::sync::Mutex<(u16, u16)> = std::sync::Mutex::new((0, 0));
+
+#[derive(Clone, Debug, PartialEq)]
+struct TranscriptScroll {
+    top: usize,
+    follow: bool,
+    new_activity: bool,
+    seen_latest_revision: u64,
+}
+
+impl Default for TranscriptScroll {
+    fn default() -> Self {
+        Self {
+            top: 0,
+            follow: true,
+            new_activity: false,
+            seen_latest_revision: 0,
+        }
+    }
+}
+
+impl TranscriptScroll {
+    fn sync(&mut self, total: usize, viewport: usize, latest_revision: u64) {
+        let max_top = total.saturating_sub(viewport);
+        if self.follow {
+            self.top = max_top;
+            self.new_activity = false;
+        } else {
+            self.top = self.top.min(max_top);
+            if self.seen_latest_revision != 0 && self.seen_latest_revision != latest_revision {
+                self.new_activity = true;
+            }
+        }
+        self.seen_latest_revision = latest_revision;
+    }
+
+    fn scroll_up(&mut self, rows: usize) {
+        self.follow = false;
+        self.top = self.top.saturating_sub(rows);
+    }
+
+    fn scroll_down(&mut self, rows: usize, total: usize, viewport: usize) {
+        let max_top = total.saturating_sub(viewport);
+        self.top = self.top.saturating_add(rows).min(max_top);
+        if self.top == max_top {
+            self.follow = true;
+            self.new_activity = false;
+        }
+    }
+
+    fn end(&mut self) {
+        self.follow = true;
+        self.new_activity = false;
+    }
+}
+
+#[derive(Clone, Default)]
+struct TranscriptView {
+    total_height: usize,
+    viewport: usize,
+    turns: usize,
+    anchor_turn: Option<usize>,
+    starts: Vec<usize>,
+    heights: Vec<usize>,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct CellKey {
+    prompt_timestamp: u64,
+    prompt_index: usize,
+}
+
+struct CachedLayout {
+    revision: CellRevision,
+    variant: u8,
+    layout: CellLayout,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CellRevision {
+    item: u64,
+    metric: u64,
+    worker: u64,
+}
+
+#[derive(Clone)]
+struct CellLayout {
     lines: Vec<Line<'static>>,
     hits: Vec<Hit>,
 }
 
-static CONVERSATION_CACHE: std::sync::Mutex<Option<ConversationCache>> =
-    std::sync::Mutex::new(None);
+#[derive(Default)]
+struct TurnLayoutCache {
+    layouts: HashMap<CellKey, CachedLayout>,
+    width: Option<u16>,
+    structure_revision: Option<u64>,
+    #[cfg(test)]
+    builds: usize,
+}
 
-fn conversation_signature(
-    threads: &[Thread],
-    width: u16,
-    show_traces: bool,
-    foreground_busy: bool,
-) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    width.hash(&mut hasher);
-    show_traces.hash(&mut hasher);
-    foreground_busy.hash(&mut hasher);
-    for thread in threads {
-        thread.id.hash(&mut hasher);
-        thread.collapsed.hash(&mut hasher);
-        thread.streaming.hash(&mut hasher);
-        thread.revision.hash(&mut hasher);
+impl TurnLayoutCache {
+    fn reset(&mut self) {
+        self.layouts.clear();
+        self.width = None;
+        self.structure_revision = None;
     }
-    hasher.finish()
+
+    fn prepare(&mut self, width: u16, cells: &[TurnCell], structure_revision: u64) {
+        if self.width != Some(width) {
+            self.reset();
+            self.width = Some(width);
+        }
+        if self.structure_revision == Some(structure_revision) {
+            return;
+        }
+        let valid = cells.iter().map(cell_key).collect::<HashSet<_>>();
+        self.layouts.retain(|key, _| valid.contains(key));
+        self.structure_revision = Some(structure_revision);
+    }
+
+    fn layout<F>(
+        &mut self,
+        key: CellKey,
+        revision: CellRevision,
+        variant: u8,
+        build: F,
+    ) -> &CellLayout
+    where
+        F: FnOnce() -> CellLayout,
+    {
+        let stale = self
+            .layouts
+            .get(&key)
+            .is_none_or(|cached| cached.revision != revision || cached.variant != variant);
+        if stale {
+            let layout = build();
+            #[cfg(test)]
+            {
+                self.builds += 1;
+            }
+            self.layouts.insert(
+                key.clone(),
+                CachedLayout {
+                    revision,
+                    variant,
+                    layout,
+                },
+            );
+        }
+        &self.layouts[&key].layout
+    }
+}
+
+struct TurnCell {
+    prompt: usize,
+    items: Vec<usize>,
+    prompt_timestamp: u64,
+}
+
+#[derive(Default)]
+struct TurnProjection {
+    structure_revision: Option<u64>,
+    cells: Vec<TurnCell>,
+}
+
+impl TurnProjection {
+    fn reset(&mut self) {
+        self.structure_revision = None;
+        self.cells.clear();
+    }
+
+    fn update(&mut self, thread: &Thread) -> bool {
+        if self.structure_revision == Some(thread.structure_revision) {
+            return false;
+        }
+        self.cells = build_turn_cells(thread);
+        self.structure_revision = Some(thread.structure_revision);
+        true
+    }
+}
+
+fn transcript_content_height(height: u16, show_activity: bool) -> usize {
+    (height as usize).saturating_sub(usize::from(show_activity && height > 1))
+}
+
+fn should_show_activity(scroll: &TranscriptScroll, total: usize, viewport: usize) -> bool {
+    scroll.new_activity
+        && !scroll.follow
+        && viewport > 1
+        && scroll.top.saturating_add(viewport) < total
+}
+
+fn foreground_thread(threads: &[Thread]) -> Option<(usize, &Thread)> {
+    threads
+        .iter()
+        .enumerate()
+        .find(|(_, thread)| thread.is_foreground)
+}
+
+fn build_turn_cells(thread: &Thread) -> Vec<TurnCell> {
+    let mut cells = thread
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.kind == ItemKind::User)
+        .map(|(prompt, item)| TurnCell {
+            prompt,
+            items: vec![prompt],
+            prompt_timestamp: item.timestamp,
+        })
+        .collect::<Vec<_>>();
+    let mut by_turn = HashMap::<&str, usize>::new();
+    let mut by_prompt = HashMap::<usize, usize>::new();
+    for (cell, turn) in cells.iter().enumerate() {
+        by_prompt.insert(turn.prompt, cell);
+    }
+    for (cell, turn) in cells.iter().enumerate().filter_map(|(cell, turn)| {
+        thread.items[turn.prompt]
+            .turn
+            .as_deref()
+            .map(|id| (cell, id))
+    }) {
+        by_turn.insert(turn, cell);
+    }
+    let mut current = None;
+    for (index, item) in thread.items.iter().enumerate() {
+        if item.kind == ItemKind::User {
+            current = by_prompt.get(&index).copied();
+            continue;
+        }
+        let cell = match item.turn.as_deref() {
+            Some(turn) => by_turn.get(turn).copied(),
+            None => current,
+        };
+        if let Some(cell) = cell {
+            cells[cell].items.push(index);
+        }
+    }
+    cells
+}
+
+fn cell_revision(thread: &Thread, cell: &TurnCell) -> CellRevision {
+    let item_revision = cell
+        .items
+        .iter()
+        .map(|index| thread.items[*index].revision)
+        .max()
+        .unwrap_or(0);
+    let metric_revision = thread.items[cell.prompt]
+        .turn
+        .as_ref()
+        .and_then(|turn| thread.metric_revisions.get(turn))
+        .copied()
+        .unwrap_or(0);
+    CellRevision {
+        item: item_revision,
+        metric: metric_revision,
+        worker: 0,
+    }
+}
+
+fn worker_turn_revisions(threads: &[Thread]) -> HashMap<&str, u64> {
+    let mut revisions = HashMap::new();
+    for thread in threads.iter().filter(|thread| !thread.is_foreground) {
+        for (index, item) in thread.items.iter().enumerate() {
+            let Some(turn) = item.turn.as_deref() else {
+                continue;
+            };
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            thread.id.hash(&mut hasher);
+            index.hash(&mut hasher);
+            item.revision.hash(&mut hasher);
+            let revision = hasher.finish();
+            revisions
+                .entry(turn)
+                .and_modify(|combined: &mut u64| *combined ^= revision)
+                .or_insert(revision);
+        }
+    }
+    revisions
+}
+
+fn cell_key(cell: &TurnCell) -> CellKey {
+    CellKey {
+        prompt_timestamp: cell.prompt_timestamp,
+        prompt_index: cell.prompt,
+    }
+}
+
+fn latest_conversation_timestamp(thread: &Thread, cell: &TurnCell) -> u64 {
+    cell.items
+        .iter()
+        .map(|index| &thread.items[*index])
+        .filter(|item| {
+            matches!(
+                item.kind,
+                ItemKind::User | ItemKind::PendingReply | ItemKind::Reply
+            )
+        })
+        .map(|item| item.timestamp)
+        .max()
+        .unwrap_or(0)
+}
+
+fn turn_response<'a>(thread: &'a Thread, cell: &TurnCell) -> Option<&'a Item> {
+    cell.items
+        .iter()
+        .map(|index| &thread.items[*index])
+        .find(|item| item.kind == ItemKind::Reply)
+        .or_else(|| {
+            cell.items
+                .iter()
+                .map(|index| &thread.items[*index])
+                .find(|item| item.kind == ItemKind::PendingReply)
+        })
+}
+
+fn toggle_trace(open_trace: &mut Option<usize>, turn: usize) {
+    *open_trace = (*open_trace != Some(turn)).then_some(turn);
+}
+
+fn ctrl_o_target(view: &TranscriptView, follow: bool) -> Option<usize> {
+    if view.turns == 0 {
+        None
+    } else if follow {
+        Some(view.turns - 1)
+    } else {
+        view.anchor_turn.map(|turn| turn.min(view.turns - 1))
+    }
+}
+
+fn select_trace_turn(
+    open_trace: &mut Option<usize>,
+    view: &TranscriptView,
+    scroll: &mut TranscriptScroll,
+    direction: i8,
+) {
+    if view.turns == 0 {
+        return;
+    }
+    let current = open_trace.unwrap_or_else(|| {
+        if scroll.follow {
+            view.turns - 1
+        } else {
+            view.anchor_turn.unwrap_or(view.turns - 1)
+        }
+    });
+    let target = if open_trace.is_none() {
+        current
+    } else if direction < 0 {
+        current.saturating_sub(1)
+    } else if current + 1 < view.turns {
+        current + 1
+    } else {
+        *open_trace = None;
+        scroll.end();
+        return;
+    };
+    *open_trace = Some(target);
+    scroll.follow = false;
+    scroll.new_activity = false;
+    scroll.top = view.starts.get(target).copied().unwrap_or(scroll.top);
+}
+
+fn page_trace_turn(
+    open_trace: &mut Option<usize>,
+    view: &TranscriptView,
+    scroll: &mut TranscriptScroll,
+    direction: i8,
+) {
+    let Some(current) = open_trace.as_ref().copied() else {
+        select_trace_turn(open_trace, view, scroll, direction);
+        return;
+    };
+    let start = view.starts.get(current).copied().unwrap_or(0);
+    let end = start.saturating_add(view.heights.get(current).copied().unwrap_or(0));
+    if direction < 0 && scroll.top > start {
+        scroll.scroll_up(view.viewport.max(1));
+        scroll.top = scroll.top.max(start);
+        return;
+    }
+    if direction > 0 && scroll.top.saturating_add(view.viewport) < end {
+        scroll.top = scroll
+            .top
+            .saturating_add(view.viewport.max(1))
+            .min(end.saturating_sub(view.viewport));
+        scroll.follow = false;
+        return;
+    }
+    select_trace_turn(open_trace, view, scroll, direction);
 }
 
 // ---- session persistence --------------------------------------------------
@@ -550,6 +959,51 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+fn remaining_duration(deadline_secs: u64) -> String {
+    let remaining = deadline_secs.saturating_sub(unix_now_secs());
+    if remaining == 0 {
+        "due".into()
+    } else {
+        format_duration(Duration::from_secs(remaining))
+    }
+}
+
+fn agent_lifetime(info: &AgentInfo) -> (String, String) {
+    let retention = if info.retained {
+        "retained"
+    } else {
+        "unretained"
+    };
+    let lifetime = format!("{} · {retention}", info.lifetime_class);
+    if info.state.is_terminal() && info.state != AgentState::Completed {
+        return (lifetime, "ended".into());
+    }
+    if let Some(deadline) = info.stage_until_secs {
+        return (
+            lifetime,
+            format!("kill in {}", remaining_duration(deadline)),
+        );
+    }
+    if let Some(deadline) = info.lease_until_secs {
+        return (lifetime, format!("lease {}", remaining_duration(deadline)));
+    }
+    let remaining = match info.lifetime_class {
+        LifetimeClass::Short => info
+            .turn_budget
+            .map(|budget| {
+                let remaining = budget.saturating_sub(info.turns_used);
+                format!(
+                    "{remaining} assignment{}",
+                    if remaining == 1 { "" } else { "s" }
+                )
+            })
+            .unwrap_or_else(|| "idle cleanup".into()),
+        LifetimeClass::Long => "daemon stop".into(),
+        LifetimeClass::Persistent => "manual release".into(),
+    };
+    (lifetime, remaining)
+}
+
 fn timestamp_label(timestamp: u64) -> String {
     let seconds = if timestamp < 10_000_000_000 {
         timestamp
@@ -588,6 +1042,11 @@ fn worker_objective(text: &str) -> &str {
         .unwrap_or(text)
 }
 
+fn agent_count(count: usize) -> String {
+    format!("{count} agent{}", if count == 1 { "" } else { "s" })
+}
+
+#[allow(dead_code)]
 fn worker_progress_badge(thread: &Thread, turn: Option<&str>) -> Option<String> {
     let turn = turn?;
     let spawned = thread
@@ -604,11 +1063,11 @@ fn worker_progress_badge(thread: &Thread, turn: Option<&str>) -> Option<String> 
         .filter(|item| item.kind == ItemKind::SpawnResult && item.turn.as_deref() == Some(turn))
         .count();
     Some(if completed == 0 {
-        format!("󰚩 {spawned} agents running")
+        format!("󰚩 {} running", agent_count(spawned))
     } else if completed == spawned {
-        format!("󰄬 {completed} agents complete")
+        format!("󰄬 {} complete", agent_count(completed))
     } else {
-        format!("󰚩 {spawned} agents · 󰄬 {completed} complete")
+        format!("󰚩 {} · 󰄬 {completed} complete", agent_count(spawned))
     })
 }
 
@@ -628,6 +1087,11 @@ fn trace_summary(text: &str) -> String {
         let Some((stage, elapsed)) = timing.rsplit_once(' ') else {
             return format!("󰐊 {timing}");
         };
+        let elapsed = elapsed
+            .strip_suffix("ms")
+            .and_then(|millis| millis.parse::<u64>().ok())
+            .map(human_millis)
+            .unwrap_or_else(|| elapsed.to_string());
         let label = stage.replace('_', " ");
         if stage.ends_with("_started") {
             return format!("󰐊 {} · +{elapsed}", label.trim_end_matches(" started"));
@@ -659,6 +1123,14 @@ fn trace_summary(text: &str) -> String {
         };
     }
     text.to_string()
+}
+
+fn human_millis(millis: u64) -> String {
+    if millis < 1_000 {
+        format!("{millis}ms")
+    } else {
+        format!("{:.1}s", millis as f64 / 1_000.0)
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -758,39 +1230,47 @@ fn load_session() -> Vec<Thread> {
     };
     let threads: Vec<Thread> = list
         .into_iter()
-        .map(|t| Thread {
-            id: t.id,
-            parent: t.parent,
-            task: t.task,
-            is_foreground: t.is_foreground,
-            collapsed: !t.is_foreground,
-            streaming: false,
-            last_activity: Instant::now(),
-            revision: 0,
-            items: t
-                .items
-                .into_iter()
-                .map(|i| {
-                    let kind = kind_from_str(&i.kind);
-                    let hidden = i.hidden || kind == ItemKind::Tool || kind == ItemKind::ToolResult;
-                    let text = if kind == ItemKind::Reply {
-                        sanitize_reply_text(&i.text)
-                    } else {
-                        i.text
-                    };
-                    Item {
-                        kind,
-                        text,
-                        hidden,
-                        output: i.output,
-                        tool_id: i.tool_id,
-                        turn: i.turn,
-                        timestamp: i.timestamp,
-                    }
-                })
-                .collect(),
-            usage: HashMap::new(),
-            metrics: t.metrics,
+        .map(|t| {
+            let revision = t.items.len() as u64;
+            Thread {
+                id: t.id,
+                parent: t.parent,
+                task: t.task,
+                is_foreground: t.is_foreground,
+                collapsed: !t.is_foreground,
+                streaming: false,
+                last_activity: Instant::now(),
+                revision,
+                structure_revision: 1,
+                items: t
+                    .items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, i)| {
+                        let kind = kind_from_str(&i.kind);
+                        let hidden =
+                            i.hidden || kind == ItemKind::Tool || kind == ItemKind::ToolResult;
+                        let text = if kind == ItemKind::Reply {
+                            sanitize_reply_text(&i.text)
+                        } else {
+                            i.text
+                        };
+                        Item {
+                            kind,
+                            text,
+                            hidden,
+                            output: i.output,
+                            tool_id: i.tool_id,
+                            turn: i.turn,
+                            timestamp: i.timestamp,
+                            revision: index as u64 + 1,
+                        }
+                    })
+                    .collect(),
+                usage: HashMap::new(),
+                metrics: t.metrics,
+                metric_revisions: HashMap::new(),
+            }
         })
         .collect();
     if threads.is_empty() {
@@ -838,15 +1318,17 @@ pub fn run() -> io::Result<()> {
     let mut foreground_activity = "working".to_string();
 
     // Chat view state.
-    let mut chat_scroll: usize = 0;
-    let mut chat_follow: bool = true;
+    let mut transcript_scroll = TranscriptScroll::default();
+    let mut transcript_cache = TurnLayoutCache::default();
+    let mut transcript_view = TranscriptView::default();
+    let mut open_trace = None;
+    let mut turn_projection = TurnProjection::default();
 
     // Floating agent pane.
     let mut pane_open: bool = false;
     let mut pane_tab = PaneTab::Foreground;
     let mut commands_open: bool = false;
     let mut info_open: bool = false;
-    let mut show_traces: bool = false;
 
     // Pane focus: 0 is the daemon; agent threads start at 1. Default to the
     // Foreground so destructive controls never target the daemon by accident.
@@ -951,6 +1433,7 @@ pub fn run() -> io::Result<()> {
                     }
                     record_correlated_metrics(&mut threads, &envelope);
                     let actor = envelope.actor.clone();
+                    let envelope_turn = envelope.turn_id.clone();
                     let event = envelope.kind;
                     if agent_id == FOREGROUND_ID {
                         match &event {
@@ -977,7 +1460,7 @@ pub fn run() -> io::Result<()> {
                     }
                     let is_foreground = agent_id == FOREGROUND_ID;
                     let idx = find_or_create_thread(&mut threads, &agent_id, is_foreground, None);
-                    apply_actor_event(&mut threads[idx], event, &actor);
+                    apply_actor_event(&mut threads[idx], event, &actor, envelope_turn.as_deref());
                 }
                 TuiEvent::Line {
                     agent_id,
@@ -1025,10 +1508,6 @@ pub fn run() -> io::Result<()> {
             }
         }
 
-        if chat_follow {
-            chat_scroll = 0;
-        }
-
         // Periodic session save.
         if last_save.elapsed() > Duration::from_secs(5) {
             last_save = Instant::now();
@@ -1056,11 +1535,13 @@ pub fn run() -> io::Result<()> {
                     f,
                     chunks[0],
                     &threads,
-                    focus,
-                    chat_scroll,
-                    show_traces,
                     foreground_busy,
                     &foreground_activity,
+                    &mut transcript_scroll,
+                    &mut transcript_cache,
+                    &mut transcript_view,
+                    open_trace,
+                    &mut turn_projection,
                 );
                 if pane_open {
                     let popup =
@@ -1103,7 +1584,6 @@ pub fn run() -> io::Result<()> {
                     &agent_infos,
                     &threads,
                     &config,
-                    show_traces,
                     if daemon_changed { "fresh" } else { "active" },
                 );
 
@@ -1134,8 +1614,13 @@ pub fn run() -> io::Result<()> {
                     KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         clear_history(&mut threads);
                         focus = foreground_focus(&threads);
-                        chat_scroll = 0;
-                        chat_follow = true;
+                        reset_transcript(
+                            &mut transcript_scroll,
+                            &mut transcript_view,
+                            &mut transcript_cache,
+                            &mut open_trace,
+                            &mut turn_projection,
+                        );
                     }
                     KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         commands_open = !commands_open;
@@ -1152,7 +1637,11 @@ pub fn run() -> io::Result<()> {
                         }
                     }
                     KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        show_traces = !show_traces;
+                        if let Some(turn) =
+                            ctrl_o_target(&transcript_view, transcript_scroll.follow)
+                        {
+                            toggle_trace(&mut open_trace, turn);
+                        }
                     }
                     KeyCode::Esc if commands_open => commands_open = false,
                     KeyCode::Esc => break,
@@ -1163,31 +1652,51 @@ pub fn run() -> io::Result<()> {
                             info_open = false;
                         }
                     }
-                    KeyCode::Up | KeyCode::PageUp => {
+                    KeyCode::Up => {
                         if pane_open {
                             focus = focus.saturating_sub(1);
-                        } else {
-                            chat_follow = false;
-                            let step = if key.code == KeyCode::PageUp { 24 } else { 1 };
-                            chat_scroll = chat_scroll.saturating_add(step);
+                        } else if input.is_empty() {
+                            select_trace_turn(
+                                &mut open_trace,
+                                &transcript_view,
+                                &mut transcript_scroll,
+                                -1,
+                            );
                         }
                     }
-                    KeyCode::Down | KeyCode::PageDown => {
+                    KeyCode::PageUp if !pane_open => {
+                        page_trace_turn(
+                            &mut open_trace,
+                            &transcript_view,
+                            &mut transcript_scroll,
+                            -1,
+                        );
+                    }
+                    KeyCode::Down => {
                         if pane_open {
                             if focus + 1 <= threads.len() {
                                 focus += 1;
                             }
-                        } else {
-                            let step = if key.code == KeyCode::PageDown { 24 } else { 1 };
-                            chat_scroll = chat_scroll.saturating_sub(step);
-                            if chat_scroll == 0 {
-                                chat_follow = true;
-                            }
+                        } else if input.is_empty() {
+                            select_trace_turn(
+                                &mut open_trace,
+                                &transcript_view,
+                                &mut transcript_scroll,
+                                1,
+                            );
                         }
                     }
+                    KeyCode::PageDown if !pane_open => {
+                        page_trace_turn(
+                            &mut open_trace,
+                            &transcript_view,
+                            &mut transcript_scroll,
+                            1,
+                        );
+                    }
                     KeyCode::End => {
-                        chat_follow = true;
-                        chat_scroll = 0;
+                        open_trace = None;
+                        transcript_scroll.end();
                     }
                     // Ctrl+Backspace / Ctrl+H: delete the previous word.
                     KeyCode::Backspace | KeyCode::Delete | KeyCode::Char('h')
@@ -1251,8 +1760,13 @@ pub fn run() -> io::Result<()> {
                                 "clear" | "reset" => {
                                     clear_history(&mut threads);
                                     focus = foreground_focus(&threads);
-                                    chat_scroll = 0;
-                                    chat_follow = true;
+                                    reset_transcript(
+                                        &mut transcript_scroll,
+                                        &mut transcript_view,
+                                        &mut transcript_cache,
+                                        &mut open_trace,
+                                        &mut turn_projection,
+                                    );
                                 }
                                 _ => handle_slash(rest, &mut threads),
                             }
@@ -1264,6 +1778,8 @@ pub fn run() -> io::Result<()> {
                         let idx = find_or_create_thread(&mut threads, FOREGROUND_ID, true, None);
                         threads[idx].add(ItemKind::User, cmd.clone());
                         threads[idx].reserve_reply();
+                        open_trace = None;
+                        transcript_scroll.end();
                         input.clear();
                         input_cursor = 0;
                         foreground_busy = true;
@@ -1327,31 +1843,27 @@ pub fn run() -> io::Result<()> {
                     use crossterm::event::{MouseButton, MouseEventKind};
                     match m.kind {
                         MouseEventKind::ScrollUp => {
-                            chat_follow = false;
-                            chat_scroll = chat_scroll.saturating_add(8);
+                            transcript_scroll.scroll_up(8);
                         }
                         MouseEventKind::ScrollDown => {
-                            chat_scroll = chat_scroll.saturating_sub(8);
-                            if chat_scroll == 0 {
-                                chat_follow = true;
-                            }
+                            transcript_scroll.scroll_down(
+                                8,
+                                transcript_view.total_height,
+                                transcript_view.viewport,
+                            );
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
                             let size = terminal.size()?;
                             if m.row == size.height.saturating_sub(1) {
-                                let controls = if show_traces {
-                                    " 󰀄 AGENTS ·  HELP · 󰈈 COMPACT · 󰋼 INFO "
-                                } else {
-                                    " 󰀄 AGENTS ·  HELP · 󰈈 TRACES · 󰋼 INFO "
-                                };
+                                let controls = " 󰀄 AGENTS ·  HELP · 󰈈 INLINE TRACES · 󰋼 INFO ";
                                 let controls_start = 12u16;
                                 if m.column >= controls_start
                                     && m.column < controls_start + controls.chars().count() as u16
                                 {
                                     let relative = m.column - controls_start;
                                     let help_start = 12;
-                                    let trace_start = if show_traces { 21 } else { 21 };
-                                    let info_start = if show_traces { 34 } else { 32 };
+                                    let trace_start = 21;
+                                    let info_start = 41;
                                     if relative < help_start {
                                         pane_open = true;
                                         commands_open = false;
@@ -1361,7 +1873,12 @@ pub fn run() -> io::Result<()> {
                                         pane_open = false;
                                         info_open = false;
                                     } else if relative < info_start {
-                                        show_traces = !show_traces;
+                                        if let Some(turn) = ctrl_o_target(
+                                            &transcript_view,
+                                            transcript_scroll.follow,
+                                        ) {
+                                            toggle_trace(&mut open_trace, turn);
+                                        }
                                     } else {
                                         info_open = true;
                                         pane_open = false;
@@ -1422,12 +1939,16 @@ pub fn run() -> io::Result<()> {
                                     continue;
                                 }
                             }
-                            let (vy, vh, top) = *VIEW.lock().unwrap();
+                            let (vy, vh) = *VIEW.lock().unwrap();
                             // Only map clicks inside the conversation area.
                             if m.row >= vy && m.row < vy + vh {
-                                let row = top + (m.row - vy) as usize;
+                                let row = (m.row - vy) as usize;
                                 let hit = HITS.lock().unwrap().get(row).cloned().flatten();
-                                if let Some((ti, ii)) = hit {
+                                if let Some(ClickTarget::TraceSummary(turn)) = hit {
+                                    toggle_trace(&mut open_trace, turn);
+                                    continue;
+                                }
+                                if let Some(ClickTarget::Item(ti, ii)) = hit {
                                     if let Some(thread) = threads.get_mut(ti) {
                                         if !thread.is_foreground && thread.collapsed {
                                             thread.collapsed = false;
@@ -1435,10 +1956,12 @@ pub fn run() -> io::Result<()> {
                                             continue;
                                         }
                                         thread.collapsed = false;
+                                        thread.touch();
+                                        let revision = thread.revision;
                                         if let Some(item) = thread.items.get_mut(ii) {
                                             item.hidden = !item.hidden;
+                                            item.revision = revision;
                                         }
-                                        thread.touch();
                                     }
                                 }
                             }
@@ -1465,6 +1988,7 @@ pub fn run() -> io::Result<()> {
 fn record_correlated_metrics(threads: &mut Vec<Thread>, envelope: &EventEnvelope) {
     let root = find_or_create_thread(threads, FOREGROUND_ID, true, None);
     threads[root].touch();
+    let revision = threads[root].revision;
     match (&envelope.actor, &envelope.kind) {
         (
             Actor::Foreground,
@@ -1480,6 +2004,9 @@ fn record_correlated_metrics(threads: &mut Vec<Thread>, envelope: &EventEnvelope
                 "completed" => metrics.completed_ms = Some(*elapsed_ms),
                 _ => {}
             }
+            threads[root]
+                .metric_revisions
+                .insert(turn.to_string(), revision);
         }
         (
             Actor::Foreground,
@@ -1499,6 +2026,9 @@ fn record_correlated_metrics(threads: &mut Vec<Thread>, envelope: &EventEnvelope
                 *completion_tokens,
                 *total_tokens,
             ));
+            threads[root]
+                .metric_revisions
+                .insert(turn.to_string(), revision);
         }
         (
             Actor::Worker { id },
@@ -1525,6 +2055,9 @@ fn record_correlated_metrics(threads: &mut Vec<Thread>, envelope: &EventEnvelope
                     assignment,
                     token_totals(*prompt_tokens, *completion_tokens, *total_tokens),
                 );
+            threads[root]
+                .metric_revisions
+                .insert(turn.clone(), revision);
         }
         _ => {}
     }
@@ -1566,9 +2099,11 @@ fn find_or_create_thread(
         streaming: false,
         last_activity: Instant::now(),
         revision: 0,
+        structure_revision: 0,
         items: Vec::new(),
         usage: HashMap::new(),
         metrics: HashMap::new(),
+        metric_revisions: HashMap::new(),
     });
     threads.len() - 1
 }
@@ -1669,12 +2204,16 @@ fn accept_user_turn(thread: &mut Thread, text: &str, turn: Option<String>) {
     if let Some(index) = thread.items.iter().rposition(|item| {
         item.kind == ItemKind::User && item.turn.is_none() && item.text.trim() == text.trim()
     }) {
+        thread.touch_structure();
         thread.items[index].turn = turn.clone();
-        if let Some(pending) = thread.items[index + 1..]
+        thread.items[index].revision = thread.revision;
+        if let Some(pending_index) = thread.items[index + 1..]
             .iter_mut()
-            .find(|item| item.kind == ItemKind::PendingReply && item.turn.is_none())
+            .position(|item| item.kind == ItemKind::PendingReply && item.turn.is_none())
         {
+            let pending = &mut thread.items[index + 1 + pending_index];
             pending.turn = turn;
+            pending.revision = thread.revision;
         }
     }
 }
@@ -1689,14 +2228,18 @@ fn apply_interaction_event(thread: &mut Thread, envelope: InteractionEventEnvelo
         InteractionEvent::ConversationFinished { text } => thread.finish_reply(text, turn),
         InteractionEvent::ConversationIntentProduced { .. } => thread.touch(),
         InteractionEvent::ForegroundRequestTimedOut { deadline_ms } => {
-            if let Some(pending) = thread
+            if let Some(index) = thread
                 .items
-                .iter_mut()
+                .iter()
                 .rev()
-                .find(|item| item.kind == ItemKind::PendingReply && item.turn == turn)
+                .position(|item| item.kind == ItemKind::PendingReply && item.turn == turn)
             {
+                let index = thread.items.len() - 1 - index;
+                thread.touch();
+                let pending = &mut thread.items[index];
                 pending.kind = ItemKind::Error;
                 pending.text = format!("request timed out after {deadline_ms}ms");
+                pending.revision = thread.revision;
             } else {
                 thread.add_turn(
                     ItemKind::Error,
@@ -1705,7 +2248,6 @@ fn apply_interaction_event(thread: &mut Thread, envelope: InteractionEventEnvelo
                 );
             }
             thread.streaming = false;
-            thread.touch();
         }
         InteractionEvent::UserVisibleNotificationPublished { text } => {
             thread.add_turn(ItemKind::System, text, turn)
@@ -1713,25 +2255,41 @@ fn apply_interaction_event(thread: &mut Thread, envelope: InteractionEventEnvelo
     }
 }
 
+#[cfg(test)]
 fn apply_agent_event(thread: &mut Thread, event: AgentEvent) {
+    apply_correlated_agent_event(thread, event, None);
+}
+
+fn projected_turn(turn: Option<u64>, envelope_turn: Option<&str>) -> Option<String> {
+    turn.map(|turn| turn.to_string())
+        .or_else(|| envelope_turn.map(str::to_owned))
+}
+
+fn apply_correlated_agent_event(
+    thread: &mut Thread,
+    event: AgentEvent,
+    envelope_turn: Option<&str>,
+) {
     match event {
         AgentEvent::Status {
             turn,
             phase,
             message,
-        } => thread.add_turn(
-            ItemKind::System,
-            format!("[{phase}] {message}"),
-            turn.map(|t| t.to_string()),
-        ),
+        } => {
+            let turn = projected_turn(turn, envelope_turn);
+            if matches!(phase.as_str(), "queued" | "working") {
+                thread.update_pending_reply_status(turn.clone(), &phase, &message);
+            }
+            thread.add_turn(ItemKind::System, format!("[{phase}] {message}"), turn);
+        }
         AgentEvent::ReplyDelta { turn, text } => {
-            thread.add_reply_fragment(text, turn.map(|t| t.to_string()), false);
+            thread.add_reply_fragment(text, projected_turn(turn, envelope_turn), false);
         }
         AgentEvent::Reply {
             turn,
             text,
             final_reply: _,
-        } => thread.finish_reply(text, turn.map(|t| t.to_string())),
+        } => thread.finish_reply(text, projected_turn(turn, envelope_turn)),
         AgentEvent::Timing {
             turn,
             stage,
@@ -1748,7 +2306,7 @@ fn apply_agent_event(thread: &mut Thread, event: AgentEvent) {
         } => thread.add_turn(
             ItemKind::Spawn,
             format!("worker {worker_id}: {objective}"),
-            turn.map(|turn| turn.to_string()),
+            projected_turn(turn, envelope_turn),
         ),
         AgentEvent::Usage {
             turn: Some(turn),
@@ -1767,12 +2325,14 @@ fn apply_agent_event(thread: &mut Thread, event: AgentEvent) {
             result,
             ..
         } => {
-            let turn = thread
-                .items
-                .iter()
-                .rev()
-                .find(|item| item.kind == ItemKind::Spawn && item.text.contains(&worker_id))
-                .and_then(|item| item.turn.clone());
+            let turn = envelope_turn.map(str::to_owned).or_else(|| {
+                thread
+                    .items
+                    .iter()
+                    .rev()
+                    .find(|item| item.kind == ItemKind::Spawn && item.text.contains(&worker_id))
+                    .and_then(|item| item.turn.clone())
+            });
             thread.add_turn(
                 ItemKind::SpawnResult,
                 format!("worker {worker_id}: {objective}\n{result}"),
@@ -1780,6 +2340,14 @@ fn apply_agent_event(thread: &mut Thread, event: AgentEvent) {
             );
         }
         AgentEvent::WorkCandidate { .. } => {}
+        AgentEvent::ArtifactRegistered { artifact } => thread.add_turn(
+            ItemKind::System,
+            format!(
+                "artifact {} ({} bytes, {}): {}",
+                artifact.path, artifact.size_bytes, artifact.kind, artifact.description
+            ),
+            None,
+        ),
         AgentEvent::WorkProgress { event } => thread.add_turn(
             ItemKind::System,
             format!("work {}: {:?}", event.work_id, event.kind),
@@ -1798,7 +2366,7 @@ fn apply_agent_event(thread: &mut Thread, event: AgentEvent) {
             thread.add_turn(
                 kind,
                 format!("work {}: {}\n{text}", result.work_id, result.objective),
-                None,
+                envelope_turn.map(str::to_owned),
             );
         }
         AgentEvent::WorkerReleaseRequested { reason } => thread.add_turn(
@@ -1812,19 +2380,28 @@ fn apply_agent_event(thread: &mut Thread, event: AgentEvent) {
             name,
             arguments,
         } => {
-            let turn = turn.map(|t| t.to_string());
+            let turn = projected_turn(turn, envelope_turn);
             thread.add_tool(format!("{name} {arguments}"), id, turn);
         }
         AgentEvent::ToolFinished { turn, id, output } => {
-            thread.add_tool_result(id, output, turn.map(|t| t.to_string()));
+            thread.add_tool_result(id, output, projected_turn(turn, envelope_turn));
         }
         AgentEvent::Error { turn, message } => {
-            thread.add_turn(ItemKind::Error, message, turn.map(|t| t.to_string()));
+            thread.add_turn(
+                ItemKind::Error,
+                message,
+                projected_turn(turn, envelope_turn),
+            );
         }
     }
 }
 
-fn apply_actor_event(thread: &mut Thread, mut event: AgentEvent, actor: &Actor) {
+fn apply_actor_event(
+    thread: &mut Thread,
+    mut event: AgentEvent,
+    actor: &Actor,
+    envelope_turn: Option<&str>,
+) {
     if matches!(actor, Actor::Background) {
         match &mut event {
             AgentEvent::Reply { text, .. } => *text = format!("[Background] {text}"),
@@ -1833,7 +2410,7 @@ fn apply_actor_event(thread: &mut Thread, mut event: AgentEvent, actor: &Actor) 
             _ => {}
         }
     }
-    apply_agent_event(thread, event);
+    apply_correlated_agent_event(thread, event, envelope_turn);
 }
 
 fn handle_slash(cmd: &str, threads: &mut Vec<Thread>) {
@@ -2055,6 +2632,20 @@ fn clear_history(threads: &mut Vec<Thread>) {
     save_session(threads);
 }
 
+fn reset_transcript(
+    scroll: &mut TranscriptScroll,
+    view: &mut TranscriptView,
+    cache: &mut TurnLayoutCache,
+    open_trace: &mut Option<usize>,
+    projection: &mut TurnProjection,
+) {
+    *scroll = TranscriptScroll::default();
+    *view = TranscriptView::default();
+    cache.reset();
+    *open_trace = None;
+    projection.reset();
+}
+
 fn foreground_focus(threads: &[Thread]) -> usize {
     threads
         .iter()
@@ -2168,9 +2759,12 @@ fn draw_command_palette(f: &mut Frame, area: Rect) {
         Line::from(""),
         help_key("Ctrl+P", "toggle help"),
         help_key("Tab", "agents pane"),
-        help_key("Ctrl+O", "show/hide traces"),
+        help_key("Ctrl+O", "toggle inline traces for the current turn"),
         help_key("Ctrl+Shift+C", "copy last reply"),
         help_key("Shift+Enter", "insert newline"),
+        help_key("Up / Down", "select a turn and expand its traces"),
+        help_key("PageUp / PageDown", "page through selected traces"),
+        help_key("End", "return to latest turn"),
         help_key("Ctrl+L", "clear chat history"),
         help_key("Ctrl+C / Esc", "quit"),
         help_divider(popup.width.saturating_sub(2) as usize),
@@ -2354,16 +2948,767 @@ fn draw_info_panel(
     f.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
+fn main_conversation_layout(
+    thread: &Thread,
+    cell: &TurnCell,
+    width: u16,
+    latest_timestamp: u64,
+    active: bool,
+    activity: &str,
+) -> CellLayout {
+    let prompt = &thread.items[cell.prompt];
+    let mut lines = Vec::new();
+    let mut hits = Vec::new();
+    let mut push = |line: Line<'static>, target: Hit| {
+        lines.push(line);
+        hits.push(target);
+    };
+    let badges = turn_cell_badges(thread, cell);
+    let response = turn_response(thread, cell);
+    let turn_suffix = prompt
+        .turn
+        .as_deref()
+        .map(|turn| format!("  󰐖 {turn}"))
+        .unwrap_or_default();
+    let trailing = format!("{turn_suffix}  [{}]", timestamp_label(prompt.timestamp));
+    let label = format!(" {} ", names().user);
+    let mut header = vec![Span::styled(
+        label,
+        Style::default()
+            .fg(Color::Black)
+            .bg(name_block_background(Color::Gray))
+            .add_modifier(Modifier::BOLD),
+    )];
+    let padding = (width as usize)
+        .saturating_sub(Line::from(header.clone()).width() + Line::raw(&trailing).width())
+        .max(1);
+    header.push(Span::raw(" ".repeat(padding)));
+    header.push(Span::styled(trailing, Style::default().fg(Color::Gray)));
+    push(Line::from(header), None);
+    push(Line::raw(""), None);
+    let body_width = width.saturating_sub(4).min(92) as usize;
+    let prompt_color = if prompt.timestamp == latest_timestamp {
+        Color::White
+    } else {
+        Color::Gray
+    };
+    for source in prompt.text.lines() {
+        for line in wrap_text(source.trim(), body_width) {
+            let mut row = vec![Span::raw("    ")];
+            row.extend(styled_markdown(&line, Style::default().fg(prompt_color)));
+            push(Line::from(row), None);
+        }
+    }
+    push(Line::raw(""), None);
+
+    if let Some(response) = response {
+        if response.kind == ItemKind::PendingReply {
+            push(
+                Line::from(Span::styled(
+                    format!(" {} ", names().conversation),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(name_block_background(Color::Green))
+                        .add_modifier(Modifier::BOLD),
+                )),
+                None,
+            );
+            push(Line::raw(""), None);
+            let pending = if active {
+                pending_reply_activity(activity, response.turn.is_some())
+            } else {
+                pending_reply_activity(&response.text, response.turn.is_some())
+            };
+            push(
+                Line::from(vec![
+                    Span::styled("    󰔟 ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        pending,
+                        Style::default()
+                            .fg(Color::Gray)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]),
+                None,
+            );
+            if let Some(progress) = turn_worker_progress(thread, cell) {
+                push(Line::raw(""), None);
+                push(
+                    Line::from(Span::styled(
+                        format!("    {progress}"),
+                        Style::default().fg(Color::Gray),
+                    )),
+                    None,
+                );
+            }
+        } else {
+            let response_turn_suffix = response
+                .turn
+                .as_deref()
+                .map(|turn| format!("  󰐖 {turn}"))
+                .unwrap_or_default();
+            let mut header = vec![Span::styled(
+                format!(" {} ", names().conversation),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(name_block_background(Color::Green))
+                    .add_modifier(Modifier::BOLD),
+            )];
+            let trailing = format!(
+                "{response_turn_suffix}  [{}]",
+                timestamp_label(response.timestamp)
+            );
+            let padding = (width as usize)
+                .saturating_sub(Line::from(header.clone()).width() + Line::raw(&trailing).width())
+                .max(1);
+            header.push(Span::raw(" ".repeat(padding)));
+            header.push(Span::styled(
+                trailing,
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            push(Line::from(header), None);
+            let metadata = if reply_completed_after_later_user(thread, response) {
+                let late = format!(
+                    "󰐖 turn {} · earlier request",
+                    response.turn.as_deref().unwrap_or("?")
+                );
+                if badges.is_empty() {
+                    late
+                } else {
+                    format!("{late} · {badges}")
+                }
+            } else {
+                badges.clone()
+            };
+            if !metadata.is_empty() {
+                push(Line::raw(""), None);
+                for line in wrap_text(&metadata, body_width) {
+                    push(
+                        Line::from(Span::styled(
+                            format!("    {line}"),
+                            Style::default().fg(Color::Gray),
+                        )),
+                        None,
+                    );
+                }
+            }
+            push(Line::raw(""), None);
+            let response_color = if response.timestamp == latest_timestamp {
+                Color::White
+            } else {
+                Color::Gray
+            };
+            for source in sanitize_reply_text(&response.text).lines() {
+                for line in wrap_text(source.trim(), body_width) {
+                    let mut row = vec![Span::raw("    ")];
+                    row.extend(styled_markdown(&line, Style::default().fg(response_color)));
+                    push(Line::from(row), None);
+                }
+            }
+        }
+    }
+    push(Line::raw(""), None);
+    CellLayout { lines, hits }
+}
+
+fn turn_cell_layout(
+    thread_index: usize,
+    turn_index: usize,
+    threads: &[Thread],
+    cell: &TurnCell,
+    width: u16,
+    latest_timestamp: u64,
+    active: bool,
+    activity: &str,
+    open: bool,
+) -> CellLayout {
+    let thread = &threads[thread_index];
+    let mut layout =
+        main_conversation_layout(thread, cell, width, latest_timestamp, active, activity);
+    let mut diagnostic_items = cell
+        .items
+        .iter()
+        .copied()
+        .filter(|index| {
+            !matches!(
+                thread.items[*index].kind,
+                ItemKind::User | ItemKind::PendingReply | ItemKind::Reply
+            )
+        })
+        .map(|index| (thread_index, index))
+        .collect::<Vec<_>>();
+    let turn = thread.items[cell.prompt].turn.as_deref();
+    if let Some(turn) = turn {
+        for (source_thread, worker) in threads
+            .iter()
+            .enumerate()
+            .filter(|(_, worker)| !worker.is_foreground)
+        {
+            diagnostic_items.extend(
+                worker
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| item.turn.as_deref() == Some(turn))
+                    .map(|(index, _)| (source_thread, index)),
+            );
+        }
+    }
+    diagnostic_items
+        .sort_by_key(|(source_thread, index)| threads[*source_thread].items[*index].timestamp);
+    let tools = diagnostic_items
+        .iter()
+        .filter(|(source_thread, index)| {
+            threads[*source_thread].items[*index].kind == ItemKind::Tool
+        })
+        .count();
+    if diagnostic_items.is_empty() {
+        return layout;
+    }
+    for hit in &mut layout.hits {
+        *hit = Some(ClickTarget::TraceSummary(turn_index));
+    }
+    if !open {
+        return layout;
+    }
+    let mut worker_traces = Vec::<WorkerTrace>::new();
+    let mut model_items = Vec::new();
+    let mut orchestration_items = Vec::new();
+    for &(source_thread, index) in &diagnostic_items {
+        let source = &threads[source_thread];
+        let item = &source.items[index];
+        if source_thread != thread_index {
+            let worker =
+                ensure_worker_trace(&mut worker_traces, &source.id, source.task.as_deref());
+            worker.items.push((source_thread, index));
+            continue;
+        }
+        match item.kind {
+            ItemKind::Spawn => {
+                if let Some((id, objective)) = worker_record(&item.text) {
+                    ensure_worker_trace(&mut worker_traces, id, objective);
+                } else {
+                    orchestration_items.push((source_thread, index));
+                }
+            }
+            ItemKind::SpawnResult => {
+                if let Some((id, objective)) = worker_record(&item.text) {
+                    let worker = ensure_worker_trace(&mut worker_traces, id, objective);
+                    worker.items.push((source_thread, index));
+                } else {
+                    orchestration_items.push((source_thread, index));
+                }
+            }
+            ItemKind::Error if worker_record(&item.text).is_some() => {
+                let (id, _) = worker_record(&item.text).expect("checked worker record");
+                let worker = ensure_worker_trace(&mut worker_traces, id, None);
+                worker.items.push((source_thread, index));
+            }
+            ItemKind::System
+                if item.text.starts_with("work ")
+                    || item.text.starts_with("worker release requested:") =>
+            {
+                orchestration_items.push((source_thread, index));
+            }
+            _ => model_items.push((source_thread, index)),
+        }
+    }
+    let workers = worker_traces.len();
+    let summary = trace_count_summary(diagnostic_items.len(), tools, workers);
+    layout.lines.push(Line::from(Span::styled(
+        summary,
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )));
+    layout
+        .hits
+        .push(Some(ClickTarget::TraceSummary(turn_index)));
+    if !model_items.is_empty() {
+        push_trace_heading(&mut layout, "Model", "  ");
+        let mut previous_status = None;
+        for (source_thread, index) in model_items {
+            let item = &threads[source_thread].items[index];
+            if item.kind == ItemKind::System {
+                let status = trace_summary(&item.text);
+                if previous_status.as_deref() == Some(status.as_str()) {
+                    continue;
+                }
+                previous_status = Some(status);
+            } else {
+                previous_status = None;
+            }
+            push_trace_item(&mut layout, threads, source_thread, index, width, "    ");
+        }
+    }
+    if !orchestration_items.is_empty() || !worker_traces.is_empty() {
+        push_trace_heading(&mut layout, "Agents/orchestration", "  ");
+        for (source_thread, index) in orchestration_items {
+            push_trace_item(&mut layout, threads, source_thread, index, width, "    ");
+        }
+        for worker in worker_traces {
+            let objective = worker.objective.as_deref().unwrap_or("Worker task");
+            layout.lines.push(Line::from(vec![
+                Span::styled("    󰚩 ", Style::default().fg(Color::Green)),
+                Span::styled(short_preview(objective), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!(" · {}", truncate_text(&worker.id, 8)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            layout.hits.push(None);
+            let (state, color) = worker_trace_state(&worker, threads);
+            layout.lines.push(Line::from(Span::styled(
+                format!("      {state}"),
+                Style::default().fg(color),
+            )));
+            layout.hits.push(None);
+            for (source_thread, index) in worker.items {
+                if matches!(
+                    threads[source_thread].items[index].kind,
+                    ItemKind::SpawnResult
+                ) {
+                    continue;
+                }
+                push_trace_item(&mut layout, threads, source_thread, index, width, "      ");
+            }
+        }
+    }
+    layout.lines.push(Line::raw(""));
+    layout.hits.push(None);
+    layout
+}
+
+struct WorkerTrace {
+    id: String,
+    objective: Option<String>,
+    items: Vec<(usize, usize)>,
+}
+
+fn worker_record(text: &str) -> Option<(&str, Option<&str>)> {
+    if let Some(id) = text.strip_prefix("spawned worker ") {
+        return Some((id.trim(), None));
+    }
+    let record = text
+        .strip_prefix("worker ")
+        .or_else(|| text.strip_prefix("work "))?;
+    let (id, detail) = record.split_once(": ").unwrap_or((record, ""));
+    let objective = detail
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    Some((id.trim(), objective))
+}
+
+fn worker_error_detail(text: &str) -> &str {
+    let Some(record) = text
+        .strip_prefix("worker ")
+        .or_else(|| text.strip_prefix("work "))
+    else {
+        return text;
+    };
+    let detail = record
+        .split_once(": ")
+        .map(|(_, detail)| detail)
+        .unwrap_or(record);
+    detail
+        .split_once('\n')
+        .map(|(_, error)| error)
+        .unwrap_or(detail)
+}
+
+fn ensure_worker_trace<'a>(
+    workers: &'a mut Vec<WorkerTrace>,
+    id: &str,
+    objective: Option<&str>,
+) -> &'a mut WorkerTrace {
+    if let Some(index) = workers.iter().position(|worker| worker.id == id) {
+        if workers[index].objective.is_none() {
+            workers[index].objective = objective.map(str::to_owned);
+        }
+        return &mut workers[index];
+    }
+    workers.push(WorkerTrace {
+        id: id.to_owned(),
+        objective: objective.map(str::to_owned),
+        items: Vec::new(),
+    });
+    workers.last_mut().expect("worker was just inserted")
+}
+
+fn trace_count_summary(events: usize, tools: usize, agents: usize) -> String {
+    let mut counts = vec![format!(
+        "{events} event{}",
+        if events == 1 { "" } else { "s" }
+    )];
+    if tools > 0 && tools != events {
+        counts.push(format!("{tools} tool{}", if tools == 1 { "" } else { "s" }));
+    }
+    if agents > 0 && agents != events {
+        counts.push(agent_count(agents));
+    }
+    format!("  trace · {}", counts.join(" · "))
+}
+
+fn push_trace_heading(layout: &mut CellLayout, label: &str, indent: &str) {
+    layout.lines.push(Line::from(Span::styled(
+        format!("{indent}{label}"),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    layout.hits.push(None);
+}
+
+fn worker_trace_state(worker: &WorkerTrace, threads: &[Thread]) -> (&'static str, Color) {
+    let errors = worker.items.iter().filter_map(|(thread, item)| {
+        let item = &threads[*thread].items[*item];
+        (item.kind == ItemKind::Error).then_some(item.text.to_ascii_lowercase())
+    });
+    for error in errors {
+        if error.contains("review") {
+            return ("review failed", Color::Red);
+        }
+        return ("failed", Color::Red);
+    }
+    if worker
+        .items
+        .iter()
+        .any(|(thread, item)| threads[*thread].items[*item].kind == ItemKind::SpawnResult)
+    {
+        ("complete", Color::Green)
+    } else {
+        ("running", Color::Yellow)
+    }
+}
+
+fn push_trace_item(
+    layout: &mut CellLayout,
+    threads: &[Thread],
+    source_thread: usize,
+    index: usize,
+    width: u16,
+    indent: &str,
+) {
+    let source = &threads[source_thread];
+    let item = &source.items[index];
+    let hit = Some(ClickTarget::Item(source_thread, index));
+    match item.kind {
+        ItemKind::Tool => {
+            let running = item.output.is_none();
+            let (tool_name, arguments) = tool_parts(&item.text);
+            let badge = if running {
+                format!(" {} running", spinner_glyph())
+            } else {
+                " ✓".to_string()
+            };
+            let badge_style =
+                Style::default().fg(if running { Color::Yellow } else { Color::Green });
+            layout.lines.push(Line::from(vec![
+                Span::styled(format!("{indent}󰆍 "), Style::default().fg(Color::Blue)),
+                Span::styled(
+                    format!("[{}] ", timestamp_label(item.timestamp)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(tool_name, Style::default().fg(Color::Green)),
+                Span::styled(badge, badge_style),
+                if item.hidden {
+                    Span::styled(
+                        format!(" · {} · click to expand", short_preview(&arguments)),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )
+                } else {
+                    Span::raw("")
+                },
+            ]));
+            layout.hits.push(hit);
+            if !item.hidden {
+                if let Some(target) = api_target(&arguments) {
+                    layout.lines.push(Line::from(Span::styled(
+                        format!("{indent}    request · {target}"),
+                        Style::default().fg(Color::Cyan),
+                    )));
+                    layout.hits.push(hit);
+                }
+                for line in wrap_text(&arguments, width.saturating_sub(8) as usize) {
+                    layout.lines.push(Line::from(Span::styled(
+                        format!("{indent}    {line}"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    layout.hits.push(hit);
+                }
+                if let Some(output) = &item.output {
+                    layout.lines.push(Line::from(Span::styled(
+                        format!("{indent}    output"),
+                        Style::default()
+                            .fg(Color::Rgb(255, 140, 0))
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    layout.hits.push(hit);
+                    for source in output.lines() {
+                        for line in wrap_text(source, width.saturating_sub(10) as usize) {
+                            layout.lines.push(Line::from(Span::styled(
+                                format!("{indent}      {line}"),
+                                Style::default()
+                                    .fg(Color::Rgb(220, 223, 228))
+                                    .bg(Color::Rgb(30, 32, 36)),
+                            )));
+                            layout.hits.push(hit);
+                        }
+                    }
+                }
+            }
+        }
+        ItemKind::ToolResult => {
+            let summary = short_preview(&item.text);
+            layout.lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{indent}  > "),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("output · {summary} · click to expand"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+            layout.hits.push(hit);
+            if !item.hidden {
+                for source in item.text.lines() {
+                    for line in wrap_text(source, width.saturating_sub(8) as usize) {
+                        layout.lines.push(Line::from(Span::styled(
+                            format!("{indent}  {line}"),
+                            Style::default()
+                                .fg(Color::Rgb(220, 223, 228))
+                                .bg(Color::Rgb(30, 32, 36)),
+                        )));
+                        layout.hits.push(hit);
+                    }
+                }
+            }
+        }
+        ItemKind::Spawn => {
+            layout.lines.push(Line::from(vec![
+                Span::styled(format!("{indent}󰚩 "), Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!(
+                        "[{}] {}",
+                        timestamp_label(item.timestamp),
+                        spawn_display_label(&names().conversation, &item.text)
+                    ),
+                    Style::default().fg(Color::Green),
+                ),
+            ]));
+            layout.hits.push(hit);
+        }
+        ItemKind::SpawnResult => {
+            layout.lines.push(Line::from(vec![
+                Span::styled(format!("{indent}󰄬 "), Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!(
+                        "[{}] task completed · {}",
+                        timestamp_label(item.timestamp),
+                        short_preview(worker_objective(&item.text))
+                    ),
+                    Style::default().fg(Color::Green),
+                ),
+            ]));
+            layout.hits.push(hit);
+        }
+        ItemKind::Error => {
+            let detail = worker_error_detail(&item.text);
+            for source in detail.lines() {
+                let mut row = vec![
+                    Span::styled(format!("{indent}󰅙 "), Style::default().fg(Color::Red)),
+                    Span::styled(
+                        format!("[{}] ", timestamp_label(item.timestamp)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ];
+                row.extend(styled_markdown(source, Style::default().fg(Color::Red)));
+                layout.lines.push(Line::from(row));
+                layout.hits.push(hit);
+            }
+        }
+        ItemKind::System => {
+            for source in item.text.lines() {
+                layout.lines.push(Line::from(vec![
+                    Span::styled(format!("{indent}· "), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("[{}] ", timestamp_label(item.timestamp)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(trace_summary(source), Style::default().fg(Color::DarkGray)),
+                ]));
+                layout.hits.push(hit);
+            }
+        }
+        ItemKind::Reply if !source.is_foreground => {
+            for line in item.text.lines() {
+                for line in wrap_text(line, width.saturating_sub(8) as usize) {
+                    layout.lines.push(Line::from(Span::styled(
+                        format!("{indent}  {line}"),
+                        Style::default().fg(Color::Gray),
+                    )));
+                    layout.hits.push(hit);
+                }
+            }
+        }
+        ItemKind::User | ItemKind::PendingReply | ItemKind::Reply => {}
+    }
+}
+
 fn draw_conversation(
+    f: &mut Frame,
+    area: Rect,
+    threads: &[Thread],
+    foreground_busy: bool,
+    foreground_activity: &str,
+    scroll: &mut TranscriptScroll,
+    cache: &mut TurnLayoutCache,
+    view: &mut TranscriptView,
+    open_trace: Option<usize>,
+    projection: &mut TurnProjection,
+) {
+    let Some((thread_index, thread)) = foreground_thread(threads) else {
+        return;
+    };
+    projection.update(thread);
+    let cells = &projection.cells;
+    cache.prepare(area.width, cells, thread.structure_revision);
+    if cells.is_empty() || area.height == 0 {
+        if let Ok(mut guard) = HITS.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = VIEW.lock() {
+            *guard = (area.y, area.height);
+        }
+        *view = TranscriptView {
+            viewport: area.height as usize,
+            ..TranscriptView::default()
+        };
+        return;
+    }
+    let latest = cells.len() - 1;
+    let latest_timestamp = latest_conversation_timestamp(thread, &cells[latest]);
+    let worker_revisions = worker_turn_revisions(threads);
+    let mut heights = Vec::with_capacity(cells.len());
+    let mut starts = Vec::with_capacity(cells.len());
+    let mut total_height = 0usize;
+    for (index, cell) in cells.iter().enumerate() {
+        starts.push(total_height);
+        let open = open_trace == Some(index);
+        let is_latest = index == latest;
+        let mut revision = cell_revision(thread, cell);
+        if open {
+            revision.worker = thread.items[cell.prompt]
+                .turn
+                .as_deref()
+                .and_then(|turn| worker_revisions.get(turn))
+                .copied()
+                .unwrap_or(0);
+        }
+        let variant = u8::from(is_latest) | (u8::from(open) << 1);
+        let height = cache
+            .layout(cell_key(cell), revision, variant, || {
+                turn_cell_layout(
+                    thread_index,
+                    index,
+                    threads,
+                    cell,
+                    area.width,
+                    latest_timestamp,
+                    is_latest && foreground_busy,
+                    foreground_activity,
+                    open,
+                )
+            })
+            .lines
+            .len();
+        heights.push(height);
+        total_height = total_height.saturating_add(height);
+    }
+    scroll.sync(total_height, area.height as usize, thread.revision);
+    let show_activity = should_show_activity(scroll, total_height, area.height as usize);
+    let viewport = transcript_content_height(area.height, show_activity);
+    scroll.sync(total_height, viewport, thread.revision);
+    let top = scroll.top;
+    let bottom = top.saturating_add(viewport);
+    let mut visible_lines = Vec::new();
+    let mut visible_hits = Vec::new();
+    let mut anchor_turn = None;
+    for (index, cell) in cells.iter().enumerate() {
+        let start = starts[index];
+        let end = start.saturating_add(heights[index]);
+        if end > top && start < bottom {
+            anchor_turn.get_or_insert(index);
+            let open = open_trace == Some(index);
+            let is_latest = index == latest;
+            let mut revision = cell_revision(thread, cell);
+            if open {
+                revision.worker = thread.items[cell.prompt]
+                    .turn
+                    .as_deref()
+                    .and_then(|turn| worker_revisions.get(turn))
+                    .copied()
+                    .unwrap_or(0);
+            }
+            let variant = u8::from(is_latest) | (u8::from(open) << 1);
+            let layout = cache.layout(cell_key(cell), revision, variant, || {
+                unreachable!("height pass populated turn layout")
+            });
+            let skip = top.saturating_sub(start);
+            let take = bottom.min(end).saturating_sub(start + skip);
+            visible_lines.extend(layout.lines.iter().skip(skip).take(take).cloned());
+            visible_hits.extend(layout.hits.iter().skip(skip).take(take).cloned());
+        }
+        if end >= bottom {
+            break;
+        }
+    }
+    if show_activity {
+        visible_lines.push(Line::from(Span::styled(
+            "  new activity below",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+        visible_hits.push(None);
+    }
+    if let Ok(mut guard) = HITS.lock() {
+        *guard = visible_hits;
+    }
+    if let Ok(mut guard) = VIEW.lock() {
+        *guard = (area.y, area.height);
+    }
+    f.render_widget(Paragraph::new(visible_lines), area);
+    *view = TranscriptView {
+        total_height,
+        viewport,
+        turns: cells.len(),
+        anchor_turn,
+        starts,
+        heights,
+    };
+}
+
+#[cfg(any())]
+fn draw_trace_conversation_legacy(
     f: &mut Frame,
     area: Rect,
     threads: &[Thread],
     focus: usize,
     scroll: usize,
-    show_traces: bool,
     foreground_busy: bool,
-    _foreground_activity: &str,
+    foreground_activity: &str,
 ) {
+    let show_traces = true;
     // ChatGPT-style: `● sender` labels; tool exec lines carry a live badge
     // (spinner while running, ✓ when done) and their output nests beneath as a
     // collapsible code block. Rows tracked in HITS for click-to-toggle.
@@ -2378,7 +3723,13 @@ fn draw_conversation(
         }};
     }
 
-    let signature = conversation_signature(threads, area.width, show_traces, foreground_busy);
+    let signature = conversation_signature(
+        threads,
+        area.width,
+        show_traces,
+        foreground_busy,
+        foreground_activity,
+    );
     let cached = CONVERSATION_CACHE.lock().ok().and_then(|cache| {
         cache.as_ref().and_then(|cache| {
             (cache.signature == signature).then(|| {
@@ -2619,11 +3970,7 @@ fn draw_conversation(
                                 Style::default().fg(Color::Yellow),
                             ),
                             Span::styled(
-                                if item.turn.is_some() {
-                                    "Checking information...".to_string()
-                                } else {
-                                    "Submitting...".to_string()
-                                },
+                                pending_reply_activity(&item.text, item.turn.is_some()),
                                 Style::default()
                                     .fg(Color::Gray)
                                     .add_modifier(Modifier::ITALIC),
@@ -3088,7 +4435,13 @@ fn draw_conversation(
         }
     }
 
-    let signature = conversation_signature(threads, area.width, show_traces, foreground_busy);
+    let signature = conversation_signature(
+        threads,
+        area.width,
+        show_traces,
+        foreground_busy,
+        foreground_activity,
+    );
     if let Ok(mut cache) = CONVERSATION_CACHE.lock() {
         *cache = Some(ConversationCache {
             signature,
@@ -3099,6 +4452,7 @@ fn draw_conversation(
     render_conversation_lines(f, area, lines, hits, scroll);
 }
 
+#[cfg(any())]
 fn render_conversation_lines(
     f: &mut Frame,
     area: Rect,
@@ -3121,6 +4475,7 @@ fn render_conversation_lines(
     draw_scroll_indicator(f, area, scroll);
 }
 
+#[cfg(any())]
 fn render_conversation_view(
     f: &mut Frame,
     area: Rect,
@@ -3139,6 +4494,7 @@ fn render_conversation_view(
     draw_scroll_indicator(f, area, scroll);
 }
 
+#[cfg(any())]
 fn draw_scroll_indicator(f: &mut Frame, area: Rect, scroll: usize) {
     if scroll > 0 && area.width > 0 {
         let indicator = format!("↑ {scroll} lines");
@@ -3159,6 +4515,7 @@ fn draw_scroll_indicator(f: &mut Frame, area: Rect, scroll: usize) {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq)]
 enum ActivityState {
     Ready,
@@ -3170,6 +4527,7 @@ enum ActivityState {
     Error,
 }
 
+#[allow(dead_code)]
 fn thread_state(thread: &Thread) -> ActivityState {
     if thread
         .items
@@ -3266,6 +4624,7 @@ fn animated_state_indicator(state: ActivityState) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn wave_label_spans(label: &str, block_color: Color) -> Vec<Span<'static>> {
     label
         .chars()
@@ -3343,10 +4702,95 @@ fn lifecycle_badge(state: AgentState) -> String {
         AgentState::Failed => "× failed".into(),
         AgentState::Interrupted => "× stopped".into(),
         AgentState::Terminated => "× killed".into(),
-        AgentState::Released => "× released".into(),
+        AgentState::Released => "✓ released".into(),
     }
 }
 
+fn pending_reply_activity(activity: &str, accepted: bool) -> String {
+    let activity = activity.trim();
+    if activity.is_empty() {
+        return if accepted {
+            "Checking information...".into()
+        } else {
+            "Submitting...".into()
+        };
+    }
+    if activity.ends_with(['.', '!', '?']) {
+        activity.to_string()
+    } else {
+        format!("{activity}...")
+    }
+}
+
+fn turn_cell_badges(thread: &Thread, cell: &TurnCell) -> String {
+    let mut spawned = 0;
+    let mut completed = 0;
+    let mut failed = 0;
+    for item in cell.items.iter().map(|index| &thread.items[*index]) {
+        match item.kind {
+            ItemKind::Spawn => spawned += 1,
+            ItemKind::SpawnResult => completed += 1,
+            ItemKind::Error if item.text.starts_with("work ") => failed += 1,
+            _ => {}
+        }
+    }
+    let mut badges = Vec::new();
+    if spawned > 0 {
+        badges.push(format!("󰚩 {}", agent_count(spawned)));
+    }
+    if completed > 0 {
+        badges.push(if spawned == 0 {
+            format!("󰄬 {} complete", agent_count(completed))
+        } else {
+            format!("󰄬 {completed} complete")
+        });
+    }
+    if failed > 0 {
+        badges.push(format!("× {failed} failed"));
+    }
+    let metrics = thread.items[cell.prompt]
+        .turn
+        .as_deref()
+        .and_then(|turn| thread.metrics.get(turn));
+    if let Some(done) = metrics.and_then(|metrics| metrics.completed_ms) {
+        badges.push(format!("󰅐 done {:.1}s", done as f64 / 1000.0));
+    }
+    if let Some(metrics) = metrics {
+        if let Some(self_usage) = &metrics.self_usage {
+            let total = metrics
+                .worker_usage
+                .values()
+                .fold(self_usage.total, |sum, usage| {
+                    sum.saturating_add(usage.total)
+                });
+            badges.push(format!("󰏪 total {}", format_count(total)));
+        }
+    }
+    badges.join(" · ")
+}
+
+fn turn_worker_progress(thread: &Thread, cell: &TurnCell) -> Option<String> {
+    let mut spawned = 0;
+    let mut completed = 0;
+    for item in cell.items.iter().map(|index| &thread.items[*index]) {
+        match item.kind {
+            ItemKind::Spawn => spawned += 1,
+            ItemKind::SpawnResult => completed += 1,
+            _ => {}
+        }
+    }
+    (spawned > 0).then(|| {
+        if completed == 0 {
+            format!("󰚩 {} running", agent_count(spawned))
+        } else if completed == spawned {
+            format!("󰄬 {} complete", agent_count(completed))
+        } else {
+            format!("󰚩 {} · 󰄬 {completed} complete", agent_count(spawned))
+        }
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn turn_badges(thread: &Thread, turn: Option<&str>, timestamp: u64, show_traces: bool) -> String {
     let previous_reply = thread
         .items
@@ -3355,11 +4799,11 @@ fn turn_badges(thread: &Thread, turn: Option<&str>, timestamp: u64, show_traces:
         .map(|item| item.timestamp)
         .max()
         .unwrap_or(0);
-    let in_turn = |item: &&Item| {
-        item.turn.as_deref() == turn
-            || (item.turn.is_none()
-                && item.timestamp > previous_reply
-                && item.timestamp <= timestamp)
+    let in_turn = |item: &&Item| match turn {
+        Some(turn) => item.turn.as_deref() == Some(turn),
+        None => {
+            item.turn.is_none() && item.timestamp > previous_reply && item.timestamp <= timestamp
+        }
     };
     let spawned = thread
         .items
@@ -3370,6 +4814,13 @@ fn turn_badges(thread: &Thread, turn: Option<&str>, timestamp: u64, show_traces:
         .items
         .iter()
         .filter(|item| item.kind == ItemKind::SpawnResult && in_turn(item))
+        .count();
+    let failed = thread
+        .items
+        .iter()
+        .filter(|item| {
+            item.kind == ItemKind::Error && item.text.starts_with("work ") && in_turn(item)
+        })
         .count();
     let started_at = thread
         .items
@@ -3410,7 +4861,7 @@ fn turn_badges(thread: &Thread, turn: Option<&str>, timestamp: u64, show_traces:
         badges.push(if show_traces {
             format!("󰚩 workers started {spawned}")
         } else {
-            format!("󰚩 {spawned} agents")
+            format!("󰚩 {}", agent_count(spawned))
         });
     }
     let metrics = turn.and_then(|turn| thread.metrics.get(turn));
@@ -3420,9 +4871,16 @@ fn turn_badges(thread: &Thread, turn: Option<&str>, timestamp: u64, show_traces:
         badges.push(if show_traces {
             format!("󰄬 workers completed {completed}")
         } else if spawned == 0 {
-            format!("󰄬 {completed} agents complete")
+            format!("󰄬 {} complete", agent_count(completed))
         } else {
             format!("󰄬 {completed} complete")
+        });
+    }
+    if failed > 0 {
+        badges.push(if show_traces {
+            format!("× workers failed {failed}")
+        } else {
+            format!("× {failed} failed")
         });
     }
     if let Some(first) = first {
@@ -3692,6 +5150,43 @@ fn draw_input(
 
 /// Vim-style statusline below the input: a bold brand segment, a clear
 /// daemon-state segment, and key bindings on the right.
+fn worker_activity_counts(
+    agent_infos: &HashMap<String, AgentInfo>,
+) -> (usize, usize, usize, usize) {
+    let mut counts = (0, 0, 0, 0);
+    for agent in agent_infos
+        .values()
+        .filter(|agent| agent.id != FOREGROUND_ID)
+    {
+        match agent.state {
+            AgentState::Starting | AgentState::Running => counts.0 += 1,
+            AgentState::Waiting => counts.1 += 1,
+            AgentState::Failed => counts.2 += 1,
+            AgentState::Completed | AgentState::Terminated | AgentState::Released => counts.3 += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn worker_activity_summary(agent_infos: &HashMap<String, AgentInfo>) -> Option<String> {
+    let (running, waiting, failed, completed) = worker_activity_counts(agent_infos);
+    let mut parts = Vec::new();
+    if running > 0 {
+        parts.push(format!("{running} active"));
+    }
+    if waiting > 0 {
+        parts.push(format!("{waiting} idle"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    if completed > 0 {
+        parts.push(format!("{completed} done"));
+    }
+    (!parts.is_empty()).then(|| format!(" {} ", parts.join(" · ")))
+}
+
 fn draw_statusline(
     f: &mut Frame,
     area: Rect,
@@ -3699,7 +5194,6 @@ fn draw_statusline(
     agent_infos: &HashMap<String, AgentInfo>,
     threads: &[Thread],
     config: &tachyon_util::config::Config,
-    show_traces: bool,
     session_label: &str,
 ) {
     let (dtext, dbg) = match daemon {
@@ -3715,47 +5209,8 @@ fn draw_statusline(
             .add_modifier(Modifier::BOLD),
     );
     let state = Span::styled(dtext, Style::default().fg(dbg).add_modifier(Modifier::BOLD));
-    let running = agent_infos
-        .values()
-        .filter(|agent| matches!(agent.state, AgentState::Starting | AgentState::Running))
-        .count();
-    let waiting = agent_infos
-        .values()
-        .filter(|agent| agent.state == AgentState::Waiting)
-        .count();
-    let failed = agent_infos
-        .values()
-        .filter(|agent| agent.state == AgentState::Failed)
-        .count();
-    let completed = agent_infos
-        .values()
-        .filter(|agent| {
-            matches!(
-                agent.state,
-                AgentState::Completed | AgentState::Terminated | AgentState::Released
-            )
-        })
-        .count();
-    let mut activity_parts = Vec::new();
-    if running > 0 {
-        activity_parts.push(format!("{} active", running));
-    }
-    if waiting > 0 {
-        activity_parts.push(format!("{} queued", waiting));
-    }
-    if failed > 0 {
-        activity_parts.push(format!("{} failed", failed));
-    }
-    if completed > 0 {
-        activity_parts.push(format!("{} done", completed));
-    }
-    let activity =
-        (!activity_parts.is_empty()).then(|| format!(" {} ", activity_parts.join(" · ")));
-    let controls = if show_traces {
-        " 󰀄 AGENTS ·  HELP · 󰈈 COMPACT · 󰋼 INFO "
-    } else {
-        " 󰀄 AGENTS ·  HELP · 󰈈 TRACES · 󰋼 INFO "
-    };
+    let activity = worker_activity_summary(agent_infos);
+    let controls = " 󰀄 AGENTS ·  HELP · 󰈈 INLINE TRACES · 󰋼 INFO ";
     let session = (session_label == "fresh")
         .then(|| Span::styled(" FRESH ", Style::default().fg(Color::DarkGray)));
     let cwd = Span::styled(
@@ -3797,6 +5252,15 @@ fn draw_statusline(
     if let Some(activity_span) = activity_span {
         add_right(activity_span);
     }
+    add_right(Span::styled(
+        format!(
+            " v{} ",
+            daemon
+                .map(|info| info.version.as_str())
+                .unwrap_or(env!("CARGO_PKG_VERSION"))
+        ),
+        Style::default().fg(Color::DarkGray),
+    ));
     add_right(state);
     let gap = area.width.saturating_sub((left_width + right_width) as u16);
     let mut line = vec![
@@ -3862,15 +5326,16 @@ fn draw_agent_pane(
         },
     );
 
-    let header = Row::new(["NAME", "STATUS", "TYPE", "AGE", "TASK"]).style(
+    let header = Row::new(["NAME", "STATUS", "LIFETIME", "REMAINING", "AGE", "TASK"]).style(
         Style::default()
             .fg(Color::Gray)
             .add_modifier(Modifier::BOLD),
     );
     let widths = [
-        Constraint::Length(18),
-        Constraint::Length(16),
-        Constraint::Length(16),
+        Constraint::Length(17),
+        Constraint::Length(14),
+        Constraint::Length(19),
+        Constraint::Length(15),
         Constraint::Length(9),
         Constraint::Min(16),
     ];
@@ -3888,6 +5353,7 @@ fn draw_agent_pane(
                 Cell::from("tachyond"),
                 Cell::from(daemon_status),
                 Cell::from("daemon"),
+                Cell::from("manual stop"),
                 Cell::from(daemon_age),
                 Cell::from("daemon service"),
             ])
@@ -3902,6 +5368,7 @@ fn draw_agent_pane(
                         Cell::from(names().conversation.clone()),
                         Cell::from(state_label(agent_activity_state(info.state))),
                         Cell::from("conversational"),
+                        Cell::from("daemon stop"),
                         Cell::from(format_age(info.created_secs)),
                         Cell::from(truncate_text(&info.description, 48)),
                     ])
@@ -3912,19 +5379,41 @@ fn draw_agent_pane(
                     }),
                 );
             }
-            let active_workers = agent_infos.values().any(|info| {
-                info.id != FOREGROUND_ID
-                    && matches!(
-                        info.state,
-                        AgentState::Starting | AgentState::Running | AgentState::Waiting
+            let background = daemon.map(|info| &info.background);
+            let pending_reviews = background.map_or(0, |info| info.pending_reviews.len());
+            let coordinator_status = match background {
+                Some(info) if info.online && pending_reviews > 0 => {
+                    format!("reviewing ({pending_reviews})")
+                }
+                Some(info) if info.online => "idle".into(),
+                Some(_) => "restarting".into(),
+                None => "offline".into(),
+            };
+            let coordinator_remaining = background
+                .and_then(|info| {
+                    info.pending_reviews
+                        .iter()
+                        .map(|review| review.deadline_ms)
+                        .min()
+                })
+                .map(|deadline| {
+                    let remaining_ms = deadline.saturating_sub(now_seconds());
+                    format!(
+                        "review {}",
+                        format_duration(Duration::from_millis(remaining_ms))
                     )
-            });
+                })
+                .unwrap_or_else(|| "daemon stop".into());
             rows.push(Row::new(vec![
-                Cell::from("Background agent"),
-                Cell::from(if active_workers { "running" } else { "idle" }),
-                Cell::from("coordinator"),
+                Cell::from("Background Coord."),
+                Cell::from(coordinator_status),
+                Cell::from("daemon · supervised"),
+                Cell::from(coordinator_remaining),
                 Cell::from("-"),
-                Cell::from(format!("{worker_count} managed workers")),
+                Cell::from(format!(
+                    "semantic review · gen {} · {worker_count} workers",
+                    background.map_or(0, |info| info.generation)
+                )),
             ]));
             rows
         }
@@ -3933,6 +5422,7 @@ fn draw_agent_pane(
             if ids.is_empty() {
                 vec![Row::new(vec![
                     Cell::from("No managed agents"),
+                    Cell::from("-"),
                     Cell::from("-"),
                     Cell::from("-"),
                     Cell::from("-"),
@@ -3945,12 +5435,28 @@ fn draw_agent_pane(
                     .map(|(index, id)| {
                         let info = &agent_infos[id];
                         let selected = focus == index + 2;
+                        let reviewing = daemon.is_some_and(|daemon| {
+                            daemon
+                                .background
+                                .pending_reviews
+                                .iter()
+                                .any(|review| review.worker_id == info.id)
+                        });
+                        let (lifetime, remaining) = agent_lifetime(info);
                         Row::new(vec![
-                            Cell::from(truncate_text(&format!("ghost {id}"), 18)),
-                            Cell::from(state_label(agent_activity_state(info.state))),
-                            Cell::from(info.task_type.clone()),
+                            Cell::from(truncate_text(&format!("ghost {id}"), 17)),
+                            Cell::from(if reviewing {
+                                "reviewing"
+                            } else {
+                                state_label(agent_activity_state(info.state))
+                            }),
+                            Cell::from(lifetime),
+                            Cell::from(remaining),
                             Cell::from(format_age(info.created_secs)),
-                            Cell::from(truncate_text(&info.description, 48)),
+                            Cell::from(truncate_text(
+                                &format!("{} · {}", info.task_type, info.description),
+                                48,
+                            )),
                         ])
                         .style(if selected {
                             Style::default().bg(Color::Rgb(42, 42, 52))
@@ -4578,6 +6084,497 @@ mod tests {
     use super::*;
     use tachyon_api::types::Actor;
 
+    fn agent_info(lifetime_class: LifetimeClass) -> AgentInfo {
+        AgentInfo {
+            id: "worker".into(),
+            task: "inspect".into(),
+            state: AgentState::Running,
+            pid: None,
+            workspace: String::new(),
+            created_secs: 0,
+            retained: true,
+            lease_until_secs: None,
+            session_id: "worker".into(),
+            lifetime_class,
+            purpose: "research".into(),
+            owner: "daemon".into(),
+            last_activity_secs: 0,
+            checkpoint_available: false,
+            turns_used: 2,
+            turn_budget: Some(3),
+            task_type: "research".into(),
+            description: "inspect".into(),
+            persistent: lifetime_class == LifetimeClass::Persistent,
+            sandboxed: false,
+            stage_until_secs: None,
+            logical_task_id: None,
+            origin_turn_id: None,
+            parent_task_id: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn agent_lifetime_describes_budget_daemon_and_manual_policies() {
+        assert_eq!(
+            agent_lifetime(&agent_info(LifetimeClass::Short)),
+            ("short · retained".into(), "1 assignment".into())
+        );
+        assert_eq!(
+            agent_lifetime(&agent_info(LifetimeClass::Long)).1,
+            "daemon stop"
+        );
+        assert_eq!(
+            agent_lifetime(&agent_info(LifetimeClass::Persistent)).1,
+            "manual release"
+        );
+    }
+
+    #[test]
+    fn worker_footer_excludes_foreground_and_calls_waiting_idle() {
+        let mut foreground = agent_info(LifetimeClass::Long);
+        foreground.id = FOREGROUND_ID.into();
+        foreground.state = AgentState::Running;
+        let mut waiting = agent_info(LifetimeClass::Short);
+        waiting.id = "worker-idle".into();
+        waiting.state = AgentState::Waiting;
+        let infos = HashMap::from([
+            (foreground.id.clone(), foreground),
+            (waiting.id.clone(), waiting),
+        ]);
+
+        assert_eq!(worker_activity_summary(&infos).as_deref(), Some(" 1 idle "));
+    }
+
+    #[test]
+    fn agent_counts_use_singular_and_plural_labels() {
+        assert_eq!(agent_count(1), "1 agent");
+        assert_eq!(agent_count(3), "3 agents");
+    }
+
+    #[test]
+    fn released_lifecycle_uses_success_marker() {
+        assert_eq!(lifecycle_badge(AgentState::Released), "✓ released");
+    }
+
+    #[test]
+    fn pending_reply_uses_activity_with_safe_fallback() {
+        assert_eq!(
+            pending_reply_activity("using search", true),
+            "using search..."
+        );
+        assert_eq!(pending_reply_activity("", true), "Checking information...");
+        assert_eq!(pending_reply_activity("   ", false), "Submitting...");
+    }
+
+    #[test]
+    fn main_conversation_is_always_expanded_in_turn_cells() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "first question".into(), Some("2".into()));
+        thread.add_turn(ItemKind::Reply, "first answer".into(), Some("2".into()));
+        thread.add_turn(ItemKind::User, "second question".into(), Some("3".into()));
+        thread.add_turn(ItemKind::PendingReply, String::new(), Some("3".into()));
+        let cells = build_turn_cells(&thread);
+        let latest = latest_conversation_timestamp(&thread, &cells[1]);
+        for cell in &cells {
+            let layout = turn_cell_layout(
+                0,
+                0,
+                std::slice::from_ref(&thread),
+                cell,
+                80,
+                latest,
+                false,
+                "working",
+                false,
+            );
+            let text = layout
+                .lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(&names().user));
+            assert!(text.contains(&names().conversation));
+            assert!(!text.contains("> first question"));
+            assert!(!text.contains("trace ·"));
+        }
+    }
+
+    #[test]
+    fn page_navigation_scrolls_one_viewport_and_end_follows_latest() {
+        let mut scroll = TranscriptScroll::default();
+        scroll.sync(100, 20, 1);
+        assert_eq!(scroll.top, 80);
+        scroll.scroll_up(20);
+        assert_eq!(scroll.top, 60);
+        assert!(!scroll.follow);
+        scroll.scroll_down(20, 100, 20);
+        assert_eq!(scroll.top, 80);
+        assert!(scroll.follow);
+        scroll.scroll_up(1);
+        scroll.end();
+        scroll.sync(120, 20, 2);
+        assert_eq!(scroll.top, 100);
+    }
+
+    #[test]
+    fn arrow_selection_opens_one_turn_and_collapses_the_previous_one() {
+        let view = TranscriptView {
+            total_height: 30,
+            viewport: 10,
+            turns: 3,
+            anchor_turn: Some(2),
+            starts: vec![0, 10, 20],
+            heights: vec![10, 10, 10],
+        };
+        let mut scroll = TranscriptScroll::default();
+        scroll.sync(30, 10, 1);
+        let mut open = None;
+
+        select_trace_turn(&mut open, &view, &mut scroll, -1);
+        assert_eq!(open, Some(2));
+        assert_eq!(scroll.top, 20);
+        assert!(!scroll.follow);
+
+        select_trace_turn(&mut open, &view, &mut scroll, -1);
+        assert_eq!(open, Some(1));
+        assert_eq!(scroll.top, 10);
+
+        select_trace_turn(&mut open, &view, &mut scroll, 1);
+        assert_eq!(open, Some(2));
+        select_trace_turn(&mut open, &view, &mut scroll, 1);
+        assert_eq!(open, None);
+        assert!(scroll.follow);
+    }
+
+    #[test]
+    fn page_keys_scroll_inside_a_tall_selected_trace_before_moving_turns() {
+        let view = TranscriptView {
+            total_height: 50,
+            viewport: 10,
+            turns: 2,
+            anchor_turn: Some(0),
+            starts: vec![0, 40],
+            heights: vec![40, 10],
+        };
+        let mut scroll = TranscriptScroll {
+            top: 0,
+            follow: false,
+            ..TranscriptScroll::default()
+        };
+        let mut open = Some(0);
+
+        page_trace_turn(&mut open, &view, &mut scroll, 1);
+        assert_eq!(open, Some(0));
+        assert_eq!(scroll.top, 10);
+        page_trace_turn(&mut open, &view, &mut scroll, 1);
+        assert_eq!(scroll.top, 20);
+        page_trace_turn(&mut open, &view, &mut scroll, 1);
+        assert_eq!(scroll.top, 30);
+        page_trace_turn(&mut open, &view, &mut scroll, 1);
+        assert_eq!(open, Some(1));
+        assert_eq!(scroll.top, 40);
+    }
+
+    #[test]
+    fn detached_height_growth_preserves_top_anchor() {
+        let mut scroll = TranscriptScroll::default();
+        scroll.sync(100, 20, 10);
+        scroll.scroll_up(30);
+        assert_eq!(scroll.top, 50);
+        scroll.sync(140, 19, 11);
+        assert_eq!(scroll.top, 50);
+        assert!(scroll.new_activity);
+    }
+
+    #[test]
+    fn turn_response_prefers_reply_over_stale_pending() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        thread.add_turn(ItemKind::Reply, "answer".into(), Some("2".into()));
+        thread.add_turn(
+            ItemKind::PendingReply,
+            "stale pending".into(),
+            Some("2".into()),
+        );
+        let cells = build_turn_cells(&thread);
+        let response = turn_response(&thread, &cells[0]).expect("response");
+        assert_eq!(response.kind, ItemKind::Reply);
+        assert_eq!(response.text, "answer");
+    }
+
+    #[test]
+    fn turn_grouping_maps_out_of_order_correlated_items_in_two_passes() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "first".into(), Some("2".into()));
+        thread.add_turn(ItemKind::User, "second".into(), Some("3".into()));
+        thread.add_turn(
+            ItemKind::SpawnResult,
+            "late first result".into(),
+            Some("2".into()),
+        );
+        thread.add_turn(
+            ItemKind::SpawnResult,
+            "unknown result".into(),
+            Some("99".into()),
+        );
+        let cells = build_turn_cells(&thread);
+        assert!(cells[0].items.contains(&2));
+        assert!(!cells[1].items.contains(&2));
+        assert!(!cells.iter().any(|cell| cell.items.contains(&3)));
+    }
+
+    #[test]
+    fn activity_indicator_reserves_content_height_and_reaches_final_line() {
+        let viewport = transcript_content_height(20, true);
+        assert_eq!(viewport, 19);
+        let mut scroll = TranscriptScroll::default();
+        scroll.sync(25, viewport, 1);
+        scroll.scroll_up(1);
+        scroll.sync(30, viewport, 2);
+        assert_eq!(scroll.top, 5);
+        scroll.scroll_down(usize::MAX, 30, viewport);
+        assert_eq!(scroll.top, 11);
+        assert!(scroll.follow);
+    }
+
+    #[test]
+    fn turn_cache_retains_one_layout_per_turn_and_clears_old_width() {
+        let mut thread = Thread::new_foreground();
+        for index in 0..200 {
+            thread.add_turn(
+                ItemKind::User,
+                format!("question {index}"),
+                Some(index.to_string()),
+            );
+        }
+        let cells = build_turn_cells(&thread);
+        let mut cache = TurnLayoutCache::default();
+        cache.prepare(80, &cells, thread.structure_revision);
+        for cell in &cells {
+            cache.layout(cell_key(cell), cell_revision(&thread, cell), 0, || {
+                CellLayout {
+                    lines: vec![Line::raw("cell")],
+                    hits: vec![None],
+                }
+            });
+        }
+        assert_eq!(cache.layouts.len(), 200);
+        cache.layout(
+            cell_key(&cells[0]),
+            CellRevision {
+                item: u64::MAX,
+                metric: u64::MAX,
+                worker: u64::MAX,
+            },
+            0,
+            || CellLayout {
+                lines: vec![Line::raw("updated")],
+                hits: vec![None],
+            },
+        );
+        assert_eq!(cache.layouts.len(), 200);
+        cache.prepare(81, &cells, thread.structure_revision);
+        assert!(cache.layouts.is_empty());
+    }
+
+    #[test]
+    fn turn_projection_survives_stream_mutations_without_rebuilding() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        thread.add_turn(ItemKind::PendingReply, String::new(), Some("2".into()));
+        let mut projection = TurnProjection::default();
+        assert!(projection.update(&thread));
+        let revision = cell_revision(&thread, &projection.cells[0]);
+        thread.add_reply_fragment("delta".into(), Some("2".into()), false);
+        assert!(!projection.update(&thread));
+        assert_ne!(cell_revision(&thread, &projection.cells[0]), revision);
+    }
+
+    #[test]
+    fn traces_default_hidden_and_conversation_cell_is_click_target() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        thread.add_turn(ItemKind::Reply, "answer".into(), Some("2".into()));
+        thread.add_turn(
+            ItemKind::System,
+            "raw diagnostic detail".into(),
+            Some("2".into()),
+        );
+        let cells = build_turn_cells(&thread);
+        let latest = latest_conversation_timestamp(&thread, &cells[0]);
+        let collapsed = turn_cell_layout(
+            0,
+            0,
+            std::slice::from_ref(&thread),
+            &cells[0],
+            80,
+            latest,
+            false,
+            "",
+            false,
+        );
+        let collapsed_text = collapsed
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!collapsed_text.contains("raw diagnostic detail"));
+        assert!(!collapsed_text.contains("trace ·"));
+        assert!(collapsed
+            .hits
+            .iter()
+            .any(|hit| *hit == Some(ClickTarget::TraceSummary(0))));
+        let open = turn_cell_layout(
+            0,
+            0,
+            std::slice::from_ref(&thread),
+            &cells[0],
+            80,
+            latest,
+            false,
+            "",
+            true,
+        );
+        assert!(open
+            .lines
+            .iter()
+            .any(|line| line.to_string().contains("trace ·")));
+        assert!(open
+            .lines
+            .iter()
+            .any(|line| line.to_string().contains("raw diagnostic detail")));
+    }
+
+    #[test]
+    fn selected_turn_nests_correlated_worker_tools() {
+        let mut threads = vec![Thread::new_foreground()];
+        threads[0].add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        threads[0].add_turn(ItemKind::Reply, "answer".into(), Some("2".into()));
+        let worker = find_or_create_thread(&mut threads, "worker-123456", false, None);
+        threads[worker].add_tool(
+            "agent_browser {\"action\":\"get\"}".into(),
+            "tool-1".into(),
+            Some("2".into()),
+        );
+        let cells = build_turn_cells(&threads[0]);
+        let latest = latest_conversation_timestamp(&threads[0], &cells[0]);
+        let layout = turn_cell_layout(0, 0, &threads, &cells[0], 80, latest, false, "", true);
+        assert!(layout
+            .lines
+            .iter()
+            .any(|line| line.to_string().contains("agent_browser")));
+        assert!(worker_turn_revisions(&threads).contains_key("2"));
+    }
+
+    #[test]
+    fn trace_toggle_keeps_at_most_one_drawer_open() {
+        let mut open = None;
+        toggle_trace(&mut open, 0);
+        assert_eq!(open, Some(0));
+        toggle_trace(&mut open, 0);
+        assert_eq!(open, None);
+        toggle_trace(&mut open, 1);
+        assert_eq!(open, Some(1));
+        toggle_trace(&mut open, 2);
+        assert_eq!(open, Some(2));
+    }
+
+    #[test]
+    fn ctrl_o_targets_viewport_anchor_or_live_turn() {
+        let view = TranscriptView {
+            turns: 4,
+            anchor_turn: Some(1),
+            ..TranscriptView::default()
+        };
+        assert_eq!(ctrl_o_target(&view, false), Some(1));
+        assert_eq!(ctrl_o_target(&view, true), Some(3));
+    }
+
+    #[test]
+    fn turn_cache_invalidates_only_changed_streaming_turn() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "first".into(), Some("2".into()));
+        thread.add_turn(ItemKind::Reply, "done".into(), Some("2".into()));
+        thread.add_turn(ItemKind::User, "second".into(), Some("3".into()));
+        thread.add_turn(ItemKind::PendingReply, String::new(), Some("3".into()));
+        let mut projection = TurnProjection::default();
+        projection.update(&thread);
+        let mut cache = TurnLayoutCache::default();
+        cache.prepare(80, &projection.cells, thread.structure_revision);
+        for cell in &projection.cells {
+            cache.layout(cell_key(cell), cell_revision(&thread, cell), 0, || {
+                CellLayout {
+                    lines: vec![Line::raw("cell")],
+                    hits: vec![None],
+                }
+            });
+        }
+        assert_eq!(cache.builds, 2);
+        thread.add_reply_fragment("delta".into(), Some("3".into()), false);
+        assert!(!projection.update(&thread));
+        for cell in &projection.cells {
+            cache.layout(cell_key(cell), cell_revision(&thread, cell), 0, || {
+                CellLayout {
+                    lines: vec![Line::raw("cell")],
+                    hits: vec![None],
+                }
+            });
+        }
+        assert_eq!(cache.builds, 3);
+    }
+
+    #[test]
+    fn metric_revision_is_not_masked_by_a_newer_item_revision() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        thread.add_turn(ItemKind::Reply, "answer".into(), Some("2".into()));
+        thread.metric_revisions.insert("2".into(), 1);
+        let cell = &build_turn_cells(&thread)[0];
+        let before = cell_revision(&thread, cell);
+        assert!(before.item > before.metric);
+
+        thread.metric_revisions.insert("2".into(), 2);
+        let after = cell_revision(&thread, cell);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn clear_reset_discards_unified_view_projection_and_cache() {
+        let mut scroll = TranscriptScroll::default();
+        scroll.scroll_up(1);
+        let mut view = TranscriptView {
+            total_height: 10,
+            viewport: 5,
+            turns: 1,
+            anchor_turn: Some(0),
+            starts: vec![0],
+            heights: vec![10],
+        };
+        let mut cache = TurnLayoutCache::default();
+        cache.width = Some(80);
+        let mut open_trace = Some(0);
+        let mut projection = TurnProjection {
+            structure_revision: Some(2),
+            cells: Vec::new(),
+        };
+        reset_transcript(
+            &mut scroll,
+            &mut view,
+            &mut cache,
+            &mut open_trace,
+            &mut projection,
+        );
+        assert_eq!(scroll, TranscriptScroll::default());
+        assert_eq!(view.total_height, 0);
+        assert!(cache.layouts.is_empty());
+        assert_eq!(cache.width, None);
+        assert_eq!(open_trace, None);
+        assert_eq!(projection.structure_revision, None);
+    }
+
     fn envelope(event_id: u64, kind: AgentEvent) -> EventEnvelope {
         EventEnvelope {
             event_id,
@@ -4683,6 +6680,87 @@ mod tests {
     }
 
     #[test]
+    fn turn_status_updates_only_its_existing_pending_reply() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "first".into(), Some("2".into()));
+        thread.add_turn(ItemKind::PendingReply, String::new(), Some("2".into()));
+        thread.add_turn(ItemKind::User, "second".into(), Some("3".into()));
+        thread.add_turn(ItemKind::PendingReply, String::new(), Some("3".into()));
+
+        apply_agent_event(
+            &mut thread,
+            AgentEvent::Status {
+                turn: Some(3),
+                phase: "queued".into(),
+                message: "Earlier answer is still running; this turn will respond in context."
+                    .into(),
+            },
+        );
+        apply_agent_event(
+            &mut thread,
+            AgentEvent::Status {
+                turn: Some(2),
+                phase: "working".into(),
+                message: "using context".into(),
+            },
+        );
+
+        assert_eq!(thread.items[1].text, "using context");
+        assert_eq!(
+            thread.items[3].text,
+            "Earlier answer is still running; this turn will respond in context."
+        );
+        assert_eq!(
+            thread
+                .items
+                .iter()
+                .filter(|item| item.kind == ItemKind::System)
+                .count(),
+            2,
+            "status traces remain available"
+        );
+    }
+
+    #[test]
+    fn conversation_finished_replaces_turn_reservation_once() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "first".into(), Some("2".into()));
+        thread.add_turn(
+            ItemKind::PendingReply,
+            "queued status".into(),
+            Some("2".into()),
+        );
+        thread.add_turn(ItemKind::User, "second".into(), Some("3".into()));
+        thread.add_turn(ItemKind::PendingReply, String::new(), Some("3".into()));
+
+        apply_interaction_event(
+            &mut thread,
+            interaction(InteractionEvent::ConversationFinished {
+                text: "first answer".into(),
+            }),
+        );
+        apply_interaction_event(
+            &mut thread,
+            interaction(InteractionEvent::ConversationFinished {
+                text: "corrected answer".into(),
+            }),
+        );
+
+        assert_eq!(thread.items.len(), 4);
+        assert_eq!(thread.items[1].kind, ItemKind::Reply);
+        assert_eq!(thread.items[1].text, "corrected answer");
+        assert_eq!(thread.items[3].kind, ItemKind::PendingReply);
+        assert_eq!(
+            thread
+                .items
+                .iter()
+                .filter(|item| item.kind == ItemKind::Reply && item.turn.as_deref() == Some("2"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn final_reply_is_idempotent_per_turn() {
         let mut thread = Thread::new_foreground();
         apply_agent_event(
@@ -4761,13 +6839,14 @@ mod tests {
     #[test]
     fn worker_start_uses_its_correlated_origin_turn() {
         let mut thread = Thread::new_foreground();
-        apply_agent_event(
+        apply_correlated_agent_event(
             &mut thread,
             AgentEvent::WorkerStarted {
                 turn: Some(2),
                 worker_id: "worker-1".into(),
                 objective: "objective".into(),
             },
+            Some("3"),
         );
         let spawn = thread
             .items
@@ -4775,6 +6854,58 @@ mod tests {
             .find(|item| item.kind == ItemKind::Spawn)
             .expect("spawn item");
         assert_eq!(spawn.turn.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn overlapping_work_results_increment_only_their_envelope_turn() {
+        let mut thread = Thread::new_foreground();
+        for worker_id in ["worker-1", "worker-2", "worker-3"] {
+            thread.add_turn(
+                ItemKind::Spawn,
+                format!("worker {worker_id}: turn two"),
+                Some("2".into()),
+            );
+        }
+        thread.add_turn(
+            ItemKind::Spawn,
+            "worker worker-4: turn three".into(),
+            Some("3".into()),
+        );
+
+        let mut seen = HashSet::new();
+        for (event_id, turn, worker_id) in [(1, "2", "worker-1"), (2, "3", "worker-4")] {
+            let mut result = envelope(
+                event_id,
+                AgentEvent::WorkResult {
+                    result: tachyon_api::types::WorkResult {
+                        work_id: worker_id.into(),
+                        objective: format!("work for turn {turn}"),
+                        generation: 1,
+                        assignment: 1,
+                        outcome: WorkOutcome::Completed {
+                            result: "done".into(),
+                            artifacts: Vec::new(),
+                            context: String::new(),
+                            suggested_reuse: false,
+                        },
+                    },
+                },
+            );
+            result.turn_id = Some(turn.into());
+            assert!(accept_event(&mut seen, &result));
+            let actor = result.actor.clone();
+            let envelope_turn = result.turn_id.clone();
+            apply_actor_event(&mut thread, result.kind, &actor, envelope_turn.as_deref());
+        }
+
+        assert_eq!(
+            turn_badges(&thread, Some("2"), u64::MAX, false),
+            "󰚩 3 agents · 󰄬 1 complete"
+        );
+        assert_eq!(
+            turn_badges(&thread, Some("3"), u64::MAX, false),
+            "󰚩 1 agent · 󰄬 1 complete"
+        );
     }
 
     #[test]
@@ -4837,6 +6968,7 @@ mod tests {
             tool_id: None,
             turn: Some("2".into()),
             timestamp: 1_000,
+            revision: 1,
         });
         thread.items.push(Item {
             kind: ItemKind::Spawn,
@@ -4846,9 +6978,39 @@ mod tests {
             tool_id: None,
             turn: Some("2".into()),
             timestamp: 4_000,
+            revision: 2,
         });
         let badges = turn_badges(&thread, Some("2"), 6_000, true);
         assert!(badges.contains("5.0s"));
+    }
+
+    #[test]
+    fn turn_badges_surface_partial_structured_worker_failures() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(
+            ItemKind::Spawn,
+            "worker one: inspect".into(),
+            Some("2".into()),
+        );
+        thread.add_turn(
+            ItemKind::Spawn,
+            "worker two: inspect".into(),
+            Some("2".into()),
+        );
+        thread.add_turn(
+            ItemKind::SpawnResult,
+            "worker one: inspect\ndone".into(),
+            Some("2".into()),
+        );
+        thread.add_turn(
+            ItemKind::Error,
+            "work two: inspect\nfailed".into(),
+            Some("2".into()),
+        );
+
+        let badges = turn_badges(&thread, Some("2"), u64::MAX, false);
+        assert!(badges.contains("󰄬 1 complete"), "{badges}");
+        assert!(badges.contains("× 1 failed"), "{badges}");
     }
 
     #[test]
@@ -4972,6 +7134,7 @@ mod tests {
             tool_id: None,
             turn: Some("2".into()),
             timestamp: 1_000,
+            revision: 1,
         });
         thread.items.push(Item {
             kind: ItemKind::User,
@@ -4981,6 +7144,7 @@ mod tests {
             tool_id: None,
             turn: Some("3".into()),
             timestamp: 2_000,
+            revision: 2,
         });
         thread.items.push(Item {
             kind: ItemKind::Reply,
@@ -4990,6 +7154,7 @@ mod tests {
             tool_id: None,
             turn: Some("2".into()),
             timestamp: 3_000,
+            revision: 3,
         });
         assert!(reply_completed_after_later_user(
             &thread,

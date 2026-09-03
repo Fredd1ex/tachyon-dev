@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ghost", "crates/memory", "crates/orchestrators", "crates/tachyon-background", "crates/tachyon-foreground", "crates/tachyon-model", "crates/tachyond", "crates/tachyon-agent-supervisor", "crates/tachyon", "crates/tachyon-api", "crates/tachyon-client", "crates/tachyon-tui", "crates/tachyon-util"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 
@@ -13,6 +13,7 @@ serde_json = "1"
 toml = "0.8"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -22,6 +23,11 @@ fs2 = "0.4"
 shell-words = "1"
 keyring = { version = "4", features = ["v1"] }
 rpassword = "7"
+tempfile = "3"
+ignore = "0.4"
+globset = "0.4"
+regex = "1"
+sha2 = "0.10"
 
 [workspace.dependencies.tachyon-util]
 path = "crates/tachyon-util"

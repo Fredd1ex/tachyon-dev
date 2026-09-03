@@ -34,7 +34,8 @@ Tachyond is the runtime authority. It currently:
 - Owns process handles and worker workspaces.
 - Publishes line-oriented events over IPC.
 
-The lifecycle contract is defined in `docs/LIFECYCLE.md`. Semantic retention
+The lifecycle contract is defined in
+[`../tachyond/LIFECYCLE.md`](../tachyond/LIFECYCLE.md). Semantic retention
 decisions currently remain in orchestration policy; Tachyond is authoritative
 for process signals, replacement, lease enforcement, and cleanup.
 

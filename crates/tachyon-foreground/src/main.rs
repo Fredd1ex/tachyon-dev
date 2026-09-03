@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use futures_util::future::join_all;
 use interaction::{
-    assess_answerability, chat_with_delegation, classify, policy_context,
+    assess_answerability, bounded_policy_text, chat_with_delegation, classify, policy_context,
     synthesize_spoken_response,
 };
 use tachyon_api::transport::Connection;
@@ -26,9 +26,13 @@ use tachyon_api::{
 };
 use tachyon_model::{ChatMessage, Content, Model, Role, TokenUsage, ToolCall, ToolSpec};
 use tachyon_orchestrator::conversation::policy::{
-    execution_policy, publication_requires_dependency, Answerability, InteractionDecision,
+    follow_up_execution_policy, publication_requires_dependency, Answerability, InteractionDecision,
 };
 use tokio::io::AsyncBufReadExt;
+
+const QUEUED_TURN_ACKNOWLEDGEMENT: &str =
+    "Waiting for the earlier result so I can answer this in context.";
+const DEFAULT_ANSWERABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentRole {
@@ -475,6 +479,7 @@ async fn process_turn(
     ) = args;
     let Some(model) = model else {
         if publication_requires_dependency(queued, decision) {
+            emit_queued_turn(turn);
             wait_for_prior_turn(&conversation, &state_changed, turn).await;
         }
         let answer =
@@ -506,10 +511,7 @@ async fn process_turn(
     };
     if queued {
         if publication_requires_dependency(queued, decision) {
-            emit_turn(
-                Some(turn),
-                format!("[status] dependency=turn {}", turn.saturating_sub(1)),
-            );
+            emit_queued_turn(turn);
             wait_for_context_or_evidence(&conversation, &state_changed, turn, &text).await;
         }
     }
@@ -520,67 +522,66 @@ async fn process_turn(
     });
     let snapshot = conversation.lock().unwrap().messages.clone();
     let mut local = snapshot;
-    if queued && decision != InteractionDecision::AnswerNow {
-        let evidence = conversation.lock().unwrap().evidence.clone();
-        let relevant = evidence
-            .iter()
-            .filter_map(|record| match record.event() {
-                AgentEvent::WorkerCompleted {
-                    worker_id,
-                    objective,
-                    result,
-                    ..
-                } if evidence_relevant_to_follow_up(
-                    record,
-                    turn.saturating_sub(1),
-                    &text,
-                ) => Some(format!(
-                    "Available background evidence (worker {worker_id}, objective {objective}):\n{result}"
-                )),
-                AgentEvent::WorkResult {
-                    result:
-                        tachyon_api::WorkResult {
-                            work_id,
-                            objective,
-                            outcome: WorkOutcome::Completed { result, .. },
-                            ..
-                        },
-                } if evidence_relevant_to_follow_up(
-                    record,
-                    turn.saturating_sub(1),
-                    &text,
-                ) => Some(format!(
-                    "Available background evidence (work {work_id}, objective {objective}):\n{result}"
-                )),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if !relevant.is_empty() {
-            local.push(ChatMessage::new(Role::User, relevant.join("\n\n")));
-        }
+    let follow_up_evidence = accepted_follow_up_evidence(
+        &conversation.lock().unwrap().evidence,
+        turn.saturating_sub(1),
+        &text,
+    );
+    if let Some(evidence) = &follow_up_evidence {
+        local.push(ChatMessage::new(Role::User, evidence.clone()));
     }
-    let answerability = if publication_requires_dependency(queued, decision) {
+    let requires_dependency = publication_requires_dependency(queued, decision);
+    let has_accepted_evidence = follow_up_evidence.is_some();
+    let mut answerability = None;
+    if let Some(timeout) = answerability_timeout(has_accepted_evidence) {
         let context = policy_context(&local);
-        let (answerability, usage) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+        let started = std::time::Instant::now();
+        let (outcome, usage, fallback, timed_out) = match tokio::time::timeout(
+            timeout,
             assess_answerability(&model, &context, &text),
         )
         .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or((Answerability::NeedsNewWork, TokenUsage::default()));
+        {
+            Ok(Ok((outcome, usage, malformed))) => (outcome, usage, malformed, false),
+            Ok(Err(_)) => (
+                Answerability::NeedsNewWork,
+                TokenUsage::default(),
+                true,
+                false,
+            ),
+            Err(_) => (
+                Answerability::NeedsNewWork,
+                TokenUsage::default(),
+                true,
+                true,
+            ),
+        };
         auxiliary_usage += usage;
-        Some(answerability)
-    } else {
-        None
-    };
-    let policy = execution_policy(answerability);
+        answerability = Some(outcome);
+        emit_event(answerability_timing(
+            turn,
+            outcome,
+            fallback,
+            timed_out,
+            started.elapsed(),
+        ));
+    } else if requires_dependency {
+        emit_event(answerability_timing(
+            turn,
+            Answerability::NeedsNewWork,
+            false,
+            false,
+            std::time::Duration::ZERO,
+        ));
+    }
+    let policy =
+        follow_up_execution_policy(requires_dependency, has_accepted_evidence, answerability);
 
     local.push(ChatMessage::new(Role::User, text.clone()));
     emit_turn(Some(turn), "[status] working".into());
     // Routing controls scheduling only. A separate answerability decision
-    // controls whether dependent turns may answer without fresh work.
-    let tools_enabled = true;
+    // controls whether follow-ups may answer without fresh work.
+    let tools_enabled = !policy.answer_from_context;
     let final_answer = match loop_until_done(
         &model,
         &mut local,
@@ -667,6 +668,28 @@ fn mark_turn_inactive(active_turns: &Arc<Mutex<BTreeMap<u64, String>>>, turn: u6
     active_turns.lock().unwrap().remove(&turn);
 }
 
+fn answerability_timeout(has_accepted_evidence: bool) -> Option<std::time::Duration> {
+    has_accepted_evidence.then_some(DEFAULT_ANSWERABILITY_TIMEOUT)
+}
+
+fn answerability_timing(
+    turn: u64,
+    outcome: Answerability,
+    fallback: bool,
+    timed_out: bool,
+    elapsed: std::time::Duration,
+) -> AgentEvent {
+    let outcome = match outcome {
+        Answerability::AnswerFromContext => "answer_from_context",
+        Answerability::NeedsNewWork => "needs_new_work",
+    };
+    AgentEvent::Timing {
+        turn,
+        stage: format!("answerability outcome={outcome} fallback={fallback} timeout={timed_out}"),
+        elapsed_ms: elapsed.as_millis() as u64,
+    }
+}
+
 fn commit_ready_turns(conversation: &mut ConversationState) {
     loop {
         let next_commit = conversation.next_commit;
@@ -742,6 +765,44 @@ fn evidence_relevant_to_follow_up(
         .origin_turn()
         .is_none_or(|origin| origin == prior_turn)
         && evidence_matches(incoming, objective)
+}
+
+fn accepted_follow_up_evidence(
+    evidence: &[EvidenceRecord],
+    prior_turn: u64,
+    incoming: &str,
+) -> Option<String> {
+    let relevant = evidence
+        .iter()
+        .filter(|record| is_completed_evidence(record.event()))
+        .filter(|record| match record.origin_turn() {
+            Some(origin) => origin == prior_turn,
+            None => evidence_relevant_to_follow_up(record, prior_turn, incoming),
+        })
+        .filter_map(|record| match record.event() {
+            AgentEvent::WorkerCompleted {
+                worker_id,
+                objective,
+                result,
+                ..
+            } => Some(format!(
+                "Available background evidence (worker {worker_id}, objective {objective}):\n{result}"
+            )),
+            AgentEvent::WorkResult {
+                result:
+                    tachyon_api::WorkResult {
+                        work_id,
+                        objective,
+                        outcome: WorkOutcome::Completed { result, .. },
+                        ..
+                    },
+            } => Some(format!(
+                "Available background evidence (work {work_id}, objective {objective}):\n{result}"
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    (!relevant.is_empty()).then(|| bounded_policy_text(&relevant.join("\n\n")))
 }
 
 fn evidence_matches(incoming: &str, objective: &str) -> bool {
@@ -823,12 +884,7 @@ enum Turn {
 
 fn emit_turn(turn: Option<u64>, message: String) {
     if let Some(rest) = message.strip_prefix("[status] ") {
-        let mut parts = rest.splitn(2, ' ');
-        emit_event(AgentEvent::Status {
-            turn,
-            phase: parts.next().unwrap_or("working").to_string(),
-            message: parts.next().unwrap_or_default().to_string(),
-        });
+        emit_event(status_event(turn, rest));
     } else if let Some(message) = message.strip_prefix("[foreground:error] ") {
         emit_event(AgentEvent::Error {
             turn,
@@ -850,6 +906,22 @@ fn emit_turn(turn: Option<u64>, message: String) {
     } else {
         println!("{message}");
     }
+}
+
+fn status_event(turn: Option<u64>, status: &str) -> AgentEvent {
+    let mut parts = status.splitn(2, ' ');
+    AgentEvent::Status {
+        turn,
+        phase: parts.next().unwrap_or("working").to_string(),
+        message: parts.next().unwrap_or_default().to_string(),
+    }
+}
+
+fn emit_queued_turn(turn: u64) {
+    emit_turn(
+        Some(turn),
+        format!("[status] queued {QUEUED_TURN_ACKNOWLEDGEMENT}"),
+    );
 }
 
 fn emit_turn_block(turn: Option<u64>, kind: &str, text: &str) {
@@ -977,6 +1049,7 @@ fn event_turn(event: &AgentEvent) -> Option<u64> {
         | AgentEvent::Error { turn, .. } => *turn,
         AgentEvent::Timing { turn, .. } => Some(*turn),
         AgentEvent::WorkerCompleted { .. }
+        | AgentEvent::ArtifactRegistered { .. }
         | AgentEvent::WorkCandidate { .. }
         | AgentEvent::WorkProgress { .. }
         | AgentEvent::WorkResult { .. }
@@ -1146,12 +1219,16 @@ async fn loop_until_done(
         drop(relay);
         usage += completion.usage;
         let text_out = completion.text.trim().to_string();
-        let mut tool_calls = completion.tool_calls.clone();
+        let mut tool_calls = if tools_enabled {
+            completion.tool_calls.clone()
+        } else {
+            Vec::new()
+        };
         let mut protocol_recovered = false;
         let dsml_response = direct_response(&tool_calls)
             .filter(|response| response.contains("DSML"))
             .or_else(|| text_out.contains("DSML").then(|| text_out.clone()));
-        if role == AgentRole::Conversation && dsml_response.is_some() {
+        if role == AgentRole::Conversation && tools_enabled && dsml_response.is_some() {
             tool_calls = dsml_response
                 .as_deref()
                 .and_then(|response| dsml_delegation_response(response, turn))
@@ -1622,12 +1699,17 @@ async fn run_tool(
                     );
                 }
             };
+            if tasks.len() > 8 {
+                return ToolOutput::failure(
+                    "spawn_agents accepts at most 8 tasks; group related objectives".into(),
+                );
+            }
             let lifetime_class = serde_json::from_str::<serde_json::Value>(&tc.arguments)
                 .ok()
                 .and_then(|value| value.get("lifetime_class").cloned())
                 .and_then(|value| serde_json::from_value(value).ok())
                 .unwrap_or(LifetimeClass::Short);
-            let jobs = tasks.into_iter().enumerate().map(|(index, task)| {
+            let jobs = tasks.iter().cloned().enumerate().map(|(index, task)| {
                 let lifetime_class = lifetime_class;
                 let correlation = delegation_correlation(tc, turn, Some(index));
                 tokio::task::spawn_blocking(move || {
@@ -1635,24 +1717,70 @@ async fn run_tool(
                 })
             });
             let results = join_all(jobs).await;
-            let mut evidence = Vec::new();
-            let mut failures = Vec::new();
-            for result in results {
-                match result {
-                    Ok(Ok(answer)) => evidence.push(answer),
-                    Ok(Err(error)) => failures.push(format!("worker failed: {error}")),
-                    Err(error) => failures.push(format!("worker task failed: {error}")),
-                }
-            }
-            let succeeded = !evidence.is_empty();
-            let text = if succeeded {
-                evidence.join("\n\n")
-            } else {
-                failures.join("\n\n")
-            };
-            ToolOutput { text, succeeded }
+            let outcomes = results
+                .into_iter()
+                .map(|result| match result {
+                    Ok(Ok(answer)) => ToolOutput::success(answer),
+                    Ok(Err(error)) => ToolOutput::failure(format!("worker failed: {error}")),
+                    Err(error) => ToolOutput::failure(format!("worker task failed: {error}")),
+                })
+                .collect();
+            compose_fanout_output(&tasks, outcomes)
         }
         other => ToolOutput::failure(format!("unknown tool: {other}")),
+    }
+}
+
+fn compose_fanout_output(tasks: &[String], outcomes: Vec<ToolOutput>) -> ToolOutput {
+    let succeeded = outcomes.iter().filter(|outcome| outcome.succeeded).count();
+    let status = if succeeded == tasks.len() {
+        "complete"
+    } else if succeeded == 0 {
+        "failed"
+    } else {
+        "partial"
+    };
+    let mut evidence = Vec::new();
+    let mut failures = Vec::new();
+    let mut outcomes = outcomes.into_iter();
+    for (index, objective) in tasks.iter().enumerate() {
+        let outcome = outcomes.next().unwrap_or_else(|| {
+            ToolOutput::failure("worker returned no outcome for this objective".into())
+        });
+        let outcome_status = if outcome.succeeded {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        let entry = format!(
+            "Objective {} [{outcome_status}]: {}\n{}",
+            index + 1,
+            objective,
+            outcome.text
+        );
+        if outcome.succeeded {
+            evidence.push(entry);
+        } else {
+            failures.push(entry);
+        }
+    }
+
+    let mut sections = vec![format!(
+        "Coverage: {status} ({succeeded}/{} objectives succeeded).",
+        tasks.len()
+    )];
+    if !evidence.is_empty() {
+        sections.push(format!("Valid evidence:\n{}", evidence.join("\n\n")));
+    }
+    if !failures.is_empty() {
+        sections.push(format!(
+            "Failed objectives (not evidence):\n{}",
+            failures.join("\n\n")
+        ));
+    }
+    ToolOutput {
+        text: sections.join("\n\n"),
+        succeeded: succeeded > 0,
     }
 }
 
@@ -1836,6 +1964,44 @@ mod tests {
 
     fn interaction_metadata() -> tachyon_api::InteractionMetadata {
         tachyon_api::InteractionMetadata::new("command-1", "turn-1", FOREGROUND_ID, 1)
+    }
+
+    #[test]
+    fn queued_turn_acknowledgement_is_a_turn_correlated_status() {
+        let event = status_event(Some(7), &format!("queued {QUEUED_TURN_ACKNOWLEDGEMENT}"));
+        assert!(matches!(
+            event,
+            AgentEvent::Status {
+                turn: Some(7),
+                phase,
+                message,
+            } if phase == "queued" && message == QUEUED_TURN_ACKNOWLEDGEMENT
+        ));
+    }
+
+    fn completed_evidence(turn: u64, result: impl Into<String>) -> EvidenceRecord {
+        EvidenceRecord::Correlated(EventEnvelope {
+            event_id: turn,
+            session_id: format!("worker-{turn}"),
+            conversation_id: Some(FOREGROUND_ID.into()),
+            turn_id: Some(turn.to_string()),
+            task_id: Some(format!("task-{turn}")),
+            parent_task_id: None,
+            tool_call_id: Some(format!("call-{turn}")),
+            actor: Actor::Worker {
+                id: format!("worker-{turn}"),
+            },
+            sequence: 1,
+            occurred_at_ms: 1,
+            kind: AgentEvent::WorkerCompleted {
+                worker_id: format!("worker-{turn}"),
+                objective: "inspect the release state".into(),
+                result: result.into(),
+                artifacts: Vec::new(),
+                context: String::new(),
+                suggested_reuse: false,
+            },
+        })
     }
 
     #[test]
@@ -2036,6 +2202,73 @@ mod tests {
     }
 
     #[test]
+    fn post_completion_follow_up_can_answer_without_spawning() {
+        let evidence = completed_evidence(4, "verified result".repeat(2_000));
+        let attached =
+            accepted_follow_up_evidence(&[evidence], 4, "Can you explain what that means?")
+                .expect("preceding accepted evidence should be attached");
+
+        assert!(attached.contains("verified result"));
+        assert!(attached.contains("[context truncated]"));
+        let policy =
+            follow_up_execution_policy(false, true, Some(Answerability::AnswerFromContext));
+        let tools_enabled = !policy.answer_from_context;
+        assert!(policy.answer_from_context);
+        assert!(!policy.force_delegation);
+        assert!(!tools_enabled);
+    }
+
+    #[test]
+    fn post_completion_follow_up_needing_new_evidence_still_delegates() {
+        let evidence = completed_evidence(7, "previously verified");
+        assert!(accepted_follow_up_evidence(
+            &[evidence],
+            7,
+            "Has that changed since the verification?"
+        )
+        .is_some());
+
+        let policy = follow_up_execution_policy(false, true, Some(Answerability::NeedsNewWork));
+        let tools_enabled = !policy.answer_from_context;
+        assert!(!policy.answer_from_context);
+        assert!(policy.force_delegation);
+        assert!(tools_enabled);
+    }
+
+    #[test]
+    fn answerability_timeout_only_applies_to_accepted_follow_up_evidence() {
+        assert_eq!(answerability_timeout(false), None);
+        assert_eq!(
+            answerability_timeout(true),
+            Some(std::time::Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn missing_follow_up_evidence_forces_delegation_without_classifier_timeout() {
+        let policy = follow_up_execution_policy(true, false, None);
+        assert_eq!(answerability_timeout(false), None);
+        assert!(policy.force_delegation);
+        assert!(!policy.answer_from_context);
+    }
+
+    #[test]
+    fn answerability_trace_contains_no_evidence() {
+        let event = answerability_timing(
+            9,
+            Answerability::NeedsNewWork,
+            true,
+            true,
+            std::time::Duration::from_millis(5_000),
+        );
+        assert!(matches!(
+            event,
+            AgentEvent::Timing { turn: 9, stage, elapsed_ms: 5_000 }
+                if stage == "answerability outcome=needs_new_work fallback=true timeout=true"
+        ));
+    }
+
+    #[test]
     fn durable_turn_contains_only_visible_transcript() {
         let conversation = durable_turn_messages("hello".into(), "Hi.".into());
         assert_eq!(conversation.len(), 2);
@@ -2081,6 +2314,39 @@ mod tests {
             compose_worker_response(&conversation),
             "first result\n\nsecond result\n\nthird result"
         );
+    }
+
+    #[test]
+    fn fanout_output_preserves_partial_coverage_and_separates_failures() {
+        let tasks = vec![
+            "verify package release".into(),
+            "inspect deployment status".into(),
+            "check security advisory".into(),
+        ];
+        let output = compose_fanout_output(
+            &tasks,
+            vec![
+                ToolOutput::success("release evidence".into()),
+                ToolOutput::failure("worker timed out".into()),
+                ToolOutput::success("advisory evidence".into()),
+            ],
+        );
+
+        assert!(output.succeeded);
+        assert!(output
+            .text
+            .contains("Coverage: partial (2/3 objectives succeeded)."));
+        let evidence = output.text.find("Valid evidence:").unwrap();
+        let failures = output
+            .text
+            .find("Failed objectives (not evidence):")
+            .unwrap();
+        assert!(evidence < failures);
+        assert!(output.text[..failures].contains("verify package release"));
+        assert!(output.text[..failures].contains("check security advisory"));
+        assert!(!output.text[..failures].contains("worker timed out"));
+        assert!(output.text[failures..].contains("inspect deployment status"));
+        assert!(output.text[failures..].contains("worker timed out"));
     }
 
     #[test]

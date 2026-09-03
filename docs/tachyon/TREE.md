@@ -9,22 +9,27 @@ tachyon/
 ├── PROJECT.md                    # Canonical product vision and requirements
 ├── README.md                     # Project overview and quick start
 ├── TODO.md                       # Current implementation backlog
-├── v0.2.0/                       # Approved v0.2.0 architecture and migration records
-│   ├── INVARIANTS.md             # Ownership, concurrency, and reliability rules
-│   ├── ORCHESTRATION_PROTOCOL.md # Target contracts and migration sequence
-│   ├── UI_PROTOCOL.md            # Runtime-derived TUI projections and behavior
-│   ├── MIGRATION.md              # Completed slices and remaining coupling
-│   └── DURABLE_STATE.md          # Deferred redb schema and migration rules
+├── roadmap/                      # Versioned targets and migration records
+│   ├── README.md                 # Milestone index and critical path
+│   ├── v0.2.0/                   # Architecture and migration contracts
+│   └── v0.3.0/                   # Ghost research harness and tool runtime
 ├── docs/
 │   ├── README.md                 # Documentation index and maintenance rules
-│   ├── TREE.md                   # This source tree guide
-│   ├── ARCHITECTURE.md           # Runtime ownership and boundaries
-│   ├── STATUS.md                 # Implemented, partial, and missing work
-│   ├── MEMORY.md                 # Markdown-first Memory service design
-│   ├── INTERACTION.md            # Conversation routing and concurrency
-│   ├── HARNESS.md                # Ghost tools and execution behavior
-│   ├── DAEMON.md                 # Tachyond ownership, IPC, and lifecycle
-│   └── ARCHINSTALL.md             # Arch Linux installation notes
+│   ├── tachyon/                  # Shared and user-facing system documentation
+│   │   ├── ARCHITECTURE.md       # Runtime ownership and boundaries
+│   │   ├── INTERACTION.md        # Conversation routing and concurrency
+│   │   ├── MEMORY.md             # Memory service design
+│   │   ├── RELIABILITY.md        # Reliability and release gates
+│   │   ├── STATUS.md             # Implemented, partial, and missing work
+│   │   ├── ARCHINSTALL.md        # Arch Linux installation notes
+│   │   └── TREE.md               # This source tree guide
+│   ├── tachyond/                 # Daemon-owned runtime documentation
+│   │   ├── DAEMON.md             # Tachyond ownership and IPC
+│   │   ├── LIFECYCLE.md          # Worker lifetime and cleanup contracts
+│   │   └── REATTACH.md           # Persistent worker reattachment
+│   └── ghost/                    # Worker harness documentation
+│       ├── HARNESS.md            # Ghost tools and execution behavior
+│       └── SANDBOX.md            # Workspace access and isolation policy
 ├── crates/
 │   ├── memory/                    # Markdown-first durable memory service
 │   │   ├── Cargo.toml

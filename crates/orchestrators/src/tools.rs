@@ -35,7 +35,7 @@ pub fn spawn_agent() -> ToolSchema {
                     "type": "string",
                     "enum": ["short", "long", "persistent"],
                     "default": "short",
-                    "description": "short is reusable for at most 3 assignments, long lasts until this daemon exits, persistent survives daemon exit and is reattached on restart"
+                    "description": "short: up to 3 assignments; long: daemon lifetime; persistent: reattaches after restart"
                 },
                 "purpose": { "type": "string" }
             },
@@ -63,19 +63,20 @@ pub fn respond() -> ToolSchema {
 pub fn spawn_agents() -> ToolSchema {
     ToolSchema::new(
         "spawn_agents",
-        "Delegate independent objectives concurrently.",
+        "Fan out independent work to materially cut latency, including same-method lists; group dependent or strongly shared-state work.",
         json!({
             "type": "object",
             "properties": {
                 "tasks": {
                     "type": "array",
+                    "maxItems": 8,
                     "items": { "type": "string" }
                 },
                 "lifetime_class": {
                     "type": "string",
                     "enum": ["short", "long", "persistent"],
                     "default": "short",
-                    "description": "short is reusable for at most 3 assignments, long lasts until this daemon exits, persistent survives daemon exit and is reattached on restart"
+                    "description": "short: up to 3 assignments; long: daemon lifetime; persistent: reattaches after restart"
                 }
             },
             "required": ["tasks"],
@@ -188,5 +189,15 @@ mod tests {
             })
             .sum::<usize>();
         assert!(chars < 900, "conversation schemas grew to {chars} chars");
+    }
+
+    #[test]
+    fn spawn_agents_schema_bounds_material_fanout() {
+        let schema = spawn_agents();
+        assert_eq!(schema.parameters["properties"]["tasks"]["maxItems"], 8);
+        assert!(schema.description.contains("independent work"));
+        assert!(schema.description.contains("same-method lists"));
+        assert!(schema.description.contains("strongly shared-state"));
+        assert!(!schema.description.contains("heterogeneous"));
     }
 }
