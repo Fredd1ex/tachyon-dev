@@ -48,6 +48,27 @@ use tachyon_api::{InteractionEvent, InteractionEventEnvelope, FOREGROUND_ID};
 
 use tachyon_client::{Client, Subscription};
 
+// Restrained semantic vocabulary for diagnostic UI. Keep conversation chrome
+// separate so the resting Freddie/Jarvis visual contract does not drift.
+mod icon {
+    pub const MODEL: &str = "󰧑";
+    pub const AGENT: &str = "󰚩";
+    pub const TOOL: &str = "󰆍";
+    pub const BROWSER: &str = "󰖟";
+    pub const SEARCH: &str = "";
+    pub const FILE: &str = "󰈙";
+    pub const DURATION: &str = "󰔛";
+    pub const TOKENS: &str = "󰘚";
+    pub const RUNNING: &str = "󰔟";
+    pub const WAITING: &str = "󰏤";
+    pub const SUCCESS: &str = "󰄬";
+    pub const WARNING: &str = "󰀪";
+    pub const FAILURE: &str = "󰅙";
+    pub const COLLAPSED: &str = "";
+    pub const EXPANDED: &str = "";
+    pub const BULLET: &str = "";
+}
+
 // ---- names from config ---------------------------------------------------
 
 struct Names {
@@ -514,9 +535,10 @@ enum PaneTab {
     Agents,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ClickTarget {
     TraceSummary(usize),
+    Worker(usize, String),
     Item(usize, usize),
 }
 
@@ -845,6 +867,22 @@ fn toggle_trace(open_trace: &mut Option<usize>, turn: usize) {
     *open_trace = (*open_trace != Some(turn)).then_some(turn);
 }
 
+fn toggle_worker(open_worker: &mut Option<(usize, String)>, turn: usize, worker: String) {
+    *open_worker = (*open_worker != Some((turn, worker.clone()))).then_some((turn, worker));
+}
+
+fn close_trace_details(
+    open_trace: &mut Option<usize>,
+    open_worker: &mut Option<(usize, String)>,
+    scroll: &mut TranscriptScroll,
+) -> bool {
+    let closed = open_trace.take().is_some() | open_worker.take().is_some();
+    if closed {
+        scroll.end();
+    }
+    closed
+}
+
 fn ctrl_o_target(view: &TranscriptView, follow: bool) -> Option<usize> {
     if view.turns == 0 {
         None
@@ -1085,7 +1123,7 @@ fn is_worker_runtime_detail(text: &str) -> bool {
 fn trace_summary(text: &str) -> String {
     if let Some(timing) = text.strip_prefix("[timing] ") {
         let Some((stage, elapsed)) = timing.rsplit_once(' ') else {
-            return format!("󰐊 {timing}");
+            return format!("{} {timing}", icon::DURATION);
         };
         let elapsed = elapsed
             .strip_suffix("ms")
@@ -1094,33 +1132,44 @@ fn trace_summary(text: &str) -> String {
             .unwrap_or_else(|| elapsed.to_string());
         let label = stage.replace('_', " ");
         if stage.ends_with("_started") {
-            return format!("󰐊 {} · +{elapsed}", label.trim_end_matches(" started"));
+            return format!(
+                "{} {} · +{elapsed}",
+                icon::DURATION,
+                label.trim_end_matches(" started")
+            );
         }
         if stage.ends_with("_completed") {
-            return format!("󰅐 {} · {elapsed}", label.trim_end_matches(" completed"));
+            return format!(
+                "{} {} · {elapsed}",
+                icon::SUCCESS,
+                label.trim_end_matches(" completed")
+            );
         }
         return match stage {
-            "ready" => format!("󰐊 ready · +{elapsed}"),
-            "publication_started" => format!("󰒓 publishing · {elapsed}"),
-            "completed" => format!("󰄬 turn completed · {elapsed}"),
-            _ => format!("󰐊 {label} · {elapsed}"),
+            "ready" => format!("{} ready · +{elapsed}", icon::WAITING),
+            "publication_started" => format!("{} publishing · {elapsed}", icon::RUNNING),
+            "completed" => format!("{} turn completed · {elapsed}", icon::SUCCESS),
+            _ => format!("{} {label} · {elapsed}", icon::DURATION),
         };
     }
     if let Some(detail) = text.strip_prefix("[working]") {
         let detail = detail.trim();
         return if detail.is_empty() {
-            "󰔟 working".into()
+            format!("{} working", icon::RUNNING)
         } else {
-            format!("󰔟 working · {detail}")
+            format!("{} working · {detail}", icon::RUNNING)
         };
     }
     if let Some(detail) = text.strip_prefix("[ready]") {
         let detail = detail.trim();
         return if detail.is_empty() {
-            "󰐊 ready".into()
+            format!("{} ready", icon::WAITING)
         } else {
-            format!("󰐊 ready · {detail}")
+            format!("{} ready · {detail}", icon::WAITING)
         };
+    }
+    if let Some(detail) = text.strip_prefix("[warning]") {
+        return format!("{} {}", icon::WARNING, detail.trim());
     }
     text.to_string()
 }
@@ -1322,6 +1371,7 @@ pub fn run() -> io::Result<()> {
     let mut transcript_cache = TurnLayoutCache::default();
     let mut transcript_view = TranscriptView::default();
     let mut open_trace = None;
+    let mut open_worker: Option<(usize, String)> = None;
     let mut turn_projection = TurnProjection::default();
 
     // Floating agent pane.
@@ -1541,6 +1591,7 @@ pub fn run() -> io::Result<()> {
                     &mut transcript_cache,
                     &mut transcript_view,
                     open_trace,
+                    open_worker.as_ref(),
                     &mut turn_projection,
                 );
                 if pane_open {
@@ -1585,6 +1636,8 @@ pub fn run() -> io::Result<()> {
                     &threads,
                     &config,
                     if daemon_changed { "fresh" } else { "active" },
+                    open_trace,
+                    &transcript_view,
                 );
 
                 if commands_open {
@@ -1621,6 +1674,7 @@ pub fn run() -> io::Result<()> {
                             &mut open_trace,
                             &mut turn_projection,
                         );
+                        open_worker = None;
                     }
                     KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         commands_open = !commands_open;
@@ -1641,9 +1695,16 @@ pub fn run() -> io::Result<()> {
                             ctrl_o_target(&transcript_view, transcript_scroll.follow)
                         {
                             toggle_trace(&mut open_trace, turn);
+                            open_worker = None;
                         }
                     }
                     KeyCode::Esc if commands_open => commands_open = false,
+                    KeyCode::Esc
+                        if close_trace_details(
+                            &mut open_trace,
+                            &mut open_worker,
+                            &mut transcript_scroll,
+                        ) => {}
                     KeyCode::Esc => break,
                     KeyCode::Tab => {
                         pane_open = !pane_open;
@@ -1656,21 +1717,29 @@ pub fn run() -> io::Result<()> {
                         if pane_open {
                             focus = focus.saturating_sub(1);
                         } else if input.is_empty() {
+                            let previous = open_trace;
                             select_trace_turn(
                                 &mut open_trace,
                                 &transcript_view,
                                 &mut transcript_scroll,
                                 -1,
                             );
+                            if open_trace != previous {
+                                open_worker = None;
+                            }
                         }
                     }
                     KeyCode::PageUp if !pane_open => {
+                        let previous = open_trace;
                         page_trace_turn(
                             &mut open_trace,
                             &transcript_view,
                             &mut transcript_scroll,
                             -1,
                         );
+                        if open_trace != previous {
+                            open_worker = None;
+                        }
                     }
                     KeyCode::Down => {
                         if pane_open {
@@ -1678,24 +1747,36 @@ pub fn run() -> io::Result<()> {
                                 focus += 1;
                             }
                         } else if input.is_empty() {
+                            let previous = open_trace;
                             select_trace_turn(
                                 &mut open_trace,
                                 &transcript_view,
                                 &mut transcript_scroll,
                                 1,
                             );
+                            if open_trace != previous {
+                                open_worker = None;
+                            }
                         }
                     }
                     KeyCode::PageDown if !pane_open => {
+                        let previous = open_trace;
                         page_trace_turn(
                             &mut open_trace,
                             &transcript_view,
                             &mut transcript_scroll,
                             1,
                         );
+                        if open_trace != previous {
+                            open_worker = None;
+                        }
                     }
                     KeyCode::End => {
-                        open_trace = None;
+                        close_trace_details(
+                            &mut open_trace,
+                            &mut open_worker,
+                            &mut transcript_scroll,
+                        );
                         transcript_scroll.end();
                     }
                     // Ctrl+Backspace / Ctrl+H: delete the previous word.
@@ -1767,6 +1848,7 @@ pub fn run() -> io::Result<()> {
                                         &mut open_trace,
                                         &mut turn_projection,
                                     );
+                                    open_worker = None;
                                 }
                                 _ => handle_slash(rest, &mut threads),
                             }
@@ -1779,6 +1861,7 @@ pub fn run() -> io::Result<()> {
                         threads[idx].add(ItemKind::User, cmd.clone());
                         threads[idx].reserve_reply();
                         open_trace = None;
+                        open_worker = None;
                         transcript_scroll.end();
                         input.clear();
                         input_cursor = 0;
@@ -1855,15 +1938,21 @@ pub fn run() -> io::Result<()> {
                         MouseEventKind::Down(MouseButton::Left) => {
                             let size = terminal.size()?;
                             if m.row == size.height.saturating_sub(1) {
-                                let controls = " 󰀄 AGENTS ·  HELP · 󰈈 INLINE TRACES · 󰋼 INFO ";
+                                let controls = footer_controls(open_trace, transcript_view.turns);
                                 let controls_start = 12u16;
                                 if m.column >= controls_start
                                     && m.column < controls_start + controls.chars().count() as u16
                                 {
                                     let relative = m.column - controls_start;
-                                    let help_start = 12;
-                                    let trace_start = 21;
-                                    let info_start = 41;
+                                    let char_offset = |needle: &str| {
+                                        controls
+                                            .find(needle)
+                                            .map(|byte| controls[..byte].chars().count() as u16)
+                                            .unwrap_or(u16::MAX)
+                                    };
+                                    let help_start = char_offset("HELP").saturating_sub(2);
+                                    let trace_start = char_offset("TRACE").saturating_sub(2);
+                                    let info_start = char_offset("INFO").saturating_sub(2);
                                     if relative < help_start {
                                         pane_open = true;
                                         commands_open = false;
@@ -1878,6 +1967,7 @@ pub fn run() -> io::Result<()> {
                                             transcript_scroll.follow,
                                         ) {
                                             toggle_trace(&mut open_trace, turn);
+                                            open_worker = None;
                                         }
                                     } else {
                                         info_open = true;
@@ -1946,6 +2036,11 @@ pub fn run() -> io::Result<()> {
                                 let hit = HITS.lock().unwrap().get(row).cloned().flatten();
                                 if let Some(ClickTarget::TraceSummary(turn)) = hit {
                                     toggle_trace(&mut open_trace, turn);
+                                    open_worker = None;
+                                    continue;
+                                }
+                                if let Some(ClickTarget::Worker(turn, worker)) = hit {
+                                    toggle_worker(&mut open_worker, turn, worker);
                                     continue;
                                 }
                                 if let Some(ClickTarget::Item(ti, ii)) = hit {
@@ -2992,12 +3087,8 @@ fn main_conversation_layout(
     } else {
         Color::Gray
     };
-    for source in prompt.text.lines() {
-        for line in wrap_text(source.trim(), body_width) {
-            let mut row = vec![Span::raw("    ")];
-            row.extend(styled_markdown(&line, Style::default().fg(prompt_color)));
-            push(Line::from(row), None);
-        }
+    for line in markdown_body_lines(&prompt.text, body_width, prompt_color) {
+        push(line, None);
     }
     push(Line::raw(""), None);
 
@@ -3100,12 +3191,12 @@ fn main_conversation_layout(
             } else {
                 Color::Gray
             };
-            for source in sanitize_reply_text(&response.text).lines() {
-                for line in wrap_text(source.trim(), body_width) {
-                    let mut row = vec![Span::raw("    ")];
-                    row.extend(styled_markdown(&line, Style::default().fg(response_color)));
-                    push(Line::from(row), None);
-                }
+            for line in markdown_body_lines(
+                &sanitize_reply_text(&response.text),
+                body_width,
+                response_color,
+            ) {
+                push(line, None);
             }
         }
     }
@@ -3123,10 +3214,18 @@ fn turn_cell_layout(
     active: bool,
     activity: &str,
     open: bool,
+    open_worker: Option<&str>,
 ) -> CellLayout {
     let thread = &threads[thread_index];
-    let mut layout =
-        main_conversation_layout(thread, cell, width, latest_timestamp, active, activity);
+    let content_width = width.saturating_sub(if open { 2 } else { 0 });
+    let mut layout = main_conversation_layout(
+        thread,
+        cell,
+        content_width,
+        latest_timestamp,
+        active,
+        activity,
+    );
     let mut diagnostic_items = cell
         .items
         .iter()
@@ -3201,10 +3300,22 @@ fn turn_cell_layout(
                     orchestration_items.push((source_thread, index));
                 }
             }
-            ItemKind::Error if worker_record(&item.text).is_some() => {
+            ItemKind::Error if item.text.starts_with("worker ") => {
                 let (id, _) = worker_record(&item.text).expect("checked worker record");
                 let worker = ensure_worker_trace(&mut worker_traces, id, None);
                 worker.items.push((source_thread, index));
+            }
+            ItemKind::Error if item.text.starts_with("work ") => {
+                let worker = worker_record(&item.text)
+                    .and_then(|(id, _)| worker_traces.iter_mut().find(|worker| worker.id == id));
+                if let Some(worker) = worker {
+                    worker.items.push((source_thread, index));
+                } else {
+                    orchestration_items.push((source_thread, index));
+                }
+            }
+            ItemKind::Error if item.text.to_ascii_lowercase().contains("review") => {
+                orchestration_items.push((source_thread, index));
             }
             ItemKind::System
                 if item.text.starts_with("work ")
@@ -3227,58 +3338,221 @@ fn turn_cell_layout(
         .hits
         .push(Some(ClickTarget::TraceSummary(turn_index)));
     if !model_items.is_empty() {
-        push_trace_heading(&mut layout, "Model", "  ");
+        push_trace_heading(&mut layout, icon::MODEL, "Model", "  ");
+        let (timeline, remaining_model_items) = compact_model_timeline(&model_items, threads);
+        let compacted = timeline.is_some();
+        if let Some(timeline) = timeline {
+            layout.lines.push(Line::from(vec![
+                Span::styled(
+                    format!("    {} ", icon::DURATION),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(timeline, Style::default().fg(Color::Gray)),
+            ]));
+            layout.hits.push(None);
+        }
         let mut previous_status = None;
-        for (source_thread, index) in model_items {
+        for (source_thread, index) in remaining_model_items {
             let item = &threads[source_thread].items[index];
             if item.kind == ItemKind::System {
-                let status = trace_summary(&item.text);
-                if previous_status.as_deref() == Some(status.as_str()) {
-                    continue;
+                for line in item
+                    .text
+                    .lines()
+                    .filter(|line| !compacted_model_line(line, compacted))
+                {
+                    let status = trace_summary(line);
+                    if previous_status.as_deref() == Some(status.as_str()) {
+                        continue;
+                    }
+                    previous_status = Some(status.clone());
+                    layout.lines.push(Line::from(vec![
+                        Span::styled("    · ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(status, Style::default().fg(Color::DarkGray)),
+                    ]));
+                    layout.hits.push(None);
                 }
-                previous_status = Some(status);
-            } else {
-                previous_status = None;
+                continue;
             }
-            push_trace_item(&mut layout, threads, source_thread, index, width, "    ");
+            previous_status = None;
+            push_trace_item(
+                &mut layout,
+                threads,
+                source_thread,
+                index,
+                content_width,
+                "    ",
+                None,
+            );
         }
     }
     if !orchestration_items.is_empty() || !worker_traces.is_empty() {
-        push_trace_heading(&mut layout, "Agents/orchestration", "  ");
+        push_trace_heading(&mut layout, icon::AGENT, "Agents", "  ");
         for (source_thread, index) in orchestration_items {
-            push_trace_item(&mut layout, threads, source_thread, index, width, "    ");
+            push_trace_item(
+                &mut layout,
+                threads,
+                source_thread,
+                index,
+                content_width,
+                "    ",
+                None,
+            );
         }
         for worker in worker_traces {
             let objective = worker.objective.as_deref().unwrap_or("Worker task");
+            let expanded = open_worker == Some(worker.id.as_str());
+            let (state, color) = worker_trace_state(&worker, threads);
+            let state_icon = match state {
+                "complete" => icon::SUCCESS,
+                "running" => icon::RUNNING,
+                _ => icon::FAILURE,
+            };
             layout.lines.push(Line::from(vec![
-                Span::styled("    󰚩 ", Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!(
+                        "    {} {} ",
+                        if expanded {
+                            icon::EXPANDED
+                        } else {
+                            icon::COLLAPSED
+                        },
+                        icon::AGENT
+                    ),
+                    Style::default().fg(Color::Green),
+                ),
                 Span::styled(short_preview(objective), Style::default().fg(Color::Gray)),
                 Span::styled(
-                    format!(" · {}", truncate_text(&worker.id, 8)),
+                    format!(" · {state_icon} {state}"),
+                    Style::default().fg(color),
+                ),
+                Span::styled(
+                    format!(" · {}", worker.id.chars().take(8).collect::<String>()),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
-            layout.hits.push(None);
-            let (state, color) = worker_trace_state(&worker, threads);
-            layout.lines.push(Line::from(Span::styled(
-                format!("      {state}"),
-                Style::default().fg(color),
-            )));
-            layout.hits.push(None);
-            for (source_thread, index) in worker.items {
-                if matches!(
-                    threads[source_thread].items[index].kind,
-                    ItemKind::SpawnResult
-                ) {
-                    continue;
+            layout
+                .hits
+                .push(Some(ClickTarget::Worker(turn_index, worker.id.clone())));
+            if expanded {
+                for (source_thread, index) in worker.items {
+                    if matches!(
+                        threads[source_thread].items[index].kind,
+                        ItemKind::SpawnResult
+                    ) {
+                        continue;
+                    }
+                    push_trace_item(
+                        &mut layout,
+                        threads,
+                        source_thread,
+                        index,
+                        content_width,
+                        "      ",
+                        Some(&worker.id),
+                    );
                 }
-                push_trace_item(&mut layout, threads, source_thread, index, width, "      ");
             }
         }
     }
     layout.lines.push(Line::raw(""));
     layout.hits.push(None);
+    add_selected_rail(&mut layout);
     layout
+}
+
+fn add_selected_rail(layout: &mut CellLayout) {
+    for line in &mut layout.lines {
+        line.spans
+            .insert(0, Span::styled("│ ", Style::default().fg(Color::DarkGray)));
+    }
+}
+
+fn timing_stage(text: &str) -> Option<(&str, u64)> {
+    let timing = text.strip_prefix("[timing] ")?;
+    let (stage, elapsed) = timing.rsplit_once(' ')?;
+    Some((stage, elapsed.strip_suffix("ms")?.parse().ok()?))
+}
+
+fn compact_timing_stage(stage: &str) -> bool {
+    stage == "first_visible"
+        || stage.contains("first_token")
+        || stage == "completed"
+        || stage.contains("routed")
+        || stage.ends_with("_started")
+        || stage.ends_with("_completed")
+}
+
+fn compacted_model_line(line: &str, compacted: bool) -> bool {
+    if timing_stage(line).is_some_and(|(stage, _)| compact_timing_stage(stage)) {
+        return true;
+    }
+    if !compacted {
+        return false;
+    }
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("[ready]")
+        || lower.starts_with("[working]")
+        || lower.contains("publication")
+        || lower.contains("publish")
+        || lower.contains("commit")
+}
+
+fn compact_model_timeline(
+    items: &[(usize, usize)],
+    threads: &[Thread],
+) -> (Option<String>, Vec<(usize, usize)>) {
+    let mut routed = None;
+    let mut first = None;
+    let mut completed = None;
+    for &(thread, index) in items {
+        for line in threads[thread].items[index].text.lines() {
+            let Some((stage, elapsed)) = timing_stage(line) else {
+                continue;
+            };
+            if stage == "first_visible" || stage.contains("first_token") {
+                first = Some(elapsed);
+            } else if stage == "completed" {
+                completed = Some(elapsed);
+            } else if stage.contains("routed") || stage.ends_with("_started") {
+                routed.get_or_insert(elapsed);
+            } else if stage.ends_with("_completed") && completed.is_none() {
+                completed = Some(elapsed);
+            }
+        }
+    }
+    let mut points = Vec::new();
+    if let Some(elapsed) = routed {
+        points.push(format!("routed {}", human_millis(elapsed)));
+    }
+    if let Some(elapsed) = first {
+        points.push(format!("first token {}", human_millis(elapsed)));
+    }
+    if let Some(elapsed) = completed {
+        points.push(format!("completed {}", human_millis(elapsed)));
+    }
+    let has_completion = completed.is_some();
+    let remaining = items
+        .iter()
+        .copied()
+        .filter(|(thread, index)| {
+            let item = &threads[*thread].items[*index];
+            if has_completion && item.kind == ItemKind::System {
+                return item
+                    .text
+                    .lines()
+                    .any(|line| !compacted_model_line(line, true));
+            }
+            if item.kind == ItemKind::System
+                && item.text.lines().all(|line| {
+                    timing_stage(line).is_some_and(|(stage, _)| compact_timing_stage(stage))
+                })
+            {
+                return false;
+            }
+            true
+        })
+        .collect();
+    ((!points.is_empty()).then(|| points.join(" -> ")), remaining)
 }
 
 struct WorkerTrace {
@@ -3320,6 +3594,26 @@ fn worker_error_detail(text: &str) -> &str {
         .unwrap_or(detail)
 }
 
+fn worker_error_summary(text: &str, worker_id: Option<&str>) -> String {
+    let detail = worker_error_detail(text);
+    let first = detail.lines().next().unwrap_or(detail).trim();
+    let summary = if first.to_ascii_lowercase().contains("review failed") {
+        "review failed"
+    } else {
+        first
+    };
+    worker_id
+        .map(|id| summary.replace(id, "worker"))
+        .unwrap_or_else(|| summary.to_string())
+}
+
+fn elide_work_id(text: &str) -> String {
+    text.strip_prefix("work ")
+        .and_then(|record| record.split_once(": "))
+        .map(|(_, detail)| format!("work · {detail}"))
+        .unwrap_or_else(|| text.to_string())
+}
+
 fn ensure_worker_trace<'a>(
     workers: &'a mut Vec<WorkerTrace>,
     id: &str,
@@ -3340,22 +3634,25 @@ fn ensure_worker_trace<'a>(
 }
 
 fn trace_count_summary(events: usize, tools: usize, agents: usize) -> String {
-    let mut counts = vec![format!(
-        "{events} event{}",
-        if events == 1 { "" } else { "s" }
-    )];
-    if tools > 0 && tools != events {
+    let mut counts = Vec::new();
+    if events != tools && events != agents {
+        counts.push(format!(
+            "{events} event{}",
+            if events == 1 { "" } else { "s" }
+        ));
+    }
+    if tools > 0 {
         counts.push(format!("{tools} tool{}", if tools == 1 { "" } else { "s" }));
     }
-    if agents > 0 && agents != events {
+    if agents > 0 {
         counts.push(agent_count(agents));
     }
     format!("  trace · {}", counts.join(" · "))
 }
 
-fn push_trace_heading(layout: &mut CellLayout, label: &str, indent: &str) {
+fn push_trace_heading(layout: &mut CellLayout, icon: &str, label: &str, indent: &str) {
     layout.lines.push(Line::from(Span::styled(
-        format!("{indent}{label}"),
+        format!("{indent}{icon} {label}"),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -3374,11 +3671,12 @@ fn worker_trace_state(worker: &WorkerTrace, threads: &[Thread]) -> (&'static str
         }
         return ("failed", Color::Red);
     }
-    if worker
-        .items
-        .iter()
-        .any(|(thread, item)| threads[*thread].items[*item].kind == ItemKind::SpawnResult)
-    {
+    if worker.items.iter().any(|(thread, item)| {
+        matches!(
+            threads[*thread].items[*item].kind,
+            ItemKind::SpawnResult | ItemKind::Reply
+        )
+    }) {
         ("complete", Color::Green)
     } else {
         ("running", Color::Yellow)
@@ -3392,6 +3690,7 @@ fn push_trace_item(
     index: usize,
     width: u16,
     indent: &str,
+    worker_id: Option<&str>,
 ) {
     let source = &threads[source_thread];
     let item = &source.items[index];
@@ -3400,6 +3699,9 @@ fn push_trace_item(
         ItemKind::Tool => {
             let running = item.output.is_none();
             let (tool_name, arguments) = tool_parts(&item.text);
+            let display_arguments = worker_id
+                .map(|id| arguments.replace(id, "worker"))
+                .unwrap_or_else(|| arguments.clone());
             let badge = if running {
                 format!(" {} running", spinner_glyph())
             } else {
@@ -3408,7 +3710,10 @@ fn push_trace_item(
             let badge_style =
                 Style::default().fg(if running { Color::Yellow } else { Color::Green });
             layout.lines.push(Line::from(vec![
-                Span::styled(format!("{indent}󰆍 "), Style::default().fg(Color::Blue)),
+                Span::styled(
+                    format!("{indent}{} ", tool_icon(&tool_name)),
+                    Style::default().fg(Color::Blue),
+                ),
                 Span::styled(
                     format!("[{}] ", timestamp_label(item.timestamp)),
                     Style::default().fg(Color::DarkGray),
@@ -3417,7 +3722,7 @@ fn push_trace_item(
                 Span::styled(badge, badge_style),
                 if item.hidden {
                     Span::styled(
-                        format!(" · {} · click to expand", short_preview(&arguments)),
+                        format!(" · {} · click to expand", short_preview(&display_arguments)),
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC),
@@ -3426,21 +3731,21 @@ fn push_trace_item(
                     Span::raw("")
                 },
             ]));
-            layout.hits.push(hit);
+            layout.hits.push(hit.clone());
             if !item.hidden {
-                if let Some(target) = api_target(&arguments) {
+                if let Some(target) = api_target(&display_arguments) {
                     layout.lines.push(Line::from(Span::styled(
                         format!("{indent}    request · {target}"),
                         Style::default().fg(Color::Cyan),
                     )));
-                    layout.hits.push(hit);
+                    layout.hits.push(hit.clone());
                 }
-                for line in wrap_text(&arguments, width.saturating_sub(8) as usize) {
+                for line in wrap_text(&display_arguments, width.saturating_sub(8) as usize) {
                     layout.lines.push(Line::from(Span::styled(
                         format!("{indent}    {line}"),
                         Style::default().fg(Color::DarkGray),
                     )));
-                    layout.hits.push(hit);
+                    layout.hits.push(hit.clone());
                 }
                 if let Some(output) = &item.output {
                     layout.lines.push(Line::from(Span::styled(
@@ -3449,7 +3754,7 @@ fn push_trace_item(
                             .fg(Color::Rgb(255, 140, 0))
                             .add_modifier(Modifier::BOLD),
                     )));
-                    layout.hits.push(hit);
+                    layout.hits.push(hit.clone());
                     for source in output.lines() {
                         for line in wrap_text(source, width.saturating_sub(10) as usize) {
                             layout.lines.push(Line::from(Span::styled(
@@ -3458,7 +3763,7 @@ fn push_trace_item(
                                     .fg(Color::Rgb(220, 223, 228))
                                     .bg(Color::Rgb(30, 32, 36)),
                             )));
-                            layout.hits.push(hit);
+                            layout.hits.push(hit.clone());
                         }
                     }
                 }
@@ -3478,7 +3783,7 @@ fn push_trace_item(
                         .add_modifier(Modifier::ITALIC),
                 ),
             ]));
-            layout.hits.push(hit);
+            layout.hits.push(hit.clone());
             if !item.hidden {
                 for source in item.text.lines() {
                     for line in wrap_text(source, width.saturating_sub(8) as usize) {
@@ -3488,7 +3793,7 @@ fn push_trace_item(
                                 .fg(Color::Rgb(220, 223, 228))
                                 .bg(Color::Rgb(30, 32, 36)),
                         )));
-                        layout.hits.push(hit);
+                        layout.hits.push(hit.clone());
                     }
                 }
             }
@@ -3505,7 +3810,7 @@ fn push_trace_item(
                     Style::default().fg(Color::Green),
                 ),
             ]));
-            layout.hits.push(hit);
+            layout.hits.push(hit.clone());
         }
         ItemKind::SpawnResult => {
             layout.lines.push(Line::from(vec![
@@ -3519,13 +3824,16 @@ fn push_trace_item(
                     Style::default().fg(Color::Green),
                 ),
             ]));
-            layout.hits.push(hit);
+            layout.hits.push(hit.clone());
         }
         ItemKind::Error => {
-            let detail = worker_error_detail(&item.text);
+            let detail = worker_error_summary(&item.text, worker_id);
             for source in detail.lines() {
                 let mut row = vec![
-                    Span::styled(format!("{indent}󰅙 "), Style::default().fg(Color::Red)),
+                    Span::styled(
+                        format!("{indent}{} ", icon::FAILURE),
+                        Style::default().fg(Color::Red),
+                    ),
                     Span::styled(
                         format!("[{}] ", timestamp_label(item.timestamp)),
                         Style::default().fg(Color::DarkGray),
@@ -3533,30 +3841,38 @@ fn push_trace_item(
                 ];
                 row.extend(styled_markdown(source, Style::default().fg(Color::Red)));
                 layout.lines.push(Line::from(row));
-                layout.hits.push(hit);
+                layout.hits.push(hit.clone());
             }
         }
         ItemKind::System => {
             for source in item.text.lines() {
+                let summary = trace_summary(source);
+                let summary = worker_id
+                    .map(|id| summary.replace(id, "worker"))
+                    .unwrap_or(summary);
+                let summary = elide_work_id(&summary);
                 layout.lines.push(Line::from(vec![
                     Span::styled(format!("{indent}· "), Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         format!("[{}] ", timestamp_label(item.timestamp)),
                         Style::default().fg(Color::DarkGray),
                     ),
-                    Span::styled(trace_summary(source), Style::default().fg(Color::DarkGray)),
+                    Span::styled(summary, Style::default().fg(Color::DarkGray)),
                 ]));
-                layout.hits.push(hit);
+                layout.hits.push(hit.clone());
             }
         }
         ItemKind::Reply if !source.is_foreground => {
             for line in item.text.lines() {
-                for line in wrap_text(line, width.saturating_sub(8) as usize) {
+                let line = worker_id
+                    .map(|id| line.replace(id, "worker"))
+                    .unwrap_or_else(|| line.to_string());
+                for line in wrap_text(&line, width.saturating_sub(8) as usize) {
                     layout.lines.push(Line::from(Span::styled(
                         format!("{indent}  {line}"),
                         Style::default().fg(Color::Gray),
                     )));
-                    layout.hits.push(hit);
+                    layout.hits.push(hit.clone());
                 }
             }
         }
@@ -3574,6 +3890,7 @@ fn draw_conversation(
     cache: &mut TurnLayoutCache,
     view: &mut TranscriptView,
     open_trace: Option<usize>,
+    open_worker: Option<&(usize, String)>,
     projection: &mut TurnProjection,
 ) {
     let Some((thread_index, thread)) = foreground_thread(threads) else {
@@ -3604,6 +3921,9 @@ fn draw_conversation(
     for (index, cell) in cells.iter().enumerate() {
         starts.push(total_height);
         let open = open_trace == Some(index);
+        let selected_worker = open_worker
+            .filter(|(turn, _)| *turn == index)
+            .map(|(_, worker)| worker.as_str());
         let is_latest = index == latest;
         let mut revision = cell_revision(thread, cell);
         if open {
@@ -3613,8 +3933,15 @@ fn draw_conversation(
                 .and_then(|turn| worker_revisions.get(turn))
                 .copied()
                 .unwrap_or(0);
+            if let Some(worker) = selected_worker {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                worker.hash(&mut hasher);
+                revision.worker ^= hasher.finish();
+            }
         }
-        let variant = u8::from(is_latest) | (u8::from(open) << 1);
+        let variant = u8::from(is_latest)
+            | (u8::from(open) << 1)
+            | (u8::from(selected_worker.is_some()) << 2);
         let height = cache
             .layout(cell_key(cell), revision, variant, || {
                 turn_cell_layout(
@@ -3627,6 +3954,7 @@ fn draw_conversation(
                     is_latest && foreground_busy,
                     foreground_activity,
                     open,
+                    selected_worker,
                 )
             })
             .lines
@@ -3649,6 +3977,9 @@ fn draw_conversation(
         if end > top && start < bottom {
             anchor_turn.get_or_insert(index);
             let open = open_trace == Some(index);
+            let selected_worker = open_worker
+                .filter(|(turn, _)| *turn == index)
+                .map(|(_, worker)| worker.as_str());
             let is_latest = index == latest;
             let mut revision = cell_revision(thread, cell);
             if open {
@@ -3658,8 +3989,15 @@ fn draw_conversation(
                     .and_then(|turn| worker_revisions.get(turn))
                     .copied()
                     .unwrap_or(0);
+                if let Some(worker) = selected_worker {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    worker.hash(&mut hasher);
+                    revision.worker ^= hasher.finish();
+                }
             }
-            let variant = u8::from(is_latest) | (u8::from(open) << 1);
+            let variant = u8::from(is_latest)
+                | (u8::from(open) << 1)
+                | (u8::from(selected_worker.is_some()) << 2);
             let layout = cache.layout(cell_key(cell), revision, variant, || {
                 unreachable!("height pass populated turn layout")
             });
@@ -4763,7 +5101,7 @@ fn turn_cell_badges(thread: &Thread, cell: &TurnCell) -> String {
                 .fold(self_usage.total, |sum, usage| {
                     sum.saturating_add(usage.total)
                 });
-            badges.push(format!("󰏪 total {}", format_count(total)));
+            badges.push(format!("{} total {}", icon::TOKENS, format_count(total)));
         }
     }
     badges.join(" · ")
@@ -4910,29 +5248,31 @@ fn turn_badges(thread: &Thread, turn: Option<&str>, timestamp: u64, show_traces:
                 });
             if show_traces {
                 badges.push(format!(
-                    "󰍛 foreground tokens {} (prompt {} + completion {})",
+                    "{} foreground tokens {} (prompt {} + completion {})",
+                    icon::TOKENS,
                     format_count(self_usage.total),
                     format_count(self_usage.prompt),
                     format_count(self_usage.completion)
                 ));
             }
             badges.push(if show_traces {
-                format!("󰏪 aggregate tokens {}", format_count(total))
+                format!("{} aggregate tokens {}", icon::TOKENS, format_count(total))
             } else {
-                format!("󰏪 total {}", format_count(total))
+                format!("{} total {}", icon::TOKENS, format_count(total))
             });
         }
     } else if let Some(turn) = turn.and_then(|value| value.parse::<u64>().ok()) {
         if let Some((prompt, completion, total)) = thread.usage.get(&turn) {
             if show_traces {
                 badges.push(format!(
-                    "󰍛 reported tokens {} (prompt {} + completion {})",
+                    "{} reported tokens {} (prompt {} + completion {})",
+                    icon::TOKENS,
                     format_count(*total),
                     format_count(*prompt),
                     format_count(*completion)
                 ));
             } else {
-                badges.push(format!("󰏪 total {}", format_count(*total)));
+                badges.push(format!("{} total {}", icon::TOKENS, format_count(*total)));
             }
         }
     }
@@ -4973,6 +5313,73 @@ fn api_target(arguments: &str) -> Option<String> {
         .map(|(index, _)| index)
         .unwrap_or(rest.len());
     Some(rest[..end].to_string())
+}
+
+fn tool_icon(name: &str) -> &'static str {
+    let name = name.to_ascii_lowercase();
+    if name.contains("browser") || name.contains("http") || name.contains("fetch") {
+        icon::BROWSER
+    } else if name.contains("search") || name.contains("grep") || name.contains("glob") {
+        icon::SEARCH
+    } else if name.contains("file") || name.contains("read") || name.contains("write") {
+        icon::FILE
+    } else {
+        icon::TOOL
+    }
+}
+
+fn flattened_list_parts(line: &str) -> Option<Vec<&str>> {
+    let parts = line.split(" - ").collect::<Vec<_>>();
+    (parts.len() >= 3
+        && parts[1..]
+            .iter()
+            .all(|part| part.trim().chars().count() >= 2))
+    .then_some(parts)
+}
+
+fn markdown_body_lines(text: &str, width: usize, color: Color) -> Vec<Line<'static>> {
+    let base = Style::default().fg(color);
+    let mut lines = Vec::new();
+    for source in text.split('\n') {
+        if source.trim().is_empty() {
+            lines.push(Line::raw(""));
+            continue;
+        }
+        let trimmed = source.trim();
+        let explicit = ["- ", "* ", "• "]
+            .into_iter()
+            .find_map(|marker| trimmed.strip_prefix(marker));
+        let (lead, entries) = if let Some(entry) = explicit {
+            (None, vec![entry])
+        } else if let Some(parts) = flattened_list_parts(trimmed) {
+            (Some(parts[0]), parts[1..].to_vec())
+        } else {
+            (Some(trimmed), Vec::new())
+        };
+        if let Some(lead) = lead.filter(|lead| !lead.trim().is_empty()) {
+            for chunk in wrap_text(lead, width) {
+                let mut row = vec![Span::raw("    ")];
+                row.extend(styled_markdown(&chunk, base));
+                lines.push(Line::from(row));
+            }
+        }
+        for entry in entries {
+            let chunks = wrap_text(entry.trim(), width.saturating_sub(2));
+            for (index, chunk) in chunks.into_iter().enumerate() {
+                let mut row = if index == 0 {
+                    vec![
+                        Span::raw("    "),
+                        Span::styled(format!("{} ", icon::BULLET), base),
+                    ]
+                } else {
+                    vec![Span::raw("      ")]
+                };
+                row.extend(styled_markdown(&chunk, base));
+                lines.push(Line::from(row));
+            }
+        }
+    }
+    lines
 }
 
 /// Wrap text at word boundaries, hard-splitting only words wider than the view.
@@ -5187,6 +5594,25 @@ fn worker_activity_summary(agent_infos: &HashMap<String, AgentInfo>) -> Option<S
     (!parts.is_empty()).then(|| format!(" {} ", parts.join(" · ")))
 }
 
+fn footer_mode_text(open_trace: Option<usize>, turns: usize) -> String {
+    match open_trace {
+        Some(turn) => format!(
+            "{} TRACE · turn {}/{} · arrows select · Pg scroll · End live",
+            icon::EXPANDED,
+            turn + 1,
+            turns
+        ),
+        None => format!("{} TRACE", icon::COLLAPSED),
+    }
+}
+
+fn footer_controls(open_trace: Option<usize>, turns: usize) -> String {
+    format!(
+        " 󰀄 AGENTS ·  HELP · {} · 󰋼 INFO ",
+        footer_mode_text(open_trace, turns)
+    )
+}
+
 fn draw_statusline(
     f: &mut Frame,
     area: Rect,
@@ -5195,6 +5621,8 @@ fn draw_statusline(
     threads: &[Thread],
     config: &tachyon_util::config::Config,
     session_label: &str,
+    open_trace: Option<usize>,
+    view: &TranscriptView,
 ) {
     let (dtext, dbg) = match daemon {
         Some(info) if info.provider_ready => (" ● ".to_string(), Color::Green),
@@ -5210,7 +5638,7 @@ fn draw_statusline(
     );
     let state = Span::styled(dtext, Style::default().fg(dbg).add_modifier(Modifier::BOLD));
     let activity = worker_activity_summary(agent_infos);
-    let controls = " 󰀄 AGENTS ·  HELP · 󰈈 INLINE TRACES · 󰋼 INFO ";
+    let controls = footer_controls(open_trace, view.turns);
     let session = (session_label == "fresh")
         .then(|| Span::styled(" FRESH ", Style::default().fg(Color::DarkGray)));
     let cwd = Span::styled(
@@ -6187,6 +6615,7 @@ mod tests {
                 false,
                 "working",
                 false,
+                None,
             );
             let text = layout
                 .lines
@@ -6340,6 +6769,22 @@ mod tests {
     }
 
     #[test]
+    fn activity_indicator_requires_unseen_rows_below_viewport() {
+        let scroll = TranscriptScroll {
+            top: 10,
+            follow: false,
+            new_activity: true,
+            seen_latest_revision: 2,
+        };
+        assert!(!should_show_activity(&scroll, 30, 20));
+        assert!(should_show_activity(&scroll, 31, 20));
+
+        let mut quiet = scroll.clone();
+        quiet.new_activity = false;
+        assert!(!should_show_activity(&quiet, 31, 20));
+    }
+
+    #[test]
     fn turn_cache_retains_one_layout_per_turn_and_clears_old_width() {
         let mut thread = Thread::new_foreground();
         for index in 0..200 {
@@ -6414,6 +6859,7 @@ mod tests {
             false,
             "",
             false,
+            None,
         );
         let collapsed_text = collapsed
             .lines
@@ -6437,6 +6883,7 @@ mod tests {
             false,
             "",
             true,
+            None,
         );
         assert!(open
             .lines
@@ -6446,6 +6893,315 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.to_string().contains("raw diagnostic detail")));
+    }
+
+    #[test]
+    fn resting_turn_layout_matches_main_conversation_lines() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        thread.add_turn(ItemKind::Reply, "answer".into(), Some("2".into()));
+        thread.add_turn(ItemKind::System, "diagnostic".into(), Some("2".into()));
+        let cells = build_turn_cells(&thread);
+        let latest = latest_conversation_timestamp(&thread, &cells[0]);
+        let expected = main_conversation_layout(&thread, &cells[0], 80, latest, false, "");
+        let resting = turn_cell_layout(
+            0,
+            0,
+            std::slice::from_ref(&thread),
+            &cells[0],
+            80,
+            latest,
+            false,
+            "",
+            false,
+            None,
+        );
+        assert_eq!(resting.lines, expected.lines);
+    }
+
+    #[test]
+    fn selected_trace_orders_and_indents_model_and_worker_hierarchy() {
+        let worker_id = "worker-123456789-secret";
+        let mut threads = vec![Thread::new_foreground()];
+        threads[0].add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        threads[0].add_turn(ItemKind::Reply, "answer".into(), Some("2".into()));
+        threads[0].add_turn(
+            ItemKind::System,
+            "[timing] completed 1048ms".into(),
+            Some("2".into()),
+        );
+        threads[0].add_turn(
+            ItemKind::Spawn,
+            format!("worker {worker_id}: Check release evidence"),
+            Some("2".into()),
+        );
+        threads[0].add_turn(
+            ItemKind::Error,
+            format!("work {worker_id}: Check release evidence\nreview failed: stale evidence"),
+            Some("2".into()),
+        );
+        let worker = find_or_create_thread(&mut threads, worker_id, false, None);
+        threads[worker].add_tool(
+            "agent_browser {\"action\":\"get\"}".into(),
+            "tool-1".into(),
+            Some("2".into()),
+        );
+        threads[worker].add_turn(ItemKind::Reply, "Evidence checked".into(), Some("2".into()));
+
+        let cells = build_turn_cells(&threads[0]);
+        let latest = latest_conversation_timestamp(&threads[0], &cells[0]);
+        let lines = turn_cell_layout(
+            0,
+            0,
+            &threads,
+            &cells[0],
+            100,
+            latest,
+            false,
+            "",
+            true,
+            Some(worker_id),
+        )
+        .lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+        let model = lines
+            .iter()
+            .position(|line| line.contains("Model"))
+            .unwrap();
+        let agents = lines
+            .iter()
+            .position(|line| line.contains("Agents"))
+            .unwrap();
+        let worker_heading = lines
+            .iter()
+            .position(|line| line.contains("Check release evidence"))
+            .unwrap();
+        let worker_tool = lines
+            .iter()
+            .position(|line| line.contains("agent_browser"))
+            .unwrap();
+        assert!(model < agents && agents < worker_heading && worker_heading < worker_tool);
+        assert!(lines[worker_heading].contains(icon::EXPANDED));
+        assert!(lines[worker_tool].contains("      "));
+        assert!(lines.iter().any(|line| line.contains("review failed")));
+        assert!(lines.iter().any(|line| line.contains("1.0s")));
+        assert!(!lines.iter().any(|line| line.contains(worker_id)));
+        assert!(lines.iter().any(|line| line.contains("worker-1")));
+    }
+
+    #[test]
+    fn trace_summary_counts_are_singular_plural_and_non_repetitive() {
+        assert_eq!(trace_count_summary(1, 1, 0), "  trace · 1 tool");
+        assert_eq!(trace_count_summary(1, 0, 1), "  trace · 1 agent");
+        assert_eq!(
+            trace_count_summary(5, 2, 1),
+            "  trace · 5 events · 2 tools · 1 agent"
+        );
+        assert_eq!(
+            trace_count_summary(6, 1, 2),
+            "  trace · 6 events · 1 tool · 2 agents"
+        );
+    }
+
+    #[test]
+    fn trace_timing_uses_human_duration() {
+        assert_eq!(
+            trace_summary("[timing] completed 1048ms"),
+            format!("{} turn completed · 1.0s", icon::SUCCESS)
+        );
+        assert_eq!(
+            trace_summary("[timing] ready 420ms"),
+            format!("{} ready · +420ms", icon::WAITING)
+        );
+    }
+
+    #[test]
+    fn semantic_icon_mapping_detects_tool_families() {
+        assert_eq!(tool_icon("agent_browser"), icon::BROWSER);
+        assert_eq!(tool_icon("web_search"), icon::SEARCH);
+        assert_eq!(tool_icon("read_file"), icon::FILE);
+        assert_eq!(tool_icon("shell"), icon::TOOL);
+        for value in [
+            icon::MODEL,
+            icon::AGENT,
+            icon::DURATION,
+            icon::TOKENS,
+            icon::RUNNING,
+            icon::WAITING,
+            icon::SUCCESS,
+            icon::WARNING,
+            icon::FAILURE,
+            icon::COLLAPSED,
+            icon::EXPANDED,
+        ] {
+            assert!(!value.is_empty());
+        }
+    }
+
+    #[test]
+    fn model_timeline_compacts_completed_lifecycle_noise() {
+        let mut thread = Thread::new_foreground();
+        for text in [
+            "[timing] model_request_1_started 0ms",
+            "[ready] provider ready",
+            "[working] generating",
+            "[timing] first_visible 6100ms",
+            "[timing] publication_started 42000ms",
+            "commit complete",
+            "[timing] completed 42800ms",
+        ] {
+            thread.add(ItemKind::System, text.into());
+        }
+        thread.add(ItemKind::Error, "provider warning".into());
+        thread.add_tool("search {}".into(), "tool-1".into(), None);
+        let items = (0..thread.items.len())
+            .map(|index| (0, index))
+            .collect::<Vec<_>>();
+        let (timeline, remaining) = compact_model_timeline(&items, &[thread]);
+        assert_eq!(
+            timeline.as_deref(),
+            Some("routed 0ms -> first token 6.1s -> completed 42.8s")
+        );
+        assert_eq!(remaining.len(), 2);
+    }
+
+    #[test]
+    fn closed_worker_is_one_row_and_still_explains_outcome() {
+        let id = "worker-123456789";
+        let mut threads = vec![Thread::new_foreground()];
+        threads[0].add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        threads[0].add_turn(ItemKind::Reply, "answer".into(), Some("2".into()));
+        threads[0].add_turn(
+            ItemKind::Spawn,
+            format!("worker {id}: Inspect release evidence"),
+            Some("2".into()),
+        );
+        let worker = find_or_create_thread(&mut threads, id, false, None);
+        threads[worker].add_turn(ItemKind::Reply, "done".into(), Some("2".into()));
+        let cells = build_turn_cells(&threads[0]);
+        let latest = latest_conversation_timestamp(&threads[0], &cells[0]);
+        let layout = turn_cell_layout(
+            0, 0, &threads, &cells[0], 100, latest, false, "", true, None,
+        );
+        let rows = layout
+            .lines
+            .iter()
+            .filter(|line| line.to_string().contains("Inspect release evidence"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].to_string().contains("complete"));
+        assert!(!layout
+            .lines
+            .iter()
+            .any(|line| line.to_string() == "complete"));
+        assert!(layout
+            .hits
+            .iter()
+            .any(|hit| { matches!(hit, Some(ClickTarget::Worker(0, worker)) if worker == id) }));
+    }
+
+    #[test]
+    fn worker_detail_toggle_keeps_only_one_worker_open() {
+        let mut open = None;
+        toggle_worker(&mut open, 0, "one".into());
+        assert_eq!(open, Some((0, "one".into())));
+        toggle_worker(&mut open, 0, "two".into());
+        assert_eq!(open, Some((0, "two".into())));
+        toggle_worker(&mut open, 0, "two".into());
+        assert_eq!(open, None);
+    }
+
+    #[test]
+    fn worker_normal_details_elide_ids_and_summarize_review_errors() {
+        let id = "worker-123456789-secret";
+        let summary = worker_error_summary(
+            &format!("work {id}: objective\nreview failed: stale evidence from task-77"),
+            Some(id),
+        );
+        assert_eq!(summary, "review failed");
+        assert!(!summary.contains(id));
+        assert_eq!(
+            elide_work_id("work task-77: validating release"),
+            "work · validating release"
+        );
+    }
+
+    #[test]
+    fn markdown_bullets_hang_and_preserve_blank_paragraphs() {
+        let lines = markdown_body_lines(
+            "- first entry wraps onto another line\n\nSummary - alpha item - beta item",
+            16,
+            Color::White,
+        );
+        let text = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(text[0].contains(icon::BULLET));
+        assert!(text.iter().any(|line| line.starts_with("      ")));
+        assert_eq!(text.iter().filter(|line| line.is_empty()).count(), 1);
+        assert_eq!(
+            text.iter()
+                .filter(|line| line.contains(icon::BULLET))
+                .count(),
+            3
+        );
+        assert!(text.iter().any(|line| line.trim() == "Summary"));
+    }
+
+    #[test]
+    fn escape_end_reset_helper_closes_nested_selection_and_follows() {
+        let mut trace = Some(2);
+        let mut worker = Some((2, "worker".into()));
+        let mut scroll = TranscriptScroll {
+            follow: false,
+            new_activity: true,
+            ..TranscriptScroll::default()
+        };
+        assert!(close_trace_details(&mut trace, &mut worker, &mut scroll));
+        assert_eq!(trace, None);
+        assert_eq!(worker, None);
+        assert!(scroll.follow);
+        assert!(!close_trace_details(&mut trace, &mut worker, &mut scroll));
+    }
+
+    #[test]
+    fn footer_trace_mode_is_concise_and_contextual() {
+        assert_eq!(
+            footer_mode_text(None, 3),
+            format!("{} TRACE", icon::COLLAPSED)
+        );
+        assert_eq!(
+            footer_mode_text(Some(1), 3),
+            format!(
+                "{} TRACE · turn 2/3 · arrows select · Pg scroll · End live",
+                icon::EXPANDED
+            )
+        );
+        assert!(!footer_controls(None, 3).contains("INLINE TRACES"));
+    }
+
+    #[test]
+    fn selected_worker_changes_the_single_cached_turn_variant() {
+        let mut cache = TurnLayoutCache::default();
+        let key = CellKey {
+            prompt_timestamp: 1,
+            prompt_index: 0,
+        };
+        let revision = CellRevision {
+            item: 1,
+            metric: 1,
+            worker: 1,
+        };
+        cache.layout(key.clone(), revision, 2, || CellLayout {
+            lines: vec![Line::raw("closed")],
+            hits: vec![None],
+        });
+        cache.layout(key, revision, 6, || CellLayout {
+            lines: vec![Line::raw("worker open")],
+            hits: vec![None],
+        });
+        assert_eq!(cache.layouts.len(), 1);
+        assert_eq!(cache.builds, 2);
     }
 
     #[test]
@@ -6461,8 +7217,24 @@ mod tests {
         );
         let cells = build_turn_cells(&threads[0]);
         let latest = latest_conversation_timestamp(&threads[0], &cells[0]);
-        let layout = turn_cell_layout(0, 0, &threads, &cells[0], 80, latest, false, "", true);
-        assert!(layout
+        let closed = turn_cell_layout(0, 0, &threads, &cells[0], 80, latest, false, "", true, None);
+        assert!(!closed
+            .lines
+            .iter()
+            .any(|line| line.to_string().contains("agent_browser")));
+        let open = turn_cell_layout(
+            0,
+            0,
+            &threads,
+            &cells[0],
+            80,
+            latest,
+            false,
+            "",
+            true,
+            Some("worker-123456"),
+        );
+        assert!(open
             .lines
             .iter()
             .any(|line| line.to_string().contains("agent_browser")));
@@ -7065,8 +7837,10 @@ mod tests {
         let badges = turn_badges(&threads[0], Some("2"), 99_000, false);
         assert!(!badges.contains("󱎫"), "{badges}");
         assert!(badges.contains("󰅐 done 4.5s"), "{badges}");
-        assert!(!badges.contains("󰍛"), "{badges}");
-        assert!(badges.contains("󰏪 total 3.5k"), "{badges}");
+        assert!(
+            badges.contains(&format!("{} total 3.5k", icon::TOKENS)),
+            "{badges}"
+        );
 
         let trace_badges = turn_badges(&threads[0], Some("2"), 99_000, true);
         assert!(
@@ -7078,11 +7852,11 @@ mod tests {
             "{trace_badges}"
         );
         assert!(
-            trace_badges.contains("󰍛 foreground tokens 1.2k"),
+            trace_badges.contains(&format!("{} foreground tokens 1.2k", icon::TOKENS)),
             "{trace_badges}"
         );
         assert!(
-            trace_badges.contains("󰏪 aggregate tokens 3.5k"),
+            trace_badges.contains(&format!("{} aggregate tokens 3.5k", icon::TOKENS)),
             "{trace_badges}"
         );
 
@@ -7102,24 +7876,26 @@ mod tests {
         );
         let compact_badges = turn_badges(&compact_thread, Some("3"), 99_000, false);
         assert!(!compact_badges.contains("󱎫"), "{compact_badges}");
-        assert!(!compact_badges.contains("󰍛"), "{compact_badges}");
         assert!(compact_badges.contains("󰅐 done 4.5s"), "{compact_badges}");
-        assert!(compact_badges.contains("󰏪 total 1.0k"), "{compact_badges}");
+        assert!(
+            compact_badges.contains(&format!("{} total 1.0k", icon::TOKENS)),
+            "{compact_badges}"
+        );
     }
 
     #[test]
     fn trace_summaries_compact_lifecycle_events() {
         assert_eq!(
             trace_summary("[timing] model_request_1_started 0ms"),
-            "󰐊 model request 1 · +0ms"
+            format!("{} model request 1 · +0ms", icon::DURATION)
         );
         assert_eq!(
             trace_summary("[timing] model_request_1_completed 3220ms"),
-            "󰅐 model request 1 · 3220ms"
+            format!("{} model request 1 · 3.2s", icon::SUCCESS)
         );
         assert_eq!(
             trace_summary("[working] I'll check the weather"),
-            "󰔟 working · I'll check the weather"
+            format!("{} working · I'll check the weather", icon::RUNNING)
         );
     }
 
