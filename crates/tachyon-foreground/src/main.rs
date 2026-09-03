@@ -31,7 +31,9 @@ use tachyon_orchestrator::conversation::policy::{
 use tokio::io::AsyncBufReadExt;
 
 const QUEUED_TURN_ACKNOWLEDGEMENT: &str =
-    "Waiting for the earlier result so I can answer this in context.";
+    "Let me pull that together and I'll get back to you shortly.";
+const CONCURRENT_TURN_ACKNOWLEDGEMENT: &str =
+    "Absolutely - I'll handle that while I keep the other request moving.";
 const DEFAULT_ANSWERABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,6 +277,7 @@ async fn run_chat(
         InteractionMetadata,
         bool,
         InteractionDecision,
+        Option<String>,
         TokenUsage,
         std::time::Instant,
     )>(64);
@@ -287,8 +290,16 @@ async fn run_chat(
     let processor_state_changed = Arc::clone(&state_changed);
     let processor_checkpoint_tx = checkpoint_tx.clone();
     tokio::spawn(async move {
-        while let Some((turn, text, metadata, queued, decision, routing_usage, accepted_at)) =
-            turn_rx.recv().await
+        while let Some((
+            turn,
+            text,
+            metadata,
+            queued,
+            decision,
+            acknowledgement,
+            routing_usage,
+            accepted_at,
+        )) = turn_rx.recv().await
         {
             let args = (
                 turn,
@@ -296,6 +307,7 @@ async fn run_chat(
                 metadata,
                 queued,
                 decision,
+                acknowledgement,
                 routing_usage,
                 accepted_at,
                 processor_model.clone(),
@@ -382,6 +394,7 @@ async fn run_chat(
                     metadata,
                     false,
                     InteractionDecision::WaitForActiveTurn,
+                    None,
                     TokenUsage::default(),
                     accepted_at,
                 ))
@@ -394,29 +407,36 @@ async fn run_chat(
             continue;
         }
 
+        let fallback_decision = fallback_interaction_decision(&classifier_context, &text);
         emit_turn(Some(turn), "[status] routing alongside active work".into());
+        if publication_requires_dependency(true, fallback_decision) {
+            emit_queued_turn(turn, None);
+        } else {
+            emit_turn(
+                Some(turn),
+                format!("[status] working {CONCURRENT_TURN_ACKNOWLEDGEMENT}"),
+            );
+        }
         let classifier_tx = turn_tx.clone();
         let classifier_model = model.clone();
         let classifier_active_turns = Arc::clone(&active_turns);
         let classifier_metadata = metadata.clone();
         tokio::spawn(async move {
-            let (decision, usage) = if let Some(model) = classifier_model {
-                tokio::time::timeout(
+            let (decision, acknowledgement, usage) = if let Some(model) = classifier_model {
+                match tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     classify(&model, &classifier_context, &text),
                 )
                 .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or((
-                    InteractionDecision::WaitForActiveTurn,
-                    TokenUsage::default(),
-                ))
+                {
+                    Ok(Ok((decision, Some(acknowledgement), usage))) => {
+                        (decision, Some(acknowledgement), usage)
+                    }
+                    Ok(Ok((_, None, usage))) => (fallback_decision, None, usage),
+                    Ok(Err(_)) | Err(_) => (fallback_decision, None, TokenUsage::default()),
+                }
             } else {
-                (
-                    InteractionDecision::WaitForActiveTurn,
-                    TokenUsage::default(),
-                )
+                (fallback_decision, None, TokenUsage::default())
             };
             emit_event(AgentEvent::Timing {
                 turn,
@@ -430,6 +450,7 @@ async fn run_chat(
                     classifier_metadata,
                     true,
                     decision,
+                    acknowledgement,
                     usage,
                     accepted_at,
                 ))
@@ -450,6 +471,7 @@ async fn process_turn(
         InteractionMetadata,
         bool,
         InteractionDecision,
+        Option<String>,
         TokenUsage,
         std::time::Instant,
         Option<Arc<Model>>,
@@ -467,6 +489,7 @@ async fn process_turn(
         metadata,
         queued,
         decision,
+        acknowledgement,
         mut auxiliary_usage,
         accepted_at,
         model,
@@ -479,7 +502,6 @@ async fn process_turn(
     ) = args;
     let Some(model) = model else {
         if publication_requires_dependency(queued, decision) {
-            emit_queued_turn(turn);
             wait_for_prior_turn(&conversation, &state_changed, turn).await;
         }
         let answer =
@@ -511,8 +533,16 @@ async fn process_turn(
     };
     if queued {
         if publication_requires_dependency(queued, decision) {
-            emit_queued_turn(turn);
+            if let Some(acknowledgement) =
+                acknowledgement.as_deref().and_then(usable_acknowledgement)
+            {
+                emit_queued_turn(turn, Some(&acknowledgement));
+            }
             wait_for_context_or_evidence(&conversation, &state_changed, turn, &text).await;
+        } else if let Some(acknowledgement) =
+            acknowledgement.as_deref().and_then(usable_acknowledgement)
+        {
+            emit_turn(Some(turn), format!("[status] working {acknowledgement}"));
         }
     }
     emit_event(AgentEvent::Timing {
@@ -772,13 +802,27 @@ fn accepted_follow_up_evidence(
     prior_turn: u64,
     incoming: &str,
 ) -> Option<String> {
-    let relevant = evidence
+    let candidates = evidence
         .iter()
         .filter(|record| is_completed_evidence(record.event()))
-        .filter(|record| match record.origin_turn() {
-            Some(origin) => origin == prior_turn,
-            None => evidence_relevant_to_follow_up(record, prior_turn, incoming),
+        .filter(|record| {
+            record
+                .origin_turn()
+                .is_none_or(|origin| origin == prior_turn)
         })
+        .collect::<Vec<_>>();
+    let matched = candidates
+        .iter()
+        .copied()
+        .filter(|record| evidence_relevant_to_follow_up(record, prior_turn, incoming))
+        .collect::<Vec<_>>();
+    let selected = if matched.is_empty() {
+        candidates
+    } else {
+        matched
+    };
+    let relevant = selected
+        .into_iter()
         .filter_map(|record| match record.event() {
             AgentEvent::WorkerCompleted {
                 worker_id,
@@ -803,6 +847,14 @@ fn accepted_follow_up_evidence(
         })
         .collect::<Vec<_>>();
     (!relevant.is_empty()).then(|| bounded_policy_text(&relevant.join("\n\n")))
+}
+
+fn fallback_interaction_decision(active_context: &str, incoming: &str) -> InteractionDecision {
+    if evidence_matches(incoming, active_context) {
+        InteractionDecision::WaitForActiveTurn
+    } else {
+        InteractionDecision::AnswerNow
+    }
 }
 
 fn evidence_matches(incoming: &str, objective: &str) -> bool {
@@ -917,10 +969,13 @@ fn status_event(turn: Option<u64>, status: &str) -> AgentEvent {
     }
 }
 
-fn emit_queued_turn(turn: u64) {
+fn emit_queued_turn(turn: u64, acknowledgement: Option<&str>) {
     emit_turn(
         Some(turn),
-        format!("[status] queued {QUEUED_TURN_ACKNOWLEDGEMENT}"),
+        format!(
+            "[status] queued {}",
+            acknowledgement.unwrap_or(QUEUED_TURN_ACKNOWLEDGEMENT)
+        ),
     );
 }
 
@@ -1977,9 +2032,33 @@ mod tests {
                 message,
             } if phase == "queued" && message == QUEUED_TURN_ACKNOWLEDGEMENT
         ));
+        assert!(!QUEUED_TURN_ACKNOWLEDGEMENT.contains("turn"));
+        assert!(!QUEUED_TURN_ACKNOWLEDGEMENT.contains("queue"));
+        assert!(usable_acknowledgement(CONCURRENT_TURN_ACKNOWLEDGEMENT).is_some());
+    }
+
+    #[test]
+    fn routing_fallback_keeps_unrelated_conversation_moving() {
+        let active = "Active turn 2: get the weather in London";
+        assert_eq!(
+            fallback_interaction_decision(active, "will I need a coat in London?"),
+            InteractionDecision::WaitForActiveTurn
+        );
+        assert_eq!(
+            fallback_interaction_decision(active, "tell me a joke"),
+            InteractionDecision::AnswerNow
+        );
     }
 
     fn completed_evidence(turn: u64, result: impl Into<String>) -> EvidenceRecord {
+        completed_objective_evidence(turn, "inspect the release state", result)
+    }
+
+    fn completed_objective_evidence(
+        turn: u64,
+        objective: &str,
+        result: impl Into<String>,
+    ) -> EvidenceRecord {
         EvidenceRecord::Correlated(EventEnvelope {
             event_id: turn,
             session_id: format!("worker-{turn}"),
@@ -1995,7 +2074,7 @@ mod tests {
             occurred_at_ms: 1,
             kind: AgentEvent::WorkerCompleted {
                 worker_id: format!("worker-{turn}"),
-                objective: "inspect the release state".into(),
+                objective: objective.into(),
                 result: result.into(),
                 artifacts: Vec::new(),
                 context: String::new(),
@@ -2216,6 +2295,19 @@ mod tests {
         assert!(policy.answer_from_context);
         assert!(!policy.force_delegation);
         assert!(!tools_enabled);
+    }
+
+    #[test]
+    fn follow_up_attaches_only_matching_objectives_when_available() {
+        let evidence = [
+            completed_objective_evidence(4, "weather in New York", "New York result"),
+            completed_objective_evidence(4, "weather in London", "London result"),
+        ];
+        let attached = accepted_follow_up_evidence(&evidence, 4, "Do I need a coat in London?")
+            .expect("London evidence");
+
+        assert!(attached.contains("London result"));
+        assert!(!attached.contains("New York result"));
     }
 
     #[test]

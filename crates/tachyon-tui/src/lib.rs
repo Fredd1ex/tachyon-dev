@@ -209,6 +209,29 @@ fn reply_completed_after_later_user(thread: &Thread, item: &Item) -> bool {
     })
 }
 
+fn ready_earlier_turn(threads: &[Thread]) -> Option<u64> {
+    let thread = threads.iter().find(|thread| thread.is_foreground)?;
+    let latest_turn = thread
+        .items
+        .iter()
+        .filter(|item| item.kind == ItemKind::User)
+        .filter_map(|item| item.turn.as_deref()?.parse::<u64>().ok())
+        .max()?;
+    let latest_pending = thread.items.iter().any(|item| {
+        item.kind == ItemKind::PendingReply
+            && item.turn.as_deref().and_then(|turn| turn.parse().ok()) == Some(latest_turn)
+    });
+    latest_pending.then_some(())?;
+    thread
+        .items
+        .iter()
+        .filter(|item| {
+            item.kind == ItemKind::Reply && reply_completed_after_later_user(thread, item)
+        })
+        .filter_map(|item| item.turn.as_deref()?.parse::<u64>().ok())
+        .max()
+}
+
 /// A single agent thread. The foreground thread is root; workers nest under
 /// their parent (or the foreground).
 struct Thread {
@@ -448,11 +471,11 @@ impl Thread {
         };
         self.touch();
         let pending = &mut self.items[index];
-        pending.text = if message.trim().is_empty() {
-            phase.to_string()
-        } else {
-            message.trim().to_string()
-        };
+        if !message.trim().is_empty() {
+            pending.text = message.trim().to_string();
+        } else if pending.text.trim().is_empty() {
+            pending.text = phase.to_string();
+        }
         pending.revision = self.revision;
     }
 
@@ -979,11 +1002,20 @@ fn unix_now_secs() -> u64 {
 }
 
 fn format_age(created_secs: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(created_secs);
-    format_duration(Duration::from_secs(now.saturating_sub(created_secs)))
+    format_elapsed(created_secs, unix_now_secs())
+}
+
+fn format_elapsed(start_secs: u64, end_secs: u64) -> String {
+    format_duration(Duration::from_secs(end_secs.saturating_sub(start_secs)))
+}
+
+fn agent_duration(info: &AgentInfo) -> String {
+    let end_secs = if info.state.is_terminal() {
+        info.last_activity_secs.max(info.created_secs)
+    } else {
+        unix_now_secs()
+    };
+    format_elapsed(info.created_secs, end_secs)
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -1082,6 +1114,12 @@ fn worker_objective(text: &str) -> &str {
 
 fn agent_count(count: usize) -> String {
     format!("{count} agent{}", if count == 1 { "" } else { "s" })
+}
+
+fn bounded_worker_outcomes(spawned: usize, completed: usize, failed: usize) -> (usize, usize) {
+    let completed = completed.min(spawned);
+    let failed = failed.min(spawned.saturating_sub(completed));
+    (completed, failed)
 }
 
 #[allow(dead_code)]
@@ -2289,7 +2327,7 @@ fn classify_line(t: &mut Thread, text: &str) {
         } else {
             t.add(ItemKind::Error, text.to_string());
         }
-    } else if !text.trim().is_empty() {
+    } else if !text.trim().is_empty() && !t.is_foreground {
         // Plain content glues onto whatever the thread was doing.
         t.add(ItemKind::System, text.to_string());
     }
@@ -2626,15 +2664,30 @@ fn pane_control(
 }
 
 fn pane_agent_ids(agent_infos: &HashMap<String, AgentInfo>) -> Vec<String> {
-    let mut ids = Vec::new();
     let mut worker_ids: Vec<String> = agent_infos
         .keys()
         .filter(|id| id.as_str() != FOREGROUND_ID)
         .cloned()
         .collect();
-    worker_ids.sort();
-    ids.extend(worker_ids);
-    ids
+    worker_ids.sort_by(|left, right| {
+        let left = &agent_infos[left];
+        let right = &agent_infos[right];
+        agent_sort_rank(left)
+            .cmp(&agent_sort_rank(right))
+            .then_with(|| right.created_secs.cmp(&left.created_secs))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    worker_ids
+}
+
+fn agent_sort_rank(info: &AgentInfo) -> u8 {
+    match info.state {
+        AgentState::Created | AgentState::Starting | AgentState::Running | AgentState::Staged => 0,
+        AgentState::Waiting => 1,
+        AgentState::Completed if info.retained => 2,
+        AgentState::Failed | AgentState::Interrupted | AgentState::Terminated => 3,
+        AgentState::Completed | AgentState::Released => 4,
+    }
 }
 
 fn daemon_control(action: &str, threads: &mut Vec<Thread>) {
@@ -3105,7 +3158,7 @@ fn main_conversation_layout(
                 None,
             );
             push(Line::raw(""), None);
-            let pending = if active {
+            let pending = if response.text.trim().is_empty() && active {
                 pending_reply_activity(activity, response.turn.is_some())
             } else {
                 pending_reply_activity(&response.text, response.turn.is_some())
@@ -4919,6 +4972,24 @@ fn agent_activity_state(state: AgentState) -> ActivityState {
     }
 }
 
+fn agent_pane_status(info: &AgentInfo, reviewing: bool) -> (&'static str, Color) {
+    if reviewing {
+        return ("reviewing", Color::Yellow);
+    }
+    match info.state {
+        AgentState::Created | AgentState::Starting => ("starting", Color::Yellow),
+        AgentState::Running => ("running", Color::Cyan),
+        AgentState::Waiting => ("waiting", Color::Yellow),
+        AgentState::Staged => ("staged", Color::Yellow),
+        AgentState::Completed if info.retained => ("idle · retained", Color::Green),
+        AgentState::Completed => ("completed", Color::Green),
+        AgentState::Failed => ("failed", Color::Red),
+        AgentState::Interrupted => ("stopped", Color::DarkGray),
+        AgentState::Terminated => ("killed", Color::DarkGray),
+        AgentState::Released => ("released", Color::DarkGray),
+    }
+}
+
 fn state_label(state: ActivityState) -> &'static str {
     match state {
         ActivityState::Ready => "ready",
@@ -5072,6 +5143,7 @@ fn turn_cell_badges(thread: &Thread, cell: &TurnCell) -> String {
             _ => {}
         }
     }
+    let (completed, failed) = bounded_worker_outcomes(spawned, completed, failed);
     let mut badges = Vec::new();
     if spawned > 0 {
         badges.push(format!("󰚩 {}", agent_count(spawned)));
@@ -5117,6 +5189,7 @@ fn turn_worker_progress(thread: &Thread, cell: &TurnCell) -> Option<String> {
             _ => {}
         }
     }
+    let (completed, _) = bounded_worker_outcomes(spawned, completed, 0);
     (spawned > 0).then(|| {
         if completed == 0 {
             format!("󰚩 {} running", agent_count(spawned))
@@ -5160,6 +5233,7 @@ fn turn_badges(thread: &Thread, turn: Option<&str>, timestamp: u64, show_traces:
             item.kind == ItemKind::Error && item.text.starts_with("work ") && in_turn(item)
         })
         .count();
+    let (completed, failed) = bounded_worker_outcomes(spawned, completed, failed);
     let started_at = thread
         .items
         .iter()
@@ -5639,6 +5713,8 @@ fn draw_statusline(
     let state = Span::styled(dtext, Style::default().fg(dbg).add_modifier(Modifier::BOLD));
     let activity = worker_activity_summary(agent_infos);
     let controls = footer_controls(open_trace, view.turns);
+    let ready =
+        ready_earlier_turn(threads).map(|turn| format!("  {} turn {turn} ready ", icon::SUCCESS));
     let session = (session_label == "fresh")
         .then(|| Span::styled(" FRESH ", Style::default().fg(Color::DarkGray)));
     let cwd = Span::styled(
@@ -5658,7 +5734,10 @@ fn draw_statusline(
     let context_span = context.map(|text| Span::styled(text, Style::default().fg(Color::DarkGray)));
     let activity_span =
         activity.map(|text| Span::styled(text, Style::default().fg(Color::DarkGray)));
-    let left_width = brand.content.chars().count() + 2 + controls.chars().count();
+    let left_width = brand.content.chars().count()
+        + 2
+        + controls.chars().count()
+        + ready.as_ref().map_or(0, |text| text.chars().count());
     let mut right_spans = Vec::new();
     let mut right_width = 0usize;
     let mut add_right = |span: Span<'static>| {
@@ -5695,8 +5774,16 @@ fn draw_statusline(
         brand,
         Span::raw("  "),
         Span::styled(controls, Style::default().fg(Color::DarkGray)),
-        Span::raw(" ".repeat(gap as usize)),
     ];
+    if let Some(ready) = ready {
+        line.push(Span::styled(
+            ready,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    line.push(Span::raw(" ".repeat(gap as usize)));
     line.extend(right_spans);
     f.render_widget(Paragraph::new(Line::from(line)), area);
 }
@@ -5754,14 +5841,14 @@ fn draw_agent_pane(
         },
     );
 
-    let header = Row::new(["NAME", "STATUS", "LIFETIME", "REMAINING", "AGE", "TASK"]).style(
+    let header = Row::new(["NAME", "STATUS", "POLICY", "CAPACITY", "DURATION", "TASK"]).style(
         Style::default()
             .fg(Color::Gray)
             .add_modifier(Modifier::BOLD),
     );
     let widths = [
         Constraint::Length(17),
-        Constraint::Length(14),
+        Constraint::Length(16),
         Constraint::Length(19),
         Constraint::Length(15),
         Constraint::Length(9),
@@ -5871,16 +5958,13 @@ fn draw_agent_pane(
                                 .any(|review| review.worker_id == info.id)
                         });
                         let (lifetime, remaining) = agent_lifetime(info);
+                        let (status, status_color) = agent_pane_status(info, reviewing);
                         Row::new(vec![
                             Cell::from(truncate_text(&format!("ghost {id}"), 17)),
-                            Cell::from(if reviewing {
-                                "reviewing"
-                            } else {
-                                state_label(agent_activity_state(info.state))
-                            }),
+                            Cell::from(status).style(Style::default().fg(status_color)),
                             Cell::from(lifetime),
                             Cell::from(remaining),
-                            Cell::from(format_age(info.created_secs)),
+                            Cell::from(agent_duration(info)),
                             Cell::from(truncate_text(
                                 &format!("{} · {}", info.task_type, info.description),
                                 48,
@@ -6559,6 +6643,43 @@ mod tests {
     }
 
     #[test]
+    fn terminal_agent_duration_stops_at_last_activity() {
+        let mut info = agent_info(LifetimeClass::Short);
+        info.created_secs = 100;
+        info.last_activity_secs = 130;
+        info.state = AgentState::Completed;
+
+        assert_eq!(agent_duration(&info), "30s");
+        assert_eq!(agent_pane_status(&info, false).0, "idle · retained");
+
+        info.retained = false;
+        info.state = AgentState::Terminated;
+        assert_eq!(agent_duration(&info), "30s");
+        assert_eq!(agent_pane_status(&info, false).0, "killed");
+    }
+
+    #[test]
+    fn agent_pane_orders_actionable_and_retained_workers_first() {
+        let mut active = agent_info(LifetimeClass::Short);
+        active.id = "active".into();
+        active.created_secs = 10;
+        let mut idle = agent_info(LifetimeClass::Short);
+        idle.id = "idle".into();
+        idle.state = AgentState::Completed;
+        let mut failed = agent_info(LifetimeClass::Short);
+        failed.id = "failed".into();
+        failed.state = AgentState::Failed;
+        failed.retained = false;
+        let infos = HashMap::from([
+            (failed.id.clone(), failed),
+            (idle.id.clone(), idle),
+            (active.id.clone(), active),
+        ]);
+
+        assert_eq!(pane_agent_ids(&infos), ["active", "idle", "failed"]);
+    }
+
+    #[test]
     fn worker_footer_excludes_foreground_and_calls_waiting_idle() {
         let mut foreground = agent_info(LifetimeClass::Long);
         foreground.id = FOREGROUND_ID.into();
@@ -6578,6 +6699,30 @@ mod tests {
     fn agent_counts_use_singular_and_plural_labels() {
         assert_eq!(agent_count(1), "1 agent");
         assert_eq!(agent_count(3), "3 agents");
+    }
+
+    #[test]
+    fn turn_badges_do_not_count_more_outcomes_than_started_workers() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "question".into(), Some("3".into()));
+        thread.add_turn(
+            ItemKind::Spawn,
+            "worker fresh: lookup".into(),
+            Some("3".into()),
+        );
+        for worker in ["old-one", "old-two", "fresh"] {
+            thread.add_turn(
+                ItemKind::SpawnResult,
+                format!("worker {worker}: result"),
+                Some("3".into()),
+            );
+        }
+        let cell = build_turn_cells(&thread).pop().expect("turn cell");
+
+        let badges = turn_cell_badges(&thread, &cell);
+        assert!(badges.contains("󰚩 1 agent"), "{badges}");
+        assert!(badges.contains("󰄬 1 complete"), "{badges}");
+        assert!(!badges.contains("3 complete"), "{badges}");
     }
 
     #[test]
@@ -7476,6 +7621,14 @@ mod tests {
                 message: "using context".into(),
             },
         );
+        apply_agent_event(
+            &mut thread,
+            AgentEvent::Status {
+                turn: Some(3),
+                phase: "working".into(),
+                message: String::new(),
+            },
+        );
 
         assert_eq!(thread.items[1].text, "using context");
         assert_eq!(
@@ -7488,9 +7641,27 @@ mod tests {
                 .iter()
                 .filter(|item| item.kind == ItemKind::System)
                 .count(),
-            2,
+            3,
             "status traces remain available"
         );
+
+        let cell = build_turn_cells(&thread).pop().expect("latest turn");
+        let layout = main_conversation_layout(&thread, &cell, 100, u64::MAX, true, "working");
+        let rendered = layout
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Earlier answer is still running"));
+        assert!(!rendered.contains("working..."));
+    }
+
+    #[test]
+    fn untyped_foreground_output_does_not_leak_into_model_trace() {
+        let mut thread = Thread::new_foreground();
+        classify_line(&mut thread, "**Temperature:** raw worker evidence");
+        assert!(thread.items.is_empty());
     }
 
     #[test]
@@ -7923,6 +8094,16 @@ mod tests {
             revision: 2,
         });
         thread.items.push(Item {
+            kind: ItemKind::PendingReply,
+            text: "Still checking that for you.".into(),
+            hidden: false,
+            output: None,
+            tool_id: None,
+            turn: Some("3".into()),
+            timestamp: 2_000,
+            revision: 2,
+        });
+        thread.items.push(Item {
             kind: ItemKind::Reply,
             text: "late result".into(),
             hidden: false,
@@ -7936,5 +8117,11 @@ mod tests {
             &thread,
             thread.items.last().unwrap()
         ));
+        let threads = vec![thread];
+        assert_eq!(ready_earlier_turn(&threads), Some(2));
+
+        let mut completed = threads;
+        completed[0].items[2].kind = ItemKind::Reply;
+        assert_eq!(ready_earlier_turn(&completed), None);
     }
 }

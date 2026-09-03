@@ -4,7 +4,8 @@
 
 use tachyon_model::{ChatMessage, Completion, Model, ModelError, Role, TokenUsage, ToolSpec};
 use tachyon_orchestrator::conversation::policy::{
-    Answerability, InteractionDecision, ANSWERABILITY_PROMPT, CLASSIFICATION_PROMPT,
+    Answerability, InteractionDecision, InteractionIntake, ANSWERABILITY_PROMPT,
+    CLASSIFICATION_PROMPT,
 };
 use tachyon_orchestrator::conversation::prompt::SYNTHESIS_PROMPT;
 
@@ -73,7 +74,7 @@ pub async fn classify(
     model: &Model,
     active_turn: &str,
     incoming: &str,
-) -> tachyon_model::Result<(InteractionDecision, TokenUsage)> {
+) -> tachyon_model::Result<(InteractionDecision, Option<String>, TokenUsage)> {
     let context = format!("Active turn:\n{active_turn}\n\nIncoming message:\n{incoming}");
     let messages = vec![
         ChatMessage::new(Role::System, CLASSIFICATION_PROMPT),
@@ -81,11 +82,19 @@ pub async fn classify(
     ];
     let mut relay = |_text: &str| {};
     let completion = model.chat(&messages, None, &mut relay).await?;
-    Ok((
-        InteractionDecision::parse(&completion.text)
-            .unwrap_or(InteractionDecision::WaitForActiveTurn),
-        completion.usage,
-    ))
+    let intake = InteractionIntake::parse(&completion.text);
+    Ok(match intake {
+        Some(intake) => (
+            intake.decision,
+            Some(intake.acknowledgement),
+            completion.usage,
+        ),
+        None => (
+            InteractionDecision::WaitForActiveTurn,
+            None,
+            completion.usage,
+        ),
+    })
 }
 
 /// Decide whether an active follow-up already has enough evidence to answer.

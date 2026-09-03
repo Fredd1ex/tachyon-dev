@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const CLASSIFICATION_PROMPT: &str = "Return only `AnswerNow` if the message can be handled independently of active work; otherwise return `WaitForActiveTurn`.";
+pub const CLASSIFICATION_PROMPT: &str = "Classify whether the incoming message can be handled independently of active work. Return exactly one JSON object with `decision` set to `AnswerNow` or `WaitForActiveTurn`, and `acknowledgement` set to one brief, natural response to the incoming message. The acknowledgement may mention what you are checking but must not mention turns, queues, workers, agents, tools, routing, or internal processing. Do not promise an exact completion time. Emit no other text.";
 
 pub const ANSWERABILITY_PROMPT: &str = "Decide whether the request can be answered accurately from conversation and accepted evidence using ordinary reasoning. Choose `AnswerFromContext` for supported advice, interpretation, comparison, explanation, summary, or transformation. Choose `NeedsNewWork` when an essential fact is missing, contradictory, stale, or the request asks for newer, future, or different-scope information. Judge only what was asked: do not demand an unrequested forecast or additional detail. Call the required tool exactly once; emit no prose.";
 
@@ -23,6 +23,20 @@ impl InteractionDecision {
             "WaitForActiveTurn" => Some(Self::WaitForActiveTurn),
             _ => None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractionIntake {
+    pub decision: InteractionDecision,
+    pub acknowledgement: String,
+}
+
+impl InteractionIntake {
+    pub fn parse(text: &str) -> Option<Self> {
+        let intake = serde_json::from_str::<Self>(text.trim()).ok()?;
+        (!intake.acknowledgement.trim().is_empty()).then_some(intake)
     }
 }
 
@@ -152,6 +166,16 @@ mod tests {
             Answerability::parse("explanation"),
             Answerability::NeedsNewWork
         );
+        assert_eq!(
+            InteractionIntake::parse(
+                r#"{"decision":"WaitForActiveTurn","acknowledgement":"Let me pull that together for you."}"#
+            ),
+            Some(InteractionIntake {
+                decision: InteractionDecision::WaitForActiveTurn,
+                acknowledgement: "Let me pull that together for you.".into(),
+            })
+        );
+        assert!(InteractionIntake::parse("WaitForActiveTurn").is_none());
     }
 
     #[test]
