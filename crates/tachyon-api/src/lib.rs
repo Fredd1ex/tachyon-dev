@@ -18,3 +18,5 @@ pub use types::*;
 pub const FOREGROUND_ID: &str = "foreground";
 /// Stable daemon-owned identity for the semantic result reviewer.
 pub const BACKGROUND_ID: &str = "background";
+/// Stable identity of the curated-memory service/agent boundary.
+pub const MEMORY_ID: &str = "memory";

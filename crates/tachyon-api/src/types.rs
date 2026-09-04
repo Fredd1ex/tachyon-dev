@@ -428,10 +428,29 @@ pub enum ApiRequest {
         #[serde(default = "default_history_limit")]
         limit: u32,
     },
+    /// Retrieve bounded private context for one Foreground turn. Tachyond
+    /// enforces retrieval policy and never exposes raw database access.
+    MemoryRecall {
+        query: String,
+        conversation_id: String,
+        turn: u64,
+        #[serde(default = "default_memory_recall_items")]
+        max_items: u32,
+        #[serde(default = "default_memory_recall_chars")]
+        max_chars: u32,
+    },
 }
 
 fn default_history_limit() -> u32 {
     100
+}
+
+fn default_memory_recall_items() -> u32 {
+    12
+}
+
+fn default_memory_recall_chars() -> u32 {
+    6000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -450,6 +469,28 @@ pub struct HistoryEntry {
     pub occurred_at_ms: u64,
     pub role: HistoryRole,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextCompactionCommand {
+    pub request_id: String,
+    pub epoch: u64,
+    pub target_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRecallKind {
+    Preference,
+    TaskHistory,
+    History,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryRecallItem {
+    pub kind: MemoryRecallKind,
+    pub text: String,
+    pub occurred_at_ms: u64,
 }
 
 /// The kind of a streamed event line.
@@ -496,6 +537,24 @@ pub enum AgentEvent {
         prompt_tokens: u32,
         completion_tokens: u32,
         total_tokens: u32,
+        #[serde(default)]
+        context_tokens: u32,
+        #[serde(default)]
+        context_window: Option<u32>,
+    },
+    ContextCompacted {
+        request_id: String,
+        epoch: u64,
+        retained_context_tokens: u32,
+    },
+    MemorySaved {
+        turn: Option<u64>,
+        memory_id: String,
+    },
+    MemoryRecalled {
+        turn: Option<u64>,
+        preference_count: u32,
+        history_count: u32,
     },
     Status {
         turn: Option<u64>,
@@ -629,6 +688,11 @@ pub enum ApiResponse {
     Logs { id: String, lines: Vec<String> },
     /// Canonical user-visible history in chronological order.
     History { entries: Vec<HistoryEntry> },
+    /// Bounded private context assembled by the Memory Agent.
+    MemoryRecall {
+        items: Vec<MemoryRecallItem>,
+        truncated: bool,
+    },
     /// Response to `AgentExec`.
     Exec {
         id: String,
@@ -954,5 +1018,26 @@ mod tests {
             serde_json::to_string(&Actor::Foreground).unwrap(),
             r#"{"kind":"foreground"}"#
         );
+    }
+
+    #[test]
+    fn memory_recall_request_and_events_round_trip() {
+        let request = ApiRequest::MemoryRecall {
+            query: "what did we work on yesterday?".into(),
+            conversation_id: "conversation-1".into(),
+            turn: 7,
+            max_items: 8,
+            max_chars: 4096,
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<ApiRequest>(&wire).unwrap(), request);
+
+        let event = AgentEvent::MemoryRecalled {
+            turn: Some(7),
+            preference_count: 2,
+            history_count: 4,
+        };
+        let wire = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<AgentEvent>(&wire).unwrap(), event);
     }
 }

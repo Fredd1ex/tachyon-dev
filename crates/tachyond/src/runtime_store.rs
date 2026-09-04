@@ -2,7 +2,7 @@ use std::path::Path;
 
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use tachyon_api::types::{AgentInfo, HistoryRole};
+use tachyon_api::types::{AgentInfo, ContextCompactionCommand, HistoryRole};
 
 const SCHEMA_VERSION: u64 = 1;
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -15,6 +15,8 @@ const COMMANDS: TableDefinition<&str, u64> = TableDefinition::new("commands");
 const MIGRATIONS: TableDefinition<&str, u64> = TableDefinition::new("migrations");
 const HISTORY_OUTBOX: TableDefinition<&str, &[u8]> = TableDefinition::new("history_outbox");
 const HISTORY_OUTBOX_ACKS: TableDefinition<&str, u64> = TableDefinition::new("history_outbox_acks");
+const CONTEXT_COMPACTIONS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("context_compactions");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct HistoryProjection {
@@ -52,6 +54,22 @@ struct TaskTransitionRecord {
     task_id: String,
     state: String,
     note: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ContextCompactionRecord {
+    schema_version: u32,
+    request_id: String,
+    agent_id: String,
+    generation: u64,
+    assignment: u64,
+    epoch: u64,
+    context_tokens: u32,
+    context_window: u32,
+    target_tokens: u32,
+    usage_event_id: u64,
+    requested_at_ms: u64,
+    completed_at_ms: Option<u64>,
 }
 
 pub(crate) struct RuntimeStore {
@@ -122,6 +140,9 @@ impl RuntimeStore {
             write
                 .open_table(HISTORY_OUTBOX_ACKS)
                 .map_err(|error| format!("create history outbox acknowledgements: {error}"))?;
+            write
+                .open_table(CONTEXT_COMPACTIONS)
+                .map_err(|error| format!("create context compactions: {error}"))?;
         }
         write
             .commit()
@@ -330,6 +351,138 @@ impl RuntimeStore {
             .map_err(|error| format!("commit history acknowledgement: {error}"))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observe_context_usage(
+        &self,
+        agent_id: &str,
+        generation: u64,
+        assignment: u64,
+        usage_event_id: u64,
+        context_tokens: u32,
+        context_window: u32,
+        occurred_at_ms: u64,
+    ) -> Result<Option<ContextCompactionCommand>, String> {
+        if context_window == 0 {
+            return Ok(None);
+        }
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| error.to_string())?;
+        if (context_tokens as u64) * 100 <= (context_window as u64) * 45 {
+            write
+                .open_table(CONTEXT_COMPACTIONS)
+                .map_err(|error| error.to_string())?
+                .remove(agent_id)
+                .map_err(|error| error.to_string())?;
+            write.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        }
+        if (context_tokens as u64) * 100 < (context_window as u64) * 65 {
+            return Ok(None);
+        }
+        let existing = {
+            let compactions = write
+                .open_table(CONTEXT_COMPACTIONS)
+                .map_err(|error| error.to_string())?;
+            let exists = compactions
+                .get(agent_id)
+                .map_err(|error| error.to_string())?
+                .is_some();
+            exists
+        };
+        if existing {
+            return Ok(None);
+        }
+        let epoch_key = format!("compaction_epoch:{agent_id}");
+        let epoch = {
+            let mut metadata = write
+                .open_table(METADATA)
+                .map_err(|error| error.to_string())?;
+            let previous = metadata
+                .get(epoch_key.as_str())
+                .map_err(|error| error.to_string())?
+                .map(|value| value.value())
+                .unwrap_or(0);
+            let epoch = previous.saturating_add(1);
+            metadata
+                .insert(epoch_key.as_str(), epoch)
+                .map_err(|error| error.to_string())?;
+            epoch
+        };
+        let command = ContextCompactionCommand {
+            request_id: format!("compact:{agent_id}:{epoch}"),
+            epoch,
+            target_tokens: context_window.saturating_mul(45) / 100,
+        };
+        let record = ContextCompactionRecord {
+            schema_version: 1,
+            request_id: command.request_id.clone(),
+            agent_id: agent_id.into(),
+            generation,
+            assignment,
+            epoch,
+            context_tokens,
+            context_window,
+            target_tokens: command.target_tokens,
+            usage_event_id,
+            requested_at_ms: occurred_at_ms,
+            completed_at_ms: None,
+        };
+        let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+        write
+            .open_table(CONTEXT_COMPACTIONS)
+            .map_err(|error| error.to_string())?
+            .insert(agent_id, bytes.as_slice())
+            .map_err(|error| error.to_string())?;
+        write.commit().map_err(|error| error.to_string())?;
+        Ok(Some(command))
+    }
+
+    pub(crate) fn complete_context_compaction(
+        &self,
+        agent_id: &str,
+        request_id: &str,
+        retained_context_tokens: u32,
+        completed_at_ms: u64,
+    ) -> Result<(), String> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| error.to_string())?;
+        let mut record = {
+            let compactions = write
+                .open_table(CONTEXT_COMPACTIONS)
+                .map_err(|error| error.to_string())?;
+            let value = compactions
+                .get(agent_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("no pending compaction for {agent_id}"))?;
+            serde_json::from_slice::<ContextCompactionRecord>(value.value())
+                .map_err(|error| error.to_string())?
+        };
+        if record.request_id != request_id {
+            return Err(format!("stale compaction acknowledgement {request_id}"));
+        }
+        if retained_context_tokens <= record.target_tokens {
+            write
+                .open_table(CONTEXT_COMPACTIONS)
+                .map_err(|error| error.to_string())?
+                .remove(agent_id)
+                .map_err(|error| error.to_string())?;
+            write.commit().map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        record.completed_at_ms = Some(completed_at_ms);
+        let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+        write
+            .open_table(CONTEXT_COMPACTIONS)
+            .map_err(|error| error.to_string())?
+            .insert(agent_id, bytes.as_slice())
+            .map_err(|error| error.to_string())?;
+        write.commit().map_err(|error| error.to_string())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn mark_migration(
         &self,
@@ -439,6 +592,22 @@ mod tests {
     }
 
     #[test]
+    fn moved_runtime_database_reopens_blank() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.redb");
+        {
+            let store = RuntimeStore::open(&path).unwrap();
+            store
+                .persist_task_transition(&task("a", AgentState::Running), "started", None)
+                .unwrap();
+        }
+        std::fs::rename(&path, directory.path().join("runtime.backup")).unwrap();
+        let regenerated = RuntimeStore::open(&path).unwrap();
+        assert!(regenerated.list_tasks().unwrap().is_empty());
+        assert!(regenerated.pending_history().unwrap().is_empty());
+    }
+
+    #[test]
     fn command_id_makes_transition_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let store = RuntimeStore::open(&directory.path().join("runtime.redb")).unwrap();
@@ -513,5 +682,33 @@ mod tests {
         assert!(store.pending_history().unwrap().is_empty());
         store.enqueue_history(&history("event-1")).unwrap();
         assert!(store.pending_history().unwrap().is_empty());
+    }
+
+    #[test]
+    fn context_compaction_uses_threshold_and_hysteresis() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RuntimeStore::open(&directory.path().join("runtime.redb")).unwrap();
+        assert!(store
+            .observe_context_usage("foreground", 0, 0, 1, 649, 1_000, 100)
+            .unwrap()
+            .is_none());
+        let first = store
+            .observe_context_usage("foreground", 0, 0, 2, 650, 1_000, 101)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.epoch, 1);
+        assert_eq!(first.target_tokens, 450);
+        assert!(store
+            .observe_context_usage("foreground", 0, 0, 3, 700, 1_000, 103)
+            .unwrap()
+            .is_none());
+        store
+            .complete_context_compaction("foreground", &first.request_id, 450, 104)
+            .unwrap();
+        let second = store
+            .observe_context_usage("foreground", 0, 0, 5, 700, 1_000, 105)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.epoch, 2);
     }
 }

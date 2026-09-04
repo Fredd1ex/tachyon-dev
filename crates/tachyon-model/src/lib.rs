@@ -282,6 +282,12 @@ pub struct TokenUsage {
     pub completion_tokens: u32,
     #[serde(default)]
     pub total_tokens: u32,
+    /// Largest single prompt observed while aggregating model calls.
+    #[serde(default)]
+    pub context_tokens: u32,
+    /// Configured context window used for the request.
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 impl std::ops::AddAssign for TokenUsage {
@@ -289,6 +295,8 @@ impl std::ops::AddAssign for TokenUsage {
         self.prompt_tokens = self.prompt_tokens.saturating_add(rhs.prompt_tokens);
         self.completion_tokens = self.completion_tokens.saturating_add(rhs.completion_tokens);
         self.total_tokens = self.total_tokens.saturating_add(rhs.total_tokens);
+        self.context_tokens = self.context_tokens.max(rhs.context_tokens);
+        self.context_window = rhs.context_window.or(self.context_window);
     }
 }
 
@@ -780,6 +788,8 @@ impl Model {
             }
         }
 
+        usage.context_tokens = usage.prompt_tokens;
+        usage.context_window = self.context_length;
         Ok(Completion {
             text,
             tool_calls,

@@ -44,7 +44,7 @@ use tachyon_api::types::{
     Actor, AgentEvent, AgentInfo, AgentState, ApiResponse, DaemonInfo, EventEnvelope, EventStream,
     LifetimeClass, WorkOutcome,
 };
-use tachyon_api::{InteractionEvent, InteractionEventEnvelope, FOREGROUND_ID};
+use tachyon_api::{InteractionEvent, InteractionEventEnvelope, FOREGROUND_ID, MEMORY_ID};
 
 use tachyon_client::{Client, Subscription};
 
@@ -1502,7 +1502,7 @@ pub fn run() -> io::Result<()> {
                             agent_infos.clear();
                             for a in &list {
                                 agent_infos.insert(a.id.clone(), a.clone());
-                                if !subscribed.contains_key(&a.id) {
+                                if a.id != MEMORY_ID && !subscribed.contains_key(&a.id) {
                                     subscribed.insert(a.id.clone(), ());
                                     spawn_stream_thread(a.id.clone(), sub_out.clone());
                                 }
@@ -2245,6 +2245,7 @@ fn record_correlated_metrics(threads: &mut Vec<Thread>, envelope: &EventEnvelope
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
+                ..
             },
         ) => {
             threads[root]
@@ -2545,6 +2546,7 @@ fn apply_correlated_agent_event(
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            ..
         } => {
             thread
                 .usage
@@ -2640,6 +2642,35 @@ fn apply_correlated_agent_event(
                 envelope_turn.map(str::to_owned),
             );
         }
+        AgentEvent::ContextCompacted {
+            epoch,
+            retained_context_tokens,
+            ..
+        } => {
+            thread.add_turn(
+                ItemKind::System,
+                format!(
+                    "[context compacted] epoch {epoch} · {retained_context_tokens} tokens retained"
+                ),
+                envelope_turn.map(str::to_owned),
+            );
+        }
+        AgentEvent::MemorySaved { turn, .. } => thread.add_turn(
+            ItemKind::System,
+            "[memory saved] user preference".into(),
+            projected_turn(turn, envelope_turn),
+        ),
+        AgentEvent::MemoryRecalled {
+            turn,
+            preference_count,
+            history_count,
+        } => thread.add_turn(
+            ItemKind::System,
+            format!(
+                "[memory recalled] {preference_count} preferences · {history_count} history items"
+            ),
+            projected_turn(turn, envelope_turn),
+        ),
         AgentEvent::Error { turn, message } => {
             thread.add_turn(
                 ItemKind::Error,
@@ -2787,7 +2818,7 @@ fn pane_control(
 fn pane_agent_ids(agent_infos: &HashMap<String, AgentInfo>) -> Vec<String> {
     let mut worker_ids: Vec<String> = agent_infos
         .keys()
-        .filter(|id| id.as_str() != FOREGROUND_ID)
+        .filter(|id| id.as_str() != FOREGROUND_ID && id.as_str() != MEMORY_ID)
         .cloned()
         .collect();
     worker_ids.sort_by(|left, right| {
@@ -5738,7 +5769,7 @@ fn worker_activity_counts(
     let mut counts = (0, 0, 0, 0);
     for agent in agent_infos
         .values()
-        .filter(|agent| agent.id != FOREGROUND_ID)
+        .filter(|agent| agent.id != FOREGROUND_ID && agent.id != MEMORY_ID)
     {
         match agent.state {
             AgentState::Starting | AgentState::Running => counts.0 += 1,
@@ -5922,7 +5953,7 @@ fn draw_agent_pane(
     };
     let worker_count = agent_infos
         .keys()
-        .filter(|id| id.as_str() != FOREGROUND_ID)
+        .filter(|id| id.as_str() != FOREGROUND_ID && id.as_str() != MEMORY_ID)
         .count();
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -6244,12 +6275,13 @@ fn draw_agent_pane_legacy(
     }
     let worker_count = agent_infos
         .keys()
-        .filter(|id| id.as_str() != FOREGROUND_ID)
+        .filter(|id| id.as_str() != FOREGROUND_ID && id.as_str() != MEMORY_ID)
         .count();
     let active_worker_count = agent_infos
         .values()
         .filter(|info| {
             info.id != FOREGROUND_ID
+                && info.id != MEMORY_ID
                 && matches!(
                     info.state,
                     AgentState::Starting | AgentState::Running | AgentState::Waiting
@@ -7679,6 +7711,33 @@ mod tests {
     }
 
     #[test]
+    fn memory_lifecycle_events_are_visible_on_the_correlated_turn() {
+        let mut thread = Thread::new_foreground();
+        apply_agent_event(
+            &mut thread,
+            AgentEvent::MemorySaved {
+                turn: Some(2),
+                memory_id: "preference-1".into(),
+            },
+        );
+        apply_agent_event(
+            &mut thread,
+            AgentEvent::MemoryRecalled {
+                turn: Some(3),
+                preference_count: 1,
+                history_count: 4,
+            },
+        );
+        assert_eq!(thread.items[0].text, "[memory saved] user preference");
+        assert_eq!(thread.items[0].turn.as_deref(), Some("2"));
+        assert_eq!(
+            thread.items[1].text,
+            "[memory recalled] 1 preferences · 4 history items"
+        );
+        assert_eq!(thread.items[1].turn.as_deref(), Some("3"));
+    }
+
+    #[test]
     fn reserved_reply_is_reconciled_and_filled_in_place() {
         let mut thread = Thread::new_foreground();
         thread.add(ItemKind::User, "hello".into());
@@ -8171,6 +8230,8 @@ mod tests {
                     prompt_tokens: 1_000,
                     completion_tokens: 200,
                     total_tokens: 1_200,
+                    context_tokens: 1_000,
+                    context_window: Some(10_000),
                 },
             ),
         ] {
@@ -8183,6 +8244,8 @@ mod tests {
                 prompt_tokens: 2_000,
                 completion_tokens: 300,
                 total_tokens: 2_300,
+                context_tokens: 2_000,
+                context_window: Some(10_000),
             },
         );
         worker.actor = Actor::Worker {

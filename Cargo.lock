@@ -2356,6 +2356,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "tachyon-api",
+ "tachyon-memory",
  "tachyon-util",
  "tempfile",
 ]

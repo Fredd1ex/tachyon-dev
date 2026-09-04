@@ -243,6 +243,70 @@ impl HistoryStore {
         }
         Ok(result)
     }
+
+    pub(crate) fn recall_between(
+        &self,
+        start_ms: u64,
+        end_ms: u64,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>, String> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| error.to_string())?;
+        let index = read
+            .open_table(ACTIVITY_BY_TIME)
+            .map_err(|error| error.to_string())?;
+        let messages = read
+            .open_table(MESSAGES)
+            .map_err(|error| error.to_string())?;
+        let start = temporal_key(start_ms, "");
+        let end = temporal_key(end_ms, "");
+        let query_tokens = search_tokens(query);
+        let mut ranked = Vec::new();
+        for entry in index
+            .range(start.as_str()..end.as_str())
+            .map_err(|error| error.to_string())?
+            .rev()
+            .take(200)
+        {
+            let (_, event_id) = entry.map_err(|error| error.to_string())?;
+            let value = messages
+                .get(event_id.value())
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "history index references a missing message".to_string())?;
+            let message: HistoryMessage = serde_json::from_slice(value.value())
+                .map_err(|error| format!("decode history message: {error}"))?;
+            if message.text.trim().eq_ignore_ascii_case(query.trim()) {
+                continue;
+            }
+            let candidate_tokens = search_tokens(&message.text);
+            let score = query_tokens
+                .iter()
+                .filter(|token| candidate_tokens.contains(*token))
+                .count();
+            ranked.push((score, message));
+        }
+        ranked.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| right.occurred_at_ms.cmp(&left.occurred_at_ms))
+                .then_with(|| left.event_id.cmp(&right.event_id))
+        });
+        Ok(ranked
+            .into_iter()
+            .take(limit)
+            .map(|(_, message)| HistoryEntry {
+                event_id: message.event_id,
+                conversation_id: message.conversation_id,
+                turn_id: message.turn_id,
+                occurred_at_ms: message.occurred_at_ms,
+                role: message.role,
+                text: message.text,
+            })
+            .collect())
+    }
 }
 
 fn temporal_key(occurred_at_ms: u64, event_id: &str) -> String {
@@ -251,6 +315,17 @@ fn temporal_key(occurred_at_ms: u64, event_id: &str) -> String {
 
 fn day_key(occurred_at_ms: u64, event_id: &str) -> String {
     format!("{:010}:{event_id}", occurred_at_ms / 86_400_000)
+}
+
+fn search_tokens(text: &str) -> std::collections::BTreeSet<String> {
+    const STOP_WORDS: [&str; 19] = [
+        "about", "after", "before", "could", "doing", "from", "have", "history", "last", "past",
+        "please", "remember", "that", "this", "what", "when", "were", "with", "worked",
+    ];
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|token| token.len() > 2 && !STOP_WORDS.contains(&token.as_str()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -294,5 +369,42 @@ mod tests {
         let records = store.activity_between(100, 200, 10).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].text, "inside");
+    }
+
+    #[test]
+    fn recall_ranks_matching_recent_history_and_excludes_the_query() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(&directory.path().join("history.redb")).unwrap();
+        store
+            .apply(&projection(
+                "rust",
+                100,
+                "Implemented Rust memory retrieval",
+            ))
+            .unwrap();
+        store
+            .apply(&projection("other", 200, "Discussed the weather"))
+            .unwrap();
+        store
+            .apply(&projection("query", 300, "What did we do on Rust memory?"))
+            .unwrap();
+        let records = store
+            .recall_between(0, 400, "What did we do on Rust memory?", 2)
+            .unwrap();
+        assert_eq!(records[0].event_id, "rust");
+        assert!(records.iter().all(|entry| entry.event_id != "query"));
+    }
+
+    #[test]
+    fn deleted_history_database_reopens_blank() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.redb");
+        {
+            let store = HistoryStore::open(&path).unwrap();
+            store.apply(&projection("event", 100, "saved")).unwrap();
+        }
+        std::fs::remove_file(&path).unwrap();
+        let regenerated = HistoryStore::open(&path).unwrap();
+        assert!(regenerated.activity_between(0, 200, 10).unwrap().is_empty());
     }
 }

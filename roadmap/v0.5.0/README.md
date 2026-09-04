@@ -1,19 +1,19 @@
 # v0.5.0 - Memory And Continuity
 
-Estimated progress: **25%**. Status: **Early**.
+Estimated progress: **40%**. Status: **In progress**.
 
 ## Scope
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| context-length tracking | Partial | Context fitting and character bounds exist; per-call token-budget accounting and scheduling do not. |
-| compaction scheduling | Early | Some history/tool-output compaction exists, but no durable compaction jobs or context epochs. |
-| Memory Agent | Missing | The Memory service now owns typed curated redb records and revocations, but it is not yet a memory-reasoning actor. |
+| context-length tracking | Partial | Per-call context use and configured windows drive scheduling; hard per-role token budgets remain. |
+| compaction scheduling | Partial | Tachyond durably schedules at 65% of the configured context window, signals the model owner, and records epoch acknowledgements; semantic summary generation remains. |
+| Memory Agent | Partial | The managed identity observes explicit preferences, validates durable records, serves private recall, and emits TUI indicators; model-proposed corrections remain. |
 | snapshots | Partial | Conversation and IPython checkpoints exist; complete versioned runtime snapshots do not. |
 | generation rollover | Partial | Worker generations guard some stale process updates, but rollover is not a durable end-to-end protocol. |
 | research memories | Early | Foreground can retain correlated evidence locally; there is no durable typed research-memory model. |
 | failure reuse | Missing | Failures are not indexed and retrieved as reusable evidence. |
-| retrieval | Early | History has a bounded typed temporal API and CLI; scoped curated-memory retrieval and policy filtering remain. |
+| retrieval | Partial | Redb temporal indexes and policy-filtered lexical preference/history ranking serve bounded typed recall; semantic ranking remains. |
 | long-running continuity | Partial | Persistent workers and limited checkpoints exist, but full daemon restart does not restore coherent active work and conversation state. |
 
 ## Dependencies
@@ -39,8 +39,8 @@ Estimated progress: **25%**. Status: **Early**.
 
 ## Next Work
 
-1. Add scoped bounded retrieval over `memories.redb` for the Memory Agent.
-2. Add runtime snapshot and compaction scheduling over `runtime.redb`.
-3. Implement the Memory Agent proposal and validation loop.
+1. Add semantic summary generation to the durable compaction protocol.
+2. Implement model-proposed preference correction and confirmation flows.
+3. Evaluate hybrid embedding retrieval once lexical ranking has representative scale tests.
 4. Implement generation rollover and stale-publication tests.
 5. Add research-memory and failure-reuse indexes.

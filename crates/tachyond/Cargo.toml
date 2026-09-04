@@ -17,6 +17,7 @@ tachyon-api.workspace = true
 tachyon-util.workspace = true
 signal-hook.workspace = true
 nix.workspace = true
+tachyon-memory = { path = "../memory" }
 
 [dev-dependencies]
 tempfile.workspace = true

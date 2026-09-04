@@ -16,18 +16,20 @@ use nix::unistd::Pid;
 use tachyon_api::types::{
     AgentEvent as StructuredAgentEvent, AgentInfo, AgentState, ApiRequest, ApiResponse,
     BackgroundCoordinatorInfo, DaemonInfo, EventEnvelope, EventStream, HistoryRole,
-    LifecycleRecommendation, LifetimeClass, PendingWorkReviewInfo, WorkOutcome, WorkRequest,
-    WorkResult, WorkReviewContext, WorkReviewDecision, WorkReviewFailure, WorkReviewRecommendation,
-    WorkReviewRequest, PROTO_VERSION,
+    LifecycleRecommendation, LifetimeClass, MemoryRecallItem, MemoryRecallKind,
+    PendingWorkReviewInfo, WorkOutcome, WorkRequest, WorkResult, WorkReviewContext,
+    WorkReviewDecision, WorkReviewFailure, WorkReviewRecommendation, WorkReviewRequest,
+    PROTO_VERSION,
 };
 use tachyon_api::{
     InteractionCommand, InteractionCommandEnvelope, InteractionEvent, InteractionEventEnvelope,
-    InteractionMetadata, BACKGROUND_ID, FOREGROUND_ID,
+    InteractionMetadata, BACKGROUND_ID, FOREGROUND_ID, MEMORY_ID,
 };
 use tachyon_util::guard;
 
 use crate::history_store::HistoryStore;
 use crate::runtime_store::{HistoryProjection, RuntimeStore, RuntimeTaskRecord};
+use tachyon_memory::{explicit_preference, MemoryStore, PreferenceObservation};
 
 const DEFAULT_BACKGROUND_REVIEW_TIMEOUT_SECS: u64 = 20;
 
@@ -80,6 +82,9 @@ struct Registry {
     background_generation: u64,
     runtime_store: Option<Arc<RuntimeStore>>,
     history_store: Option<Arc<HistoryStore>>,
+    memory_store: Option<Arc<MemoryStore>>,
+    memory_started_secs: u64,
+    memory_last_activity_secs: u64,
 }
 
 impl Default for Registry {
@@ -93,6 +98,9 @@ impl Default for Registry {
             background_generation: 0,
             runtime_store: None,
             history_store: None,
+            memory_store: None,
+            memory_started_secs: unix_now(),
+            memory_last_activity_secs: 0,
         }
     }
 }
@@ -150,8 +158,42 @@ impl Registry {
 
     fn sorted(&self) -> Vec<AgentInfo> {
         let mut agents: Vec<AgentInfo> = self.tasks.values().map(|t| t.info.clone()).collect();
+        agents.push(memory_agent_info(
+            self.memory_started_secs,
+            self.memory_last_activity_secs,
+        ));
         agents.sort_by(|a, b| b.created_secs.cmp(&a.created_secs));
         agents
+    }
+}
+
+fn memory_agent_info(created_secs: u64, last_activity_secs: u64) -> AgentInfo {
+    AgentInfo {
+        id: MEMORY_ID.into(),
+        task: "Curate durable memory and support context compaction.".into(),
+        state: AgentState::Running,
+        pid: None,
+        workspace: tachyon_util::daemon::databases_dir().display().to_string(),
+        created_secs,
+        retained: true,
+        lease_until_secs: None,
+        session_id: MEMORY_ID.into(),
+        lifetime_class: LifetimeClass::Persistent,
+        purpose: "memory".into(),
+        owner: "daemon".into(),
+        last_activity_secs,
+        checkpoint_available: false,
+        turns_used: 0,
+        turn_budget: None,
+        task_type: "memory".into(),
+        description: "curated memory service".into(),
+        persistent: true,
+        sandboxed: false,
+        stage_until_secs: None,
+        logical_task_id: None,
+        origin_turn_id: None,
+        parent_task_id: None,
+        tool_call_id: None,
     }
 }
 
@@ -418,6 +460,278 @@ fn persist_interaction_history(registry: &Arc<Mutex<Registry>>, data: &str) {
     }
     if let Err(error) = project_pending_history(registry) {
         eprintln!("tachyond: project history: {error}");
+    }
+}
+
+fn observe_explicit_preference(registry: &Arc<Mutex<Registry>>, data: &str) {
+    let Ok(envelope) = serde_json::from_str::<InteractionEventEnvelope>(data) else {
+        return;
+    };
+    let InteractionEvent::UserTurnAccepted { text } = &envelope.event else {
+        return;
+    };
+    let Some(record) = explicit_preference(PreferenceObservation {
+        event_id: &envelope.metadata.message_id,
+        conversation_id: &envelope.metadata.conversation_id,
+        turn_id: envelope.metadata.turn_id.as_deref(),
+        text,
+        occurred_at_ms: envelope.metadata.occurred_at_ms,
+    }) else {
+        return;
+    };
+    let store = registry.lock().unwrap().memory_store.clone();
+    let Some(store) = store else {
+        eprintln!("tachyond: memory store missing for preference observation");
+        return;
+    };
+    if let Err(error) = store.put(&record) {
+        eprintln!("tachyond: save preference {}: {error}", record.id);
+        return;
+    }
+    let turn = envelope
+        .metadata
+        .turn_id
+        .as_deref()
+        .and_then(|turn| turn.parse::<u64>().ok());
+    emit_memory_event(
+        registry,
+        envelope.metadata.conversation_id,
+        envelope.metadata.turn_id,
+        StructuredAgentEvent::MemorySaved {
+            turn,
+            memory_id: record.id,
+        },
+    );
+}
+
+fn emit_memory_event(
+    registry: &Arc<Mutex<Registry>>,
+    conversation_id: String,
+    turn_id: Option<String>,
+    kind: StructuredAgentEvent,
+) {
+    registry.lock().unwrap().memory_last_activity_secs = unix_now();
+    let sequence = DAEMON_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let envelope = EventEnvelope {
+        event_id: sequence,
+        session_id: MEMORY_ID.into(),
+        conversation_id: Some(conversation_id),
+        turn_id,
+        task_id: None,
+        parent_task_id: None,
+        tool_call_id: None,
+        actor: tachyon_api::Actor::System,
+        sequence,
+        occurred_at_ms: unix_now_ms(),
+        kind,
+    };
+    if let Ok(data) = serde_json::to_string(&envelope) {
+        push_event(registry, FOREGROUND_ID, EventStream::Stdout, &data);
+    }
+}
+
+fn wants_history_recall(query: &str) -> bool {
+    let query = query.to_ascii_lowercase();
+    [
+        "history",
+        "what did we",
+        "what were we",
+        "worked on",
+        "working on",
+        "previously",
+        "earlier",
+        "yesterday",
+        "last week",
+        "last monday",
+        "last tuesday",
+        "last wednesday",
+        "last thursday",
+        "last friday",
+        "last saturday",
+        "last sunday",
+    ]
+    .iter()
+    .any(|marker| query.contains(marker))
+}
+
+fn history_recall_window(query: &str, now_ms: u64) -> (u64, u64) {
+    const DAY_MS: u64 = 86_400_000;
+    let query = query.to_ascii_lowercase();
+    let today = now_ms / DAY_MS;
+    if query.contains("yesterday") {
+        return (
+            today.saturating_sub(1) * DAY_MS,
+            today.saturating_mul(DAY_MS),
+        );
+    }
+    if query.contains("today") {
+        return (today.saturating_mul(DAY_MS), now_ms.saturating_add(1));
+    }
+    let weekdays = [
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    ];
+    if query.contains("last ") {
+        if let Some(target) = weekdays
+            .iter()
+            .position(|weekday| query.contains(&format!("last {weekday}")))
+        {
+            // 1970-01-01 was Thursday. Weekday indices use Monday = 0.
+            let current = ((today + 3) % 7) as usize;
+            let mut days_back = (current + 7 - target) % 7;
+            if days_back == 0 {
+                days_back = 7;
+            }
+            let day = today.saturating_sub(days_back as u64);
+            return (day * DAY_MS, day.saturating_add(1) * DAY_MS);
+        }
+    }
+    if query.contains("last week") || query.contains("recently") {
+        return (now_ms.saturating_sub(7 * DAY_MS), now_ms.saturating_add(1));
+    }
+    (0, now_ms.saturating_add(1))
+}
+
+fn recall_task_history(
+    store: &RuntimeStore,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<MemoryRecallItem>, String> {
+    let query_tokens = recall_tokens(query);
+    let mut ranked = store
+        .list_tasks()?
+        .into_iter()
+        .map(|record| {
+            let searchable = format!(
+                "{} {} {}",
+                record.info.task, record.info.purpose, record.info.description
+            );
+            let candidate_tokens = recall_tokens(&searchable);
+            let score = query_tokens
+                .iter()
+                .filter(|token| candidate_tokens.contains(*token))
+                .count();
+            (score, record)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| {
+                right
+                    .info
+                    .last_activity_secs
+                    .cmp(&left.info.last_activity_secs)
+            })
+            .then_with(|| left.info.id.cmp(&right.info.id))
+    });
+    Ok(ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, record)| MemoryRecallItem {
+            kind: MemoryRecallKind::TaskHistory,
+            text: format!(
+                "{} [{}]: {}",
+                record.info.id, record.info.state, record.info.task
+            ),
+            occurred_at_ms: record
+                .info
+                .last_activity_secs
+                .max(record.info.created_secs)
+                .saturating_mul(1000),
+        })
+        .collect())
+}
+
+fn recall_tokens(text: &str) -> std::collections::BTreeSet<String> {
+    const STOP_WORDS: [&str; 17] = [
+        "about", "could", "doing", "from", "have", "history", "last", "past", "please", "remember",
+        "that", "this", "what", "when", "were", "with", "worked",
+    ];
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|token| token.len() > 2 && !STOP_WORDS.contains(&token.as_str()))
+        .collect()
+}
+
+fn handle_context_compaction(registry: &Arc<Mutex<Registry>>, agent_id: &str, data: &str) {
+    let Ok(envelope) = serde_json::from_str::<EventEnvelope>(data) else {
+        return;
+    };
+    if let StructuredAgentEvent::ContextCompacted {
+        request_id,
+        retained_context_tokens,
+        ..
+    } = &envelope.kind
+    {
+        let store = registry.lock().unwrap().runtime_store.clone();
+        if let Some(store) = store {
+            if let Err(error) = store.complete_context_compaction(
+                agent_id,
+                request_id,
+                *retained_context_tokens,
+                envelope.occurred_at_ms,
+            ) {
+                eprintln!("tachyond: complete context compaction: {error}");
+            }
+        }
+        return;
+    }
+    let StructuredAgentEvent::Usage {
+        context_tokens,
+        context_window: Some(context_window),
+        ..
+    } = envelope.kind
+    else {
+        return;
+    };
+    let (store, generation, assignment) = {
+        let registry = registry.lock().unwrap();
+        let Some(task) = registry.tasks.get(agent_id) else {
+            return;
+        };
+        if agent_id != FOREGROUND_ID && !task.warm {
+            return;
+        }
+        (
+            registry.runtime_store.clone(),
+            task.generation,
+            task.assignment,
+        )
+    };
+    let Some(store) = store else { return };
+    let command = match store.observe_context_usage(
+        agent_id,
+        generation,
+        assignment,
+        envelope.event_id,
+        context_tokens,
+        context_window,
+        envelope.occurred_at_ms,
+    ) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("tachyond: schedule context compaction: {error}");
+            return;
+        }
+    };
+    let Some(command) = command else { return };
+    let encoded = match serde_json::to_string(&command) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            eprintln!("tachyond: encode context compaction: {error}");
+            return;
+        }
+    };
+    if let Err(error) =
+        task_input(registry, agent_id).and_then(|input| write_task_input(input, agent_id, &encoded))
+    {
+        eprintln!("tachyond: deliver context compaction to {agent_id}: {error}");
     }
 }
 
@@ -1166,7 +1480,9 @@ fn push_event(registry: &Arc<Mutex<Registry>>, id: &str, stream: EventStream, da
             "Work assignment reached a terminal outcome.",
         );
     }
+    handle_context_compaction(registry, id, &correlated_data);
     persist_interaction_history(registry, &correlated_data);
+    observe_explicit_preference(registry, &correlated_data);
     log_event(id, &stream, &correlated_data);
     if completed {
         start_ready_tasks(registry);
@@ -1382,6 +1698,13 @@ fn main() -> std::process::ExitCode {
             None
         }
     };
+    let memory_store = match MemoryStore::open(tachyon_util::daemon::memories_database_path()) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            eprintln!("tachyond: memories store unavailable: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
 
     let pid = std::process::id();
     if let Err(e) = tachyon_util::daemon::write_pid(pid) {
@@ -1392,6 +1715,7 @@ fn main() -> std::process::ExitCode {
     let reg = Arc::new(Mutex::new(Registry {
         runtime_store: Some(runtime_store),
         history_store,
+        memory_store: Some(memory_store),
         ..Registry::default()
     }));
     let (review_tx, review_rx) = mpsc::sync_channel(64);
@@ -1756,6 +2080,133 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
                 Ok(entries) => ApiResponse::History { entries },
                 Err(error) => ApiResponse::error(format!("history query failed: {error}")),
             }
+        }
+        MemoryRecall {
+            query,
+            conversation_id,
+            turn,
+            max_items,
+            max_chars,
+        } => {
+            let item_limit = (*max_items).clamp(1, 32) as usize;
+            let char_limit = (*max_chars).clamp(256, 12_000) as usize;
+            let (memory, history, runtime) = {
+                let registry = registry.lock().unwrap();
+                (
+                    registry.memory_store.clone(),
+                    registry.history_store.clone(),
+                    registry.runtime_store.clone(),
+                )
+            };
+            let Some(memory) = memory else {
+                return ApiResponse::error("memory store unavailable");
+            };
+            let now_ms = unix_now_ms();
+            let preference_limit = item_limit.div_ceil(2).min(6);
+            let preferences = match memory.recall_preferences(query, now_ms, preference_limit) {
+                Ok(records) => records,
+                Err(error) => {
+                    return ApiResponse::error(format!("memory recall failed: {error}"));
+                }
+            };
+            let recall_history = wants_history_recall(query);
+            let task_entries = if recall_history {
+                let Some(runtime) = runtime else {
+                    return ApiResponse::error("runtime store unavailable");
+                };
+                match recall_task_history(&runtime, query, item_limit + 1) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        return ApiResponse::error(format!("task history recall failed: {error}"));
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let history_entries = if recall_history {
+                let Some(history) = history else {
+                    return ApiResponse::error("history store unavailable");
+                };
+                let (start_ms, end_ms) = history_recall_window(query, now_ms);
+                match history.recall_between(start_ms, end_ms, query, item_limit + 1) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        return ApiResponse::error(format!("history recall failed: {error}"));
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
+            let mut candidates = preferences
+                .into_iter()
+                .map(|record| MemoryRecallItem {
+                    kind: MemoryRecallKind::Preference,
+                    text: record.value,
+                    occurred_at_ms: record.updated_at_ms,
+                })
+                .collect::<Vec<_>>();
+            let history_entries = history_entries
+                .into_iter()
+                .map(|entry| MemoryRecallItem {
+                    kind: MemoryRecallKind::History,
+                    text: format!("{:?}: {}", entry.role, entry.text),
+                    occurred_at_ms: entry.occurred_at_ms,
+                })
+                .collect::<Vec<_>>();
+            let historical_candidates = task_entries.len().max(history_entries.len());
+            for index in 0..historical_candidates {
+                if let Some(item) = task_entries.get(index) {
+                    candidates.push(item.clone());
+                }
+                if let Some(item) = history_entries.get(index) {
+                    candidates.push(item.clone());
+                }
+            }
+
+            let mut items = Vec::new();
+            let mut used_chars = 0;
+            let mut truncated = candidates.len() > item_limit;
+            for mut item in candidates {
+                if items.len() >= item_limit || used_chars >= char_limit {
+                    truncated = true;
+                    break;
+                }
+                let available = char_limit - used_chars;
+                let item_chars = item.text.chars().count();
+                if item_chars > available {
+                    item.text = item.text.chars().take(available).collect();
+                    truncated = true;
+                }
+                used_chars += item.text.chars().count();
+                items.push(item);
+            }
+            let actual_preferences = items
+                .iter()
+                .filter(|item| item.kind == MemoryRecallKind::Preference)
+                .count() as u32;
+            let actual_history = items
+                .iter()
+                .filter(|item| item.kind == MemoryRecallKind::History)
+                .chain(
+                    items
+                        .iter()
+                        .filter(|item| item.kind == MemoryRecallKind::TaskHistory),
+                )
+                .count() as u32;
+            if !items.is_empty() {
+                emit_memory_event(
+                    registry,
+                    conversation_id.clone(),
+                    Some(turn.to_string()),
+                    StructuredAgentEvent::MemoryRecalled {
+                        turn: Some(*turn),
+                        preference_count: actual_preferences,
+                        history_count: actual_history,
+                    },
+                );
+            }
+            ApiResponse::MemoryRecall { items, truncated }
         }
         AgentStart {
             task,
@@ -2837,9 +3288,7 @@ fn spawn_warm_ghost(id: &str, workspace: &str) -> std::io::Result<Child> {
 /// (id, child, stdin).
 fn spawn_foreground() -> std::io::Result<(String, Child, std::process::ChildStdin)> {
     let mut cmd = Command::new(foreground_path());
-    cmd.arg("--agent-id")
-        .arg(FOREGROUND_ID)
-        .arg("--new-session");
+    cmd.arg("--agent-id").arg(FOREGROUND_ID);
 
     // The Conversational Agent's workspace should be the directory the daemon
     // was launched from (the user's project when they ran `tachyon` there).
@@ -4043,6 +4492,16 @@ mod tests {
     }
 
     #[test]
+    fn agent_list_includes_memory_service_once() {
+        let agents = Registry::default().sorted();
+        assert_eq!(
+            agents.iter().filter(|agent| agent.id == MEMORY_ID).count(),
+            1
+        );
+        assert_eq!(agents[0].task_type, "memory");
+    }
+
+    #[test]
     fn history_projection_keeps_only_canonical_visible_messages() {
         let metadata = InteractionMetadata {
             protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
@@ -4109,6 +4568,118 @@ mod tests {
             .pending_history()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn accepted_explicit_preference_is_saved_but_an_ordinary_task_is_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let memory = Arc::new(MemoryStore::open(directory.path().join("memories.redb")).unwrap());
+        let registry = Arc::new(Mutex::new(Registry {
+            memory_store: Some(Arc::clone(&memory)),
+            ..Registry::default()
+        }));
+        for (message_id, text) in [
+            ("preference", "I prefer concise status updates."),
+            ("task", "Implement database regeneration tests."),
+        ] {
+            let event = InteractionEventEnvelope {
+                metadata: InteractionMetadata {
+                    protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
+                    message_id: message_id.into(),
+                    correlation_id: message_id.into(),
+                    causation_id: None,
+                    conversation_id: "conversation-1".into(),
+                    turn_id: Some("1".into()),
+                    generation: 0,
+                    occurred_at_ms: 123,
+                },
+                event: InteractionEvent::UserTurnAccepted { text: text.into() },
+            };
+            observe_explicit_preference(&registry, &serde_json::to_string(&event).unwrap());
+        }
+        let records = memory.list().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].value, "I prefer concise status updates.");
+    }
+
+    #[test]
+    fn memory_recall_combines_preferences_and_prompted_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let memory = Arc::new(MemoryStore::open(directory.path().join("memories.redb")).unwrap());
+        memory
+            .put(
+                &explicit_preference(PreferenceObservation {
+                    event_id: "preference",
+                    conversation_id: "conversation-1",
+                    turn_id: Some("1"),
+                    text: "I prefer concise Rust answers.",
+                    occurred_at_ms: 100,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let history = Arc::new(HistoryStore::open(&directory.path().join("history.redb")).unwrap());
+        history
+            .apply(&HistoryProjection {
+                schema_version: 1,
+                event_id: "history".into(),
+                conversation_id: "conversation-1".into(),
+                turn_id: Some("2".into()),
+                occurred_at_ms: 200,
+                role: HistoryRole::Assistant,
+                text: "Implemented the Rust database layer.".into(),
+            })
+            .unwrap();
+        let registry = Arc::new(Mutex::new(Registry {
+            memory_store: Some(memory),
+            history_store: Some(history),
+            runtime_store: Some(Arc::new(
+                RuntimeStore::open(&directory.path().join("runtime.redb")).unwrap(),
+            )),
+            ..Registry::default()
+        }));
+        let mut prior_task = task("prior-task", AgentState::Completed);
+        prior_task.info.task = "Build the Rust database layer".into();
+        let prior_info = prior_task.info.clone();
+        registry
+            .lock()
+            .unwrap()
+            .tasks
+            .insert(prior_info.id.clone(), prior_task);
+        persist_task(&registry, &prior_info, "completed");
+        let response = dispatch(
+            &ApiRequest::MemoryRecall {
+                query: "What did we work on in the Rust history?".into(),
+                conversation_id: "conversation-1".into(),
+                turn: 3,
+                max_items: 4,
+                max_chars: 1000,
+            },
+            &registry,
+        );
+        let ApiResponse::MemoryRecall { items, truncated } = response else {
+            panic!("expected memory recall response");
+        };
+        assert!(!truncated);
+        assert_eq!(items.len(), 3);
+        assert!(items
+            .iter()
+            .any(|item| item.kind == MemoryRecallKind::Preference));
+        assert!(items
+            .iter()
+            .any(|item| item.kind == MemoryRecallKind::History));
+        assert!(items
+            .iter()
+            .any(|item| item.kind == MemoryRecallKind::TaskHistory));
+    }
+
+    #[test]
+    fn relative_history_windows_are_bounded_to_the_requested_day() {
+        const DAY_MS: u64 = 86_400_000;
+        assert_eq!(
+            history_recall_window("what did we do yesterday?", 10 * DAY_MS + 123),
+            (9 * DAY_MS, 10 * DAY_MS)
+        );
     }
 
     #[test]
@@ -4343,6 +4914,8 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 20,
                 total_tokens: 120,
+                context_tokens: 100,
+                context_window: Some(1_000),
             },
         };
         push_event(

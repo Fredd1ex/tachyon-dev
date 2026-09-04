@@ -45,6 +45,15 @@ pub struct MemoryStore {
     database: Database,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreferenceObservation<'a> {
+    pub event_id: &'a str,
+    pub conversation_id: &'a str,
+    pub turn_id: Option<&'a str>,
+    pub text: &'a str,
+    pub occurred_at_ms: u64,
+}
+
 impl MemoryStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
         let path = path.as_ref();
@@ -152,6 +161,48 @@ impl MemoryStore {
         Ok(records)
     }
 
+    /// Return active, explicitly-consented preferences in deterministic
+    /// relevance order. This intentionally keeps retrieval behind a small API
+    /// so a lexical ranker can later be replaced by semantic search.
+    pub fn recall_preferences(
+        &self,
+        query: &str,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<MemoryRecord>, MemoryError> {
+        let query_tokens = search_tokens(query);
+        let mut ranked = self
+            .list()?
+            .into_iter()
+            .filter(|record| {
+                record.subject == "user"
+                    && record.predicate == "preference"
+                    && matches!(record.consent.as_str(), "stated" | "explicit" | "approved")
+                    && record.sensitivity == "normal"
+                    && record.expires_at_ms.is_none_or(|expiry| expiry > now_ms)
+            })
+            .map(|record| {
+                let candidate = search_tokens(&record.value);
+                let score = query_tokens
+                    .iter()
+                    .filter(|token| candidate.contains(*token))
+                    .count();
+                (score, record)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(ranked
+            .into_iter()
+            .take(limit)
+            .map(|(_, record)| record)
+            .collect())
+    }
+
     pub fn revoke(&self, id: &str, revoked_at_ms: u64) -> Result<(), MemoryError> {
         validate_identifier(id)?;
         let write = self.database.begin_write().map_err(storage)?;
@@ -168,6 +219,63 @@ impl MemoryStore {
             .map_err(storage)?;
         write.commit().map_err(storage)
     }
+}
+
+/// Curate only direct preference statements. Conversation history is not
+/// promoted unless the user used an explicit preference construction.
+pub fn explicit_preference(observation: PreferenceObservation<'_>) -> Option<MemoryRecord> {
+    let text = observation.text.trim();
+    if text.is_empty() || text.chars().count() > 1000 {
+        return None;
+    }
+    let normalized = text.to_ascii_lowercase();
+    const MARKERS: [&str; 8] = [
+        "i prefer ",
+        "my preference is ",
+        "i like ",
+        "i dislike ",
+        "please always ",
+        "i always want ",
+        "i want you to always ",
+        "remember that i ",
+    ];
+    if !MARKERS.iter().any(|marker| normalized.contains(marker)) {
+        return None;
+    }
+    let id_suffix = observation
+        .event_id
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' => '-',
+            character => character,
+        })
+        .collect::<String>();
+    Some(MemoryRecord {
+        schema_version: SCHEMA_VERSION as u32,
+        id: format!("preference-{id_suffix}"),
+        subject: "user".into(),
+        predicate: "preference".into(),
+        value: text.into(),
+        provenance: format!(
+            "explicit user statement in {} turn {}",
+            observation.conversation_id,
+            observation.turn_id.unwrap_or("unknown")
+        ),
+        confidence_millis: 1000,
+        sensitivity: "normal".into(),
+        consent: "stated".into(),
+        created_at_ms: observation.occurred_at_ms,
+        updated_at_ms: observation.occurred_at_ms,
+        expires_at_ms: None,
+        supersedes: None,
+    })
+}
+
+fn search_tokens(text: &str) -> std::collections::BTreeSet<String> {
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|token| token.len() > 2)
+        .collect()
 }
 
 fn storage(error: impl std::fmt::Display) -> MemoryError {
@@ -256,5 +364,62 @@ mod tests {
             Err(MemoryError::NotFound(_))
         ));
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn explicit_preferences_are_curated_but_ordinary_tasks_are_not() {
+        let preference = explicit_preference(PreferenceObservation {
+            event_id: "event/1",
+            conversation_id: "conversation-1",
+            turn_id: Some("2"),
+            text: "I prefer concise answers.",
+            occurred_at_ms: 100,
+        })
+        .unwrap();
+        assert_eq!(preference.id, "preference-event-1");
+        assert_eq!(preference.predicate, "preference");
+        assert!(explicit_preference(PreferenceObservation {
+            event_id: "event-2",
+            conversation_id: "conversation-1",
+            turn_id: Some("3"),
+            text: "Add a unit test for database recovery.",
+            occurred_at_ms: 200,
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn recall_is_bounded_ranked_and_policy_filtered() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(directory.path().join("memories.redb")).unwrap();
+        let mut concise = record("concise");
+        concise.predicate = "preference".into();
+        concise.value = "I prefer concise Rust answers".into();
+        let mut expired = record("expired");
+        expired.predicate = "preference".into();
+        expired.value = "I prefer verbose Rust answers".into();
+        expired.expires_at_ms = Some(99);
+        let mut sensitive = record("sensitive");
+        sensitive.predicate = "preference".into();
+        sensitive.sensitivity = "private".into();
+        store.put(&concise).unwrap();
+        store.put(&expired).unwrap();
+        store.put(&sensitive).unwrap();
+
+        let recalled = store.recall_preferences("Rust style", 100, 1).unwrap();
+        assert_eq!(recalled, vec![concise]);
+    }
+
+    #[test]
+    fn deleted_or_moved_memory_database_reopens_blank() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("memories.redb");
+        {
+            let store = MemoryStore::open(&path).unwrap();
+            store.put(&record("preference-1")).unwrap();
+        }
+        std::fs::rename(&path, directory.path().join("memories.backup")).unwrap();
+        let regenerated = MemoryStore::open(&path).unwrap();
+        assert!(regenerated.list().unwrap().is_empty());
     }
 }

@@ -5,6 +5,10 @@ memory into independent redb databases under
 `$TACHYON_DATA_DIR/databases` (normally
 `~/.local/share/tachyon/databases`).
 
+Tachyond opens and validates all three stores during startup. If a database file
+is absent it is recreated with the current empty schema; incompatible or corrupt
+existing files fail startup rather than being overwritten.
+
 ```text
 Tachyond -> runtime.redb
          -> durable outbox -> history projector -> history.redb
@@ -42,9 +46,37 @@ retain a tombstone so stale imports cannot resurrect them.
 
 ## Memory Agent
 
-The future Memory Agent proposes summaries and facts but does not receive direct
-database access. The Rust Memory service validates its typed proposals. History
-is never automatically promoted into user memory.
+The daemon-managed Memory Agent observes authoritative accepted user turns.
+Direct preference constructions such as `I prefer ...` are converted into typed
+records with statement provenance and explicit consent, then validated by the
+Rust Memory store. Ordinary conversation and task history is never promoted
+into curated memory.
+
+Before each model turn, Foreground requests a bounded private recall projection
+from Tachyond. Active normal-sensitivity preferences are ranked and returned.
+Past conversation activity is searched only when the prompt asks about earlier
+work or a temporal period. Recalled data is attached to the ephemeral model
+input as untrusted context; it is never added to checkpoints, canonical history,
+or model-visible tool protocols. The TUI receives count-only `memory_saved` and
+`memory_recalled` lifecycle events.
+
+### Retrieval
+
+Retrieval currently combines redb indexes with deterministic lexical ranking:
+
+- `memories.redb` supplies consent-, sensitivity-, revocation-, and expiry-aware
+  preference candidates.
+- `history.redb` supplies bounded timestamp ranges and at most 200 recent
+  candidates for lexical ranking.
+- `runtime.redb` supplies durable task objectives and terminal lifecycle state
+  for prompted task-history recall.
+- Tachyond clamps result count and total characters before crossing IPC.
+
+Tantivy is intentionally not used yet. At current data volumes, another index
+would add synchronization and recovery complexity without improving structured
+preference or date retrieval. The typed recall API isolates the ranker so a
+future hybrid implementation can add embeddings and semantic similarity, or
+Tantivy for larger full-text corpora, without changing Foreground or the TUI.
 
 Tachyond owns context token accounting. At the configurable soft threshold,
 initially 65 percent, it schedules compaction. A model may generate a candidate
@@ -67,7 +99,12 @@ and explicit conflict handling.
 - [x] Versioned `history.redb` conversation and temporal indexes.
 - [x] Versioned `memories.redb` records, conflict checks, and revocations.
 - [x] Bounded daemon-owned temporal history query API and CLI.
-- [ ] Scoped and bounded curated-memory retrieval for agent use.
-- [ ] Memory Agent proposal and validation loop.
-- [ ] Durable 65-percent compaction scheduling and context epochs.
+- [x] Scoped and bounded curated-memory and prompted history retrieval.
+- [x] Explicit user-preference observation, validation, and TUI lifecycle
+  indicators; the managed service identity is visible in agent listings.
+- [ ] Model-proposed facts and preference corrections beyond explicit statement
+  constructions.
+- [x] Durable 65-percent compaction scheduling, 45-percent target, context
+  epochs, typed signals, and acknowledgements.
+- [ ] Memory-Agent-generated semantic summaries during compaction.
 - [ ] Portable import/export commands.

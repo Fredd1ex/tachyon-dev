@@ -22,7 +22,7 @@ use ghost::role::AgentRole;
 #[cfg(test)]
 use ghost::{harness::agent::normalized_call_signature, model::ToolCall};
 use tachyon_api::types::{
-    Actor, AgentEvent, ArtifactRegistration, EventEnvelope,
+    Actor, AgentEvent, ArtifactRegistration, ContextCompactionCommand, EventEnvelope,
     ToolTelemetryIdentity as ApiToolTelemetryIdentity, WorkEvent, WorkEventKind, WorkOutcome,
     WorkRequest, WorkResult,
 };
@@ -107,6 +107,8 @@ struct ChatCheckpoint {
     evidence: Vec<serde_json::Value>,
     #[serde(default = "initial_commit")]
     next_commit: u64,
+    #[serde(default)]
+    context_epoch: u64,
 }
 
 fn initial_commit() -> u64 {
@@ -241,6 +243,8 @@ async fn run_task(
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
                     total_tokens: usage.total_tokens,
+                    context_tokens: usage.context_tokens,
+                    context_window: usage.context_window,
                 },
                 role,
                 agent_id.as_deref(),
@@ -301,12 +305,41 @@ async fn run_chat(
         .as_ref()
         .map(|checkpoint| checkpoint.next_commit)
         .unwrap_or(1);
+    let mut context_epoch = checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.context_epoch)
+        .unwrap_or_default();
     println!("[ghost] ready");
     emit_ready(role, agent_id.as_deref());
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let text = line.trim();
         if text.is_empty() {
+            continue;
+        }
+        if let Ok(command) = serde_json::from_str::<ContextCompactionCommand>(text) {
+            if command.epoch > context_epoch {
+                compact_context_messages(&mut messages, command.target_tokens);
+                context_epoch = command.epoch;
+                write_chat_checkpoint(
+                    &checkpoint_path,
+                    &ChatCheckpoint {
+                        messages: messages.clone(),
+                        evidence: evidence.clone(),
+                        next_commit,
+                        context_epoch,
+                    },
+                );
+            }
+            emit_event(
+                AgentEvent::ContextCompacted {
+                    request_id: command.request_id,
+                    epoch: command.epoch,
+                    retained_context_tokens: estimated_context_tokens(&messages),
+                },
+                role,
+                agent_id.as_deref(),
+            );
             continue;
         }
         let request = serde_json::from_str::<WorkRequest>(text).ok();
@@ -354,6 +387,8 @@ async fn run_chat(
                         prompt_tokens: usage.prompt_tokens,
                         completion_tokens: usage.completion_tokens,
                         total_tokens: usage.total_tokens,
+                        context_tokens: usage.context_tokens,
+                        context_window: usage.context_window,
                     },
                     role,
                     agent_id.as_deref(),
@@ -396,6 +431,7 @@ async fn run_chat(
                 messages: messages.clone(),
                 evidence: evidence.clone(),
                 next_commit,
+                context_epoch,
             },
         );
         emit_ready(role, agent_id.as_deref());
@@ -481,6 +517,41 @@ fn compact_completed_history(messages: &mut Vec<ChatMessage>) {
             .all(|content| matches!(content, Content::Text(_))),
         Role::Tool => false,
     });
+}
+
+fn estimated_context_tokens(messages: &[ChatMessage]) -> u32 {
+    messages
+        .iter()
+        .map(|message| {
+            serde_json::to_vec(message)
+                .map(|encoded| (encoded.len() / 4 + 1) as u32)
+                .unwrap_or_default()
+        })
+        .fold(0, u32::saturating_add)
+}
+
+fn compact_context_messages(messages: &mut Vec<ChatMessage>, target_tokens: u32) {
+    if estimated_context_tokens(messages) <= target_tokens {
+        return;
+    }
+    let mut retained = Vec::new();
+    let mut used = 0_u32;
+    if let Some(system) = messages.iter().find(|message| message.role == Role::System) {
+        used = used.saturating_add(estimated_context_tokens(std::slice::from_ref(system)));
+        retained.push((0, system.clone()));
+    }
+    for (index, message) in messages.iter().enumerate().rev() {
+        if message.role == Role::System {
+            continue;
+        }
+        let cost = estimated_context_tokens(std::slice::from_ref(message));
+        if used.saturating_add(cost) <= target_tokens || retained.len() < 3 {
+            retained.push((index.saturating_add(1), message.clone()));
+            used = used.saturating_add(cost);
+        }
+    }
+    retained.sort_by_key(|(index, _)| *index);
+    *messages = retained.into_iter().map(|(_, message)| message).collect();
 }
 
 struct GhostAgentLoopSink<'a> {
