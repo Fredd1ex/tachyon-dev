@@ -85,6 +85,106 @@ pub fn spawn_agents() -> ToolSchema {
     )
 }
 
+pub fn memory() -> ToolSchema {
+    ToolSchema::new(
+        "memory",
+        "Consult authoritative durable user memory when profile context is relevant, or apply one user-requested durable memory change. Never answer a durable user-profile question from conversation text alone. Recall before forget or correct so returned IDs can be used exactly.",
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["recall", "remember", "forget", "correct"] },
+                "query": { "type": "string", "minLength": 1, "maxLength": 1000 },
+                "include_history": { "type": "boolean", "description": "Whether prior conversation and task history are relevant to this recall." },
+                "target_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "uniqueItems": true,
+                    "items": { "type": "string" }
+                },
+                "value": { "type": "string", "minLength": 1, "maxLength": 1000 },
+                "kind": { "type": "string", "enum": ["fact", "preference", "constraint", "goal", "routine", "relationship"] },
+                "namespace": { "type": "string", "minLength": 1, "maxLength": 100 },
+                "relation": { "type": "string", "minLength": 1, "maxLength": 100 },
+                "scope": { "type": "string", "minLength": 1, "maxLength": 100 },
+                "cardinality": { "type": "string", "enum": ["one", "many"] },
+                "topics": {
+                    "type": "array",
+                    "maxItems": 8,
+                    "items": { "type": "string", "minLength": 1, "maxLength": 50 }
+                }
+            },
+            "required": ["action"],
+            "oneOf": [
+                {
+                    "properties": { "action": { "const": "recall" } },
+                    "required": ["action", "query", "include_history"]
+                },
+                {
+                    "properties": { "action": { "const": "remember" } },
+                    "required": ["action", "value", "kind", "namespace", "relation", "scope", "cardinality"]
+                },
+                {
+                    "properties": { "action": { "const": "forget" } },
+                    "required": ["action", "target_ids"]
+                },
+                {
+                    "properties": { "action": { "const": "correct" } },
+                    "required": ["action", "target_ids", "value", "kind", "namespace", "relation", "scope", "cardinality"]
+                }
+            ],
+            "additionalProperties": false,
+        }),
+    )
+}
+
+pub fn schedule() -> ToolSchema {
+    ToolSchema::new(
+        "schedule",
+        "Manage durable reminders and future agent work. Preserve timing from clarification follow-ups; do not spawn future work immediately. Use start_at for 'at', finish_by for 'by', and day next when no date is given.",
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["create", "list", "cancel", "start_at", "finish_by"] },
+                "text": { "type": "string", "minLength": 1, "maxLength": 500 },
+                "objective": { "type": "string", "minLength": 1, "maxLength": 4000 },
+                "delay_seconds": { "type": "integer", "minimum": 1, "maximum": 31536000 },
+                "local_time": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" },
+                "day": { "type": "string", "enum": ["next", "today", "tomorrow"] },
+                "id": { "type": "string", "minLength": 1, "maxLength": 200 }
+            },
+            "required": ["action"],
+            "oneOf": [
+                {
+                    "properties": { "action": { "const": "create" } },
+                    "required": ["action", "text", "delay_seconds"]
+                },
+                {
+                    "properties": { "action": { "const": "create" } },
+                    "required": ["action", "text", "local_time", "day"]
+                },
+                {
+                    "properties": { "action": { "const": "list" } },
+                    "required": ["action"]
+                },
+                {
+                    "properties": { "action": { "const": "cancel" } },
+                    "required": ["action", "id"]
+                },
+                {
+                    "properties": { "action": { "const": "start_at" } },
+                    "required": ["action", "objective"]
+                },
+                {
+                    "properties": { "action": { "const": "finish_by" } },
+                    "required": ["action", "objective"]
+                }
+            ],
+            "additionalProperties": false,
+        }),
+    )
+}
+
 fn agent_control(name: &str, description: &str, needs_task: bool) -> ToolSchema {
     let mut properties = json!({
         "id": { "type": "string", "description": "The Tachyon agent id." }
@@ -181,14 +281,38 @@ mod tests {
 
     #[test]
     fn conversation_schema_budget_stays_compact() {
-        let schemas = [spawn_agent(), spawn_agents()];
+        let schemas = [spawn_agent(), spawn_agents(), memory(), schedule()];
         let chars = schemas
             .iter()
             .map(|schema| {
                 schema.name.len() + schema.description.len() + schema.parameters.to_string().len()
             })
             .sum::<usize>();
-        assert!(chars < 900, "conversation schemas grew to {chars} chars");
+        assert!(chars < 3_800, "conversation schemas grew to {chars} chars");
+    }
+
+    #[test]
+    fn memory_schema_is_contextual_strict_and_bounded() {
+        let schema = memory();
+        assert!(schema
+            .description
+            .contains("authoritative durable user memory"));
+        assert!(schema.description.contains("Never answer"));
+        assert_eq!(schema.parameters["additionalProperties"], false);
+        assert_eq!(schema.parameters["properties"]["target_ids"]["maxItems"], 8);
+        assert_eq!(schema.parameters["properties"]["topics"]["maxItems"], 8);
+        assert_eq!(schema.parameters["oneOf"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn schedule_schema_is_strict_and_bounded() {
+        let schema = schedule();
+        assert_eq!(schema.parameters["additionalProperties"], false);
+        assert_eq!(
+            schema.parameters["properties"]["delay_seconds"]["minimum"],
+            1
+        );
+        assert_eq!(schema.parameters["oneOf"].as_array().unwrap().len(), 6);
     }
 
     #[test]

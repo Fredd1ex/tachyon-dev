@@ -24,15 +24,19 @@ Memory service -> memories.redb
 - No operation assumes an atomic transaction across database files.
 
 Runtime stores tasks, workers, generations, assignments, transition events,
-leases, snapshots, and the history outbox. History stores only canonical
-user-visible messages and notifications, indexed by conversation, timestamp,
-and UTC day. Streamed deltas, reasoning, tool traffic, and transient status are
-not history.
+leases, snapshots, and the history outbox. Each committed task transition also
+enqueues a typed task-history projection in the same runtime transaction.
+History stores canonical conversation messages, notifications, immutable task
+events, and interval summaries, indexed by timestamp and UTC day. Conversation
+messages and summaries additionally use a conversation index. Streamed deltas,
+reasoning, tool traffic, and transient status are not history.
 
 Curated memory records contain:
 
 - Stable record ID
-- Subject, predicate, and value
+- Kind: fact, preference, constraint, goal, routine, or relationship
+- Subject, namespace, relation (stored as `predicate`), scope, and value
+- Cardinality (`one` or `many`) and zero or more topics
 - Provenance
 - Confidence
 - Sensitivity and consent
@@ -43,22 +47,69 @@ Curated memory records contain:
 Stable IDs are idempotent. Reusing an ID for different content fails instead of
 silently rewriting user memory. Revoked records are excluded from reads but
 retain a tombstone so stale imports cannot resurrect them.
+Remembering a different value for the same kind, namespace, relation, and scope
+automatically performs an atomic superseding correction when cardinality is
+`one`; cardinality `many` preserves distinct active values.
+
+The memory database also contains a `primitive_catalog` table. A fresh database
+transactionally seeds the supported kinds, scopes, cardinalities, and common
+namespaces. These 19 schema primitives describe the vocabulary and are not user
+memories: deleting or moving `memories.redb` recreates the catalog with zero
+curated records. Memory records use payload schema version 2; legacy payloads
+decode through conservative uncategorized defaults while the redb container
+schema remains version 1 because the catalog is an additive table.
+
+## Chronological History
+
+The runtime database remains authoritative for current task state. Its durable
+outbox carries conversation and task projections to the history projector. An
+outbox event is acknowledged only after the idempotent history transaction
+commits, so restart replay cannot lose or duplicate a transition.
+
+History entries have an explicit kind: `conversation`, `task`, or
+`conversation_summary`. Task entries preserve task ID, resulting state, stable
+sequence-derived event ID, timestamp, objective, and transition note. They are
+chronological facts, not mutable task snapshots and not curated user memory.
+
+Every 20 canonical conversation messages, the history projector derives a
+bounded deterministic digest of that interval and writes it as a
+`conversation_summary`. Its ID is based on the conversation and ending message
+count, making retries idempotent. Summary records are indexed with the
+conversation and temporal activity but do not increment the source-message
+count or recursively create summaries. These durable history digests are
+separate from model-generated runtime context-compaction snapshots.
 
 ## Memory Agent
 
-The daemon-managed Memory Agent observes authoritative accepted user turns.
-Direct preference constructions such as `I prefer ...` are converted into typed
-records with statement provenance and explicit consent, then validated by the
-Rust Memory store. Ordinary conversation and task history is never promoted
-into curated memory.
+The Conversation Agent owns a contextual `memory` capability with `recall`,
+`remember`, `forget`, and `correct` actions. It decides during its existing model
+turn whether durable context is materially relevant; ordinary greetings and
+context-free requests perform no memory IPC and require no separate memory model
+pass. This decision is semantic rather than activated by canned phrases.
 
-Before each model turn, Foreground requests a bounded private recall projection
-from Tachyond. Active normal-sensitivity preferences are ranked and returned.
-Past conversation activity is searched only when the prompt asks about earlier
-work or a temporal period. Recalled data is attached to the ephemeral model
-input as untrusted context; it is never added to checkpoints, canonical history,
-or model-visible tool protocols. The TUI receives count-only `memory_saved` and
-`memory_recalled` lifecycle events.
+Recall delegates a compact model-written objective to Tachyond with an explicit
+decision about whether conversation and task history are relevant. Tachyond
+enforces item and character limits and returns untrusted bounded records. A
+forget or correction may target only exact IDs returned by an earlier recall in
+the same turn, and at most one mutation may be attempted per accepted turn.
+Tachyond derives provenance, consent, timestamps, and IDs; the Rust Memory store
+validates and atomically commits the typed proposal.
+
+Memory tool calls and results exist only in the ephemeral per-turn model
+projection. Their arguments and returned private context are omitted from
+generic tool telemetry, checkpoints, and canonical history. Foreground waits for
+the authoritative mutation result before allowing a response to claim that
+memory changed. The TUI retains the generic `working...` placeholder and shows
+count-only saved, recalled, forgotten, corrected, or unchanged badges beside
+timing and token usage.
+
+Deleting `memories.redb` removes curated user memory but does not rewrite
+canonical conversation history. A Tachyond restart starts Foreground with a new
+conversation checkpoint and turn sequence, so stale active transcript context
+does not survive that restart. Historical statements remain non-authoritative
+for stored-profile questions: the Conversation Agent must consult Memory with
+history disabled, and an empty result means no durable profile record is
+available.
 
 ### Retrieval
 
@@ -67,9 +118,9 @@ Retrieval currently combines redb indexes with deterministic lexical ranking:
 - `memories.redb` supplies consent-, sensitivity-, revocation-, and expiry-aware
   preference candidates.
 - `history.redb` supplies bounded timestamp ranges and at most 200 recent
-  candidates for lexical ranking.
+  conversation, task, and summary candidates for lexical ranking.
 - `runtime.redb` supplies durable task objectives and terminal lifecycle state
-  for prompted task-history recall.
+  when the Conversation Agent requests task-history context.
 - Tachyond clamps result count and total characters before crossing IPC.
 
 Tantivy is intentionally not used yet. At current data volumes, another index
@@ -96,14 +147,17 @@ and explicit conflict handling.
 - [x] Authoritative `runtime.redb` task snapshots and transition events.
 - [x] Indexed persistent-worker recovery without Markdown scans.
 - [x] Durable runtime history outbox with idempotent acknowledgement.
-- [x] Versioned `history.redb` conversation and temporal indexes.
-- [x] Versioned `memories.redb` records, conflict checks, and revocations.
+- [x] Versioned `history.redb` conversation and temporal indexes, chronological
+  task projections, and deterministic 20-message interval summaries.
+- [x] Categorized version-2 `memories.redb` records, primitive catalog bootstrap,
+  conflict checks, and revocations.
 - [x] Bounded daemon-owned temporal history query API and CLI.
-- [x] Scoped and bounded curated-memory and prompted history retrieval.
-- [x] Explicit user-preference observation, validation, and TUI lifecycle
-  indicators; the managed service identity is visible in agent listings.
-- [ ] Model-proposed facts and preference corrections beyond explicit statement
-  constructions.
+- [x] Scoped and bounded model-selected memory and history retrieval without a
+  per-turn preflight request.
+- [x] Strict semantic remember, forget, correction, normalization,
+  deduplication, validation, and TUI lifecycle badges; the managed service
+  identity is visible in agent listings.
+- [ ] User-facing memory inspection and confirmation controls.
 - [x] Durable 65-percent compaction scheduling, 45-percent target, context
   epochs, typed signals, and acknowledgements.
 - [ ] Memory-Agent-generated semantic summaries during compaction.

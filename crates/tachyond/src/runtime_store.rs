@@ -2,7 +2,10 @@ use std::path::Path;
 
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use tachyon_api::types::{AgentInfo, ContextCompactionCommand, HistoryRole};
+use tachyon_api::types::{
+    AgentInfo, ContextCompactionCommand, HistoryKind, HistoryRole, ReminderInfo, ReminderStatus,
+    ScheduledTaskInfo, ScheduledTaskMode, ScheduledTaskStatus,
+};
 
 const SCHEMA_VERSION: u64 = 1;
 const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -17,16 +20,24 @@ const HISTORY_OUTBOX: TableDefinition<&str, &[u8]> = TableDefinition::new("histo
 const HISTORY_OUTBOX_ACKS: TableDefinition<&str, u64> = TableDefinition::new("history_outbox_acks");
 const CONTEXT_COMPACTIONS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("context_compactions");
+const REMINDERS: TableDefinition<&str, &[u8]> = TableDefinition::new("reminders");
+const SCHEDULED_TASKS: TableDefinition<&str, &[u8]> = TableDefinition::new("scheduled_tasks");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct HistoryProjection {
     pub schema_version: u32,
     pub event_id: String,
+    #[serde(default)]
+    pub kind: HistoryKind,
     pub conversation_id: String,
     pub turn_id: Option<String>,
     pub occurred_at_ms: u64,
     pub role: HistoryRole,
     pub text: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub task_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +81,29 @@ struct ContextCompactionRecord {
     usage_event_id: u64,
     requested_at_ms: u64,
     completed_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReminderRecord {
+    schema_version: u32,
+    source_event_id: String,
+    info: ReminderInfo,
+    delivery_attempts: u32,
+    delivery_started_at_ms: Option<u64>,
+    delivered_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScheduledTaskRecord {
+    schema_version: u32,
+    source_event_id: String,
+    info: ScheduledTaskInfo,
+    #[serde(default)]
+    result: Option<String>,
+    #[serde(default)]
+    delivery_started_at_ms: Option<u64>,
+    #[serde(default)]
+    result_delivered: bool,
 }
 
 pub(crate) struct RuntimeStore {
@@ -143,6 +177,12 @@ impl RuntimeStore {
             write
                 .open_table(CONTEXT_COMPACTIONS)
                 .map_err(|error| format!("create context compactions: {error}"))?;
+            write
+                .open_table(REMINDERS)
+                .map_err(|error| format!("create reminders: {error}"))?;
+            write
+                .open_table(SCHEDULED_TASKS)
+                .map_err(|error| format!("create scheduled tasks: {error}"))?;
         }
         write
             .commit()
@@ -204,6 +244,20 @@ impl RuntimeStore {
         };
         let event_bytes = serde_json::to_vec(&event)
             .map_err(|error| format!("encode runtime task event: {error}"))?;
+        let history_projection = HistoryProjection {
+            schema_version: SCHEMA_VERSION as u32,
+            event_id: format!("runtime-task-transition-{sequence:020}"),
+            kind: HistoryKind::Task,
+            conversation_id: String::new(),
+            turn_id: None,
+            occurred_at_ms: task.updated_at_ms,
+            role: HistoryRole::Notification,
+            text: format!("{}: {note}", task.info.task),
+            task_id: Some(task.info.id.clone()),
+            task_state: Some(task.info.state.to_string()),
+        };
+        let history_bytes = serde_json::to_vec(&history_projection)
+            .map_err(|error| format!("encode task history projection: {error}"))?;
         {
             let mut tasks = write
                 .open_table(TASKS)
@@ -219,6 +273,26 @@ impl RuntimeStore {
             events
                 .insert(sequence, event_bytes.as_slice())
                 .map_err(|error| format!("append runtime task event {sequence}: {error}"))?;
+        }
+        {
+            let acknowledgements = write
+                .open_table(HISTORY_OUTBOX_ACKS)
+                .map_err(|error| format!("open history acknowledgements: {error}"))?;
+            let acknowledged = acknowledgements
+                .get(history_projection.event_id.as_str())
+                .map_err(|error| format!("read task history acknowledgement: {error}"))?
+                .is_some();
+            drop(acknowledgements);
+            if !acknowledged {
+                write
+                    .open_table(HISTORY_OUTBOX)
+                    .map_err(|error| format!("open history outbox: {error}"))?
+                    .insert(
+                        history_projection.event_id.as_str(),
+                        history_bytes.as_slice(),
+                    )
+                    .map_err(|error| format!("enqueue task history projection: {error}"))?;
+            }
         }
         if let Some(command_id) = command_id {
             let mut commands = write
@@ -483,6 +557,497 @@ impl RuntimeStore {
         write.commit().map_err(|error| error.to_string())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_reminder(
+        &self,
+        id: &str,
+        source_event_id: &str,
+        conversation_id: &str,
+        turn: u64,
+        text: &str,
+        created_at_ms: u64,
+        due_at_ms: u64,
+    ) -> Result<ReminderInfo, String> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| format!("begin reminder transaction: {error}"))?;
+        {
+            let mut reminders = write
+                .open_table(REMINDERS)
+                .map_err(|error| format!("open reminders: {error}"))?;
+            if let Some(value) = reminders
+                .get(id)
+                .map_err(|error| format!("read reminder {id}: {error}"))?
+            {
+                let record: ReminderRecord = serde_json::from_slice(value.value())
+                    .map_err(|error| format!("decode reminder {id}: {error}"))?;
+                if record.source_event_id != source_event_id {
+                    return Err(format!("reminder id {id} belongs to another request"));
+                }
+                return Ok(record.info);
+            }
+            let info = ReminderInfo {
+                id: id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                turn,
+                text: text.to_string(),
+                created_at_ms,
+                due_at_ms,
+                status: ReminderStatus::Pending,
+            };
+            let bytes = serde_json::to_vec(&ReminderRecord {
+                schema_version: 1,
+                source_event_id: source_event_id.to_string(),
+                info: info.clone(),
+                delivery_attempts: 0,
+                delivery_started_at_ms: None,
+                delivered_at_ms: None,
+            })
+            .map_err(|error| format!("encode reminder {id}: {error}"))?;
+            reminders
+                .insert(id, bytes.as_slice())
+                .map_err(|error| format!("write reminder {id}: {error}"))?;
+            drop(reminders);
+            write
+                .commit()
+                .map_err(|error| format!("commit reminder {id}: {error}"))?;
+            Ok(info)
+        }
+    }
+
+    pub(crate) fn active_reminders(&self) -> Result<Vec<ReminderInfo>, String> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| format!("begin reminder read: {error}"))?;
+        let reminders = read
+            .open_table(REMINDERS)
+            .map_err(|error| format!("open reminders: {error}"))?;
+        let mut active = Vec::new();
+        for entry in reminders
+            .iter()
+            .map_err(|error| format!("iterate reminders: {error}"))?
+        {
+            let (_, value) = entry.map_err(|error| format!("read reminder entry: {error}"))?;
+            let record: ReminderRecord = serde_json::from_slice(value.value())
+                .map_err(|error| format!("decode reminder entry: {error}"))?;
+            if matches!(
+                record.info.status,
+                ReminderStatus::Pending | ReminderStatus::Delivering
+            ) {
+                active.push(record.info);
+            }
+        }
+        active.sort_by(|left, right| {
+            left.due_at_ms
+                .cmp(&right.due_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(active)
+    }
+
+    pub(crate) fn cancel_reminder(&self, id: &str) -> Result<ReminderInfo, String> {
+        self.update_reminder(id, |record| {
+            if record.info.status != ReminderStatus::Pending {
+                return Err(format!(
+                    "reminder {id} is already {}",
+                    match record.info.status {
+                        ReminderStatus::Delivering => "firing",
+                        ReminderStatus::Delivered => "delivered",
+                        ReminderStatus::Cancelled => "cancelled",
+                        ReminderStatus::Pending => unreachable!(),
+                    }
+                ));
+            }
+            record.info.status = ReminderStatus::Cancelled;
+            record.delivery_started_at_ms = None;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn claim_due_reminders(
+        &self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<ReminderInfo>, String> {
+        const DELIVERY_RETRY_MS: u64 = 5_000;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| format!("begin due reminder transaction: {error}"))?;
+        let mut claimed = Vec::new();
+        {
+            let mut reminders = write
+                .open_table(REMINDERS)
+                .map_err(|error| format!("open reminders: {error}"))?;
+            let mut candidates = Vec::new();
+            for entry in reminders
+                .iter()
+                .map_err(|error| format!("iterate reminders: {error}"))?
+            {
+                let (key, value) =
+                    entry.map_err(|error| format!("read reminder entry: {error}"))?;
+                let record: ReminderRecord = serde_json::from_slice(value.value())
+                    .map_err(|error| format!("decode reminder entry: {error}"))?;
+                let retryable = record.info.status == ReminderStatus::Delivering
+                    && record
+                        .delivery_started_at_ms
+                        .is_some_and(|started| started.saturating_add(DELIVERY_RETRY_MS) <= now_ms);
+                if record.info.due_at_ms <= now_ms
+                    && (record.info.status == ReminderStatus::Pending || retryable)
+                {
+                    candidates.push((key.value().to_string(), record));
+                }
+            }
+            candidates.sort_by(|(_, left), (_, right)| {
+                left.info
+                    .due_at_ms
+                    .cmp(&right.info.due_at_ms)
+                    .then_with(|| left.info.id.cmp(&right.info.id))
+            });
+            for (id, mut record) in candidates.into_iter().take(limit) {
+                record.info.status = ReminderStatus::Delivering;
+                record.delivery_attempts = record.delivery_attempts.saturating_add(1);
+                record.delivery_started_at_ms = Some(now_ms);
+                let bytes = serde_json::to_vec(&record)
+                    .map_err(|error| format!("encode reminder {id}: {error}"))?;
+                reminders
+                    .insert(id.as_str(), bytes.as_slice())
+                    .map_err(|error| format!("claim reminder {id}: {error}"))?;
+                claimed.push(record.info);
+            }
+        }
+        write
+            .commit()
+            .map_err(|error| format!("commit due reminders: {error}"))?;
+        Ok(claimed)
+    }
+
+    pub(crate) fn release_reminder_delivery(&self, id: &str) -> Result<ReminderInfo, String> {
+        self.update_reminder(id, |record| {
+            if record.info.status == ReminderStatus::Delivering {
+                record.info.status = ReminderStatus::Pending;
+                record.delivery_started_at_ms = None;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn acknowledge_reminder_delivery(
+        &self,
+        id: &str,
+        delivered_at_ms: u64,
+    ) -> Result<ReminderInfo, String> {
+        self.update_reminder(id, |record| {
+            if record.info.status != ReminderStatus::Delivering {
+                return Err(format!("reminder {id} is not awaiting delivery"));
+            }
+            record.info.status = ReminderStatus::Delivered;
+            record.delivered_at_ms = Some(delivered_at_ms);
+            record.delivery_started_at_ms = None;
+            Ok(())
+        })
+    }
+
+    fn update_reminder(
+        &self,
+        id: &str,
+        update: impl FnOnce(&mut ReminderRecord) -> Result<(), String>,
+    ) -> Result<ReminderInfo, String> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| format!("begin reminder update: {error}"))?;
+        let info = {
+            let mut reminders = write
+                .open_table(REMINDERS)
+                .map_err(|error| format!("open reminders: {error}"))?;
+            let value = reminders
+                .get(id)
+                .map_err(|error| format!("read reminder {id}: {error}"))?
+                .ok_or_else(|| format!("no such reminder: {id}"))?;
+            let mut record: ReminderRecord = serde_json::from_slice(value.value())
+                .map_err(|error| format!("decode reminder {id}: {error}"))?;
+            drop(value);
+            update(&mut record)?;
+            let bytes = serde_json::to_vec(&record)
+                .map_err(|error| format!("encode reminder {id}: {error}"))?;
+            reminders
+                .insert(id, bytes.as_slice())
+                .map_err(|error| format!("write reminder {id}: {error}"))?;
+            record.info
+        };
+        write
+            .commit()
+            .map_err(|error| format!("commit reminder {id}: {error}"))?;
+        Ok(info)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_scheduled_task(
+        &self,
+        id: &str,
+        source_event_id: &str,
+        conversation_id: &str,
+        turn: u64,
+        objective: &str,
+        mode: ScheduledTaskMode,
+        created_at_ms: u64,
+        due_at_ms: u64,
+    ) -> Result<ScheduledTaskInfo, String> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| error.to_string())?;
+        let info = {
+            let mut tasks = write
+                .open_table(SCHEDULED_TASKS)
+                .map_err(|error| format!("open scheduled tasks: {error}"))?;
+            if let Some(value) = tasks.get(id).map_err(|error| error.to_string())? {
+                let record: ScheduledTaskRecord = serde_json::from_slice(value.value())
+                    .map_err(|error| format!("decode scheduled task {id}: {error}"))?;
+                if record.source_event_id != source_event_id {
+                    return Err(format!("scheduled task id {id} belongs to another request"));
+                }
+                return Ok(record.info);
+            }
+            let info = ScheduledTaskInfo {
+                id: id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                turn,
+                objective: objective.to_string(),
+                mode,
+                created_at_ms,
+                due_at_ms,
+                status: ScheduledTaskStatus::Pending,
+                work_id: None,
+            };
+            let bytes = serde_json::to_vec(&ScheduledTaskRecord {
+                schema_version: 1,
+                source_event_id: source_event_id.to_string(),
+                info: info.clone(),
+                result: None,
+                delivery_started_at_ms: None,
+                result_delivered: false,
+            })
+            .map_err(|error| format!("encode scheduled task {id}: {error}"))?;
+            tasks
+                .insert(id, bytes.as_slice())
+                .map_err(|error| format!("write scheduled task {id}: {error}"))?;
+            info
+        };
+        write.commit().map_err(|error| error.to_string())?;
+        Ok(info)
+    }
+
+    pub(crate) fn scheduled_tasks(&self) -> Result<Vec<ScheduledTaskInfo>, String> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| error.to_string())?;
+        let tasks = read
+            .open_table(SCHEDULED_TASKS)
+            .map_err(|error| format!("open scheduled tasks: {error}"))?;
+        let mut schedules = Vec::new();
+        for entry in tasks.iter().map_err(|error| error.to_string())? {
+            let (_, value) = entry.map_err(|error| error.to_string())?;
+            let record: ScheduledTaskRecord =
+                serde_json::from_slice(value.value()).map_err(|error| error.to_string())?;
+            if matches!(
+                record.info.status,
+                ScheduledTaskStatus::Pending | ScheduledTaskStatus::Running
+            ) {
+                schedules.push(record.info);
+            }
+        }
+        schedules.sort_by(|left, right| {
+            left.due_at_ms
+                .cmp(&right.due_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(schedules)
+    }
+
+    pub(crate) fn recover_scheduled_tasks(&self) -> Result<(), String> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| error.to_string())?;
+        {
+            let mut tasks = write
+                .open_table(SCHEDULED_TASKS)
+                .map_err(|error| format!("open scheduled tasks: {error}"))?;
+            let mut recovered = Vec::new();
+            for entry in tasks.iter().map_err(|error| error.to_string())? {
+                let (key, value) = entry.map_err(|error| error.to_string())?;
+                let mut record: ScheduledTaskRecord =
+                    serde_json::from_slice(value.value()).map_err(|error| error.to_string())?;
+                if record.info.status == ScheduledTaskStatus::Running && record.result.is_none() {
+                    record.info.status = ScheduledTaskStatus::Pending;
+                    recovered.push((key.value().to_string(), record));
+                }
+            }
+            for (id, record) in recovered {
+                let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+                tasks
+                    .insert(id.as_str(), bytes.as_slice())
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        write.commit().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn claim_ready_scheduled_tasks(
+        &self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<ScheduledTaskInfo>, String> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| error.to_string())?;
+        let mut claimed = Vec::new();
+        {
+            let mut tasks = write
+                .open_table(SCHEDULED_TASKS)
+                .map_err(|error| format!("open scheduled tasks: {error}"))?;
+            let mut candidates = Vec::new();
+            for entry in tasks.iter().map_err(|error| error.to_string())? {
+                let (key, value) = entry.map_err(|error| error.to_string())?;
+                let record: ScheduledTaskRecord =
+                    serde_json::from_slice(value.value()).map_err(|error| error.to_string())?;
+                let ready = record.info.status == ScheduledTaskStatus::Pending
+                    && (record.info.mode == ScheduledTaskMode::FinishBy
+                        || record.info.due_at_ms <= now_ms);
+                if ready {
+                    candidates.push((key.value().to_string(), record));
+                }
+            }
+            candidates.sort_by_key(|(_, record)| record.info.due_at_ms);
+            for (id, mut record) in candidates.into_iter().take(limit) {
+                record.info.status = ScheduledTaskStatus::Running;
+                record.info.work_id = Some(format!("scheduled-work-{id}"));
+                let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+                tasks
+                    .insert(id.as_str(), bytes.as_slice())
+                    .map_err(|error| error.to_string())?;
+                claimed.push(record.info);
+            }
+        }
+        write.commit().map_err(|error| error.to_string())?;
+        Ok(claimed)
+    }
+
+    pub(crate) fn store_scheduled_task_result(
+        &self,
+        id: &str,
+        result: &str,
+        failed: bool,
+    ) -> Result<ScheduledTaskInfo, String> {
+        self.update_scheduled_task(id, |record| {
+            record.result = Some(result.to_string());
+            if failed {
+                record.info.status = ScheduledTaskStatus::Failed;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn claim_scheduled_task_notifications(
+        &self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<(ScheduledTaskInfo, String)>, String> {
+        const DELIVERY_RETRY_MS: u64 = 5_000;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| error.to_string())?;
+        let mut claimed = Vec::new();
+        {
+            let mut tasks = write
+                .open_table(SCHEDULED_TASKS)
+                .map_err(|error| format!("open scheduled tasks: {error}"))?;
+            let mut candidates = Vec::new();
+            for entry in tasks.iter().map_err(|error| error.to_string())? {
+                let (key, value) = entry.map_err(|error| error.to_string())?;
+                let record: ScheduledTaskRecord =
+                    serde_json::from_slice(value.value()).map_err(|error| error.to_string())?;
+                let retryable = record
+                    .delivery_started_at_ms
+                    .is_none_or(|started| started.saturating_add(DELIVERY_RETRY_MS) <= now_ms);
+                if record.result.is_some()
+                    && !record.result_delivered
+                    && matches!(
+                        record.info.status,
+                        ScheduledTaskStatus::Running | ScheduledTaskStatus::Failed
+                    )
+                    && retryable
+                {
+                    candidates.push((key.value().to_string(), record));
+                }
+            }
+            candidates.sort_by_key(|(_, record)| record.info.due_at_ms);
+            for (id, mut record) in candidates.into_iter().take(limit) {
+                record.delivery_started_at_ms = Some(now_ms);
+                let result = record.result.clone().unwrap_or_default();
+                let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+                tasks
+                    .insert(id.as_str(), bytes.as_slice())
+                    .map_err(|error| error.to_string())?;
+                claimed.push((record.info, result));
+            }
+        }
+        write.commit().map_err(|error| error.to_string())?;
+        Ok(claimed)
+    }
+
+    pub(crate) fn acknowledge_scheduled_task_notification(
+        &self,
+        id: &str,
+    ) -> Result<ScheduledTaskInfo, String> {
+        self.update_scheduled_task(id, |record| {
+            if record.info.status == ScheduledTaskStatus::Running {
+                record.info.status = ScheduledTaskStatus::Completed;
+            }
+            record.delivery_started_at_ms = None;
+            record.result_delivered = true;
+            Ok(())
+        })
+    }
+
+    fn update_scheduled_task(
+        &self,
+        id: &str,
+        update: impl FnOnce(&mut ScheduledTaskRecord) -> Result<(), String>,
+    ) -> Result<ScheduledTaskInfo, String> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| error.to_string())?;
+        let info = {
+            let mut tasks = write
+                .open_table(SCHEDULED_TASKS)
+                .map_err(|error| format!("open scheduled tasks: {error}"))?;
+            let value = tasks
+                .get(id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("no such scheduled task: {id}"))?;
+            let mut record: ScheduledTaskRecord =
+                serde_json::from_slice(value.value()).map_err(|error| error.to_string())?;
+            drop(value);
+            update(&mut record)?;
+            let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+            tasks
+                .insert(id, bytes.as_slice())
+                .map_err(|error| error.to_string())?;
+            record.info
+        };
+        write.commit().map_err(|error| error.to_string())?;
+        Ok(info)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn mark_migration(
         &self,
@@ -560,11 +1125,14 @@ mod tests {
         HistoryProjection {
             schema_version: 1,
             event_id: event_id.into(),
+            kind: HistoryKind::Conversation,
             conversation_id: "conversation-1".into(),
             turn_id: Some("1".into()),
             occurred_at_ms: 123,
             role: HistoryRole::User,
             text: "hello".into(),
+            task_id: None,
+            task_state: None,
         }
     }
 
@@ -685,6 +1253,21 @@ mod tests {
     }
 
     #[test]
+    fn task_transition_enqueues_chronological_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RuntimeStore::open(&directory.path().join("runtime.redb")).unwrap();
+        store
+            .persist_task_transition(&task("a", AgentState::Running), "started", None)
+            .unwrap();
+
+        let pending = store.pending_history().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, HistoryKind::Task);
+        assert_eq!(pending[0].task_id.as_deref(), Some("a"));
+        assert_eq!(pending[0].task_state.as_deref(), Some("running"));
+    }
+
+    #[test]
     fn context_compaction_uses_threshold_and_hysteresis() {
         let directory = tempfile::tempdir().unwrap();
         let store = RuntimeStore::open(&directory.path().join("runtime.redb")).unwrap();
@@ -710,5 +1293,124 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(second.epoch, 2);
+    }
+
+    #[test]
+    fn reminders_are_durable_claimed_acknowledged_and_cancelled() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.redb");
+        {
+            let store = RuntimeStore::open(&path).unwrap();
+            let reminder = store
+                .create_reminder(
+                    "reminder-1",
+                    "source-1",
+                    "foreground",
+                    1,
+                    "Your coffee is ready.",
+                    100,
+                    200,
+                )
+                .unwrap();
+            assert_eq!(reminder.status, ReminderStatus::Pending);
+            assert!(store.claim_due_reminders(199, 10).unwrap().is_empty());
+        }
+        let store = RuntimeStore::open(&path).unwrap();
+        let claimed = store.claim_due_reminders(200, 10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].status, ReminderStatus::Delivering);
+        assert!(store.claim_due_reminders(201, 10).unwrap().is_empty());
+        let delivered = store
+            .acknowledge_reminder_delivery("reminder-1", 202)
+            .unwrap();
+        assert_eq!(delivered.status, ReminderStatus::Delivered);
+        assert!(store.active_reminders().unwrap().is_empty());
+
+        store
+            .create_reminder(
+                "reminder-2",
+                "source-2",
+                "foreground",
+                2,
+                "Second reminder.",
+                300,
+                400,
+            )
+            .unwrap();
+        let cancelled = store.cancel_reminder("reminder-2").unwrap();
+        assert_eq!(cancelled.status, ReminderStatus::Cancelled);
+        assert!(store.claim_due_reminders(500, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scheduled_tasks_preserve_start_and_finish_deadline_semantics() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.redb");
+        let store = RuntimeStore::open(&path).unwrap();
+        store
+            .create_scheduled_task(
+                "scheduled-task-start",
+                "source-start",
+                "foreground",
+                1,
+                "check weather",
+                ScheduledTaskMode::StartAt,
+                100,
+                500,
+            )
+            .unwrap();
+
+        store
+            .create_scheduled_task(
+                "scheduled-task-finish",
+                "source-finish",
+                "foreground",
+                2,
+                "prepare forecast",
+                ScheduledTaskMode::FinishBy,
+                100,
+                500,
+            )
+            .unwrap();
+
+        let listed = store.scheduled_tasks().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|task| task.objective == "check weather"));
+
+        let claimed = store.claim_ready_scheduled_tasks(200, 10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].mode, ScheduledTaskMode::FinishBy);
+        assert!(store
+            .claim_ready_scheduled_tasks(499, 10)
+            .unwrap()
+            .is_empty());
+        drop(store);
+
+        let store = RuntimeStore::open(&path).unwrap();
+        store.recover_scheduled_tasks().unwrap();
+        let mut claimed = store.claim_ready_scheduled_tasks(500, 10).unwrap();
+        claimed.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(claimed.len(), 2);
+        let finish = claimed
+            .iter()
+            .find(|task| task.mode == ScheduledTaskMode::FinishBy)
+            .unwrap();
+        store
+            .store_scheduled_task_result(&finish.id, "forecast ready", false)
+            .unwrap();
+        let notifications = store.claim_scheduled_task_notifications(501, 10).unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].1, "forecast ready");
+        let delivered = store
+            .acknowledge_scheduled_task_notification(&finish.id)
+            .unwrap();
+        assert_eq!(delivered.status, ScheduledTaskStatus::Completed);
+        let active = store.scheduled_tasks().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].mode, ScheduledTaskMode::StartAt);
+        assert!(store
+            .claim_scheduled_task_notifications(10_000, 10)
+            .unwrap()
+            .is_empty());
     }
 }

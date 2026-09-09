@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use tachyon::cli::{Cli, Command, DaemonAction, ProviderAction};
+use tachyon::cli::{Cli, Command, DaemonAction, MemoryAction, ProviderAction};
 use tachyon::style::{colored_glyph, palette, render};
 
 use tachyon_api::types::{AgentState, ApiRequest, ApiResponse};
@@ -31,8 +31,8 @@ fn main() -> ExitCode {
 
     let cmd = cli.command.expect("handled above");
 
-    // Only agent/data commands auto-start the daemon. Daemon-lifecycle and
-    // provider commands manage/read config and must not spawn it implicitly.
+    // Only agent commands auto-start the daemon. Local administration and
+    // provider commands must not spawn it implicitly.
     if needs_ipc(&cmd) {
         tachyon::daemon::ensure_running();
         daemon_key_check(&p);
@@ -43,8 +43,10 @@ fn main() -> ExitCode {
 
 /// True if a command needs an IPC connection to the daemon.
 fn needs_ipc(cmd: &Command) -> bool {
-    !matches!(cmd, Command::Daemon(_) | Command::Providers(_))
-        && !matches!(cmd, Command::Restart(args) if args.id == "daemon")
+    !matches!(
+        cmd,
+        Command::Daemon(_) | Command::Memory(_) | Command::Providers(_)
+    ) && !matches!(cmd, Command::Restart(args) if args.id == "daemon")
 }
 
 /// All CLI commands are thin mirrors of `ApiRequest`s (one-to-one mapping).
@@ -87,6 +89,7 @@ fn dispatch(cmd: Command, p: &tachyon::style::Palette) -> ExitCode {
                 Some(DaemonAction::Stop) => return daemon_stop(p),
                 Some(DaemonAction::Restart) => return daemon_restart(p),
             },
+            Command::Memory(args) => return memory_cmd(args, p),
             Command::Providers(_) => return providers_cmd(cmd, p),
             _ => {}
         }
@@ -137,7 +140,9 @@ fn dispatch(cmd: Command, p: &tachyon::style::Palette) -> ExitCode {
             limit: args.limit,
         },
         Command::Top(_) => ApiRequest::Top,
-        Command::Daemon(_) | Command::Providers(_) => unreachable!("handled above"),
+        Command::Daemon(_) | Command::Memory(_) | Command::Providers(_) => {
+            unreachable!("handled above")
+        }
     };
 
     let resp = match client.request(&req, std::time::Duration::from_secs(60)) {
@@ -462,6 +467,35 @@ fn daemon_restart(p: &tachyon::style::Palette) -> ExitCode {
     }
     daemon_key_check(p);
     ExitCode::SUCCESS
+}
+
+fn memory_cmd(args: &tachyon::cli::MemoryArgs, p: &tachyon::style::Palette) -> ExitCode {
+    match &args.action {
+        MemoryAction::Wipe => {
+            let path = tachyon::data::memory_path();
+            if tachyon::daemon::status() {
+                println!(
+                    "{}",
+                    render(&p.bad, "cannot wipe memory while the daemon is running")
+                );
+                println!("  stop it first with: tachyon daemon stop");
+                return ExitCode::FAILURE;
+            }
+            match tachyon::data::erase(std::slice::from_ref(&path)) {
+                Ok(results) => {
+                    for (path, deleted) in results {
+                        let status = if deleted { "deleted" } else { "already absent" };
+                        println!("{} {}", render(&p.good, status), path.display());
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    println!("{}", render(&p.bad, error));
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
 }
 
 fn providers_cmd(cmd: Command, p: &tachyon::style::Palette) -> ExitCode {

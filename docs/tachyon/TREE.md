@@ -75,6 +75,7 @@ tachyon/
 │   │       ├── daemon.rs         # Start/stop/status daemon helpers
 │   │       ├── cli.rs            # CLI argument definitions
 │   │       ├── config.rs         # CLI configuration commands
+│   │       ├── data.rs           # Safe authoritative memory wiping
 │   │       ├── providers.rs      # Provider/model configuration commands
 │   │       ├── style.rs          # Terminal presentation helpers
 │   │       └── lib.rs            # Shared CLI crate exports

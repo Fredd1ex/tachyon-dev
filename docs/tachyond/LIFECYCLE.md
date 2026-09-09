@@ -66,11 +66,12 @@ the state transition and signals or kills the process.
 
 `long` optimizes for reuse during the current interaction. `persistent`
 optimizes for continuation over time and requires durable recovery metadata.
-Persistent session metadata, workspace reconstruction, Foreground conversation
-checkpoints, and serializable IPython variable checkpoints are implemented. A
-restarted session receives the same logical identity and restores checkpointed
-state. Unserializable Python objects, active network handles, and external
-processes still require explicit artifact/checkpoint handling.
+Persistent worker metadata, workspace reconstruction, and serializable IPython
+variable checkpoints are implemented. A restarted persistent worker receives
+the same logical identity and restores checkpointed state. Foreground instead
+starts a fresh conversation checkpoint after a Tachyond restart. Unserializable
+Python objects, active network handles, and external processes still require
+explicit artifact/checkpoint handling.
 
 ## Agent Properties
 

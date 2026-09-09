@@ -17,11 +17,18 @@ the source of truth for the intended system and MVP requirements.
 - Worker execution through `ipython` and `agent_browser`.
 - Concurrent worker calls through `spawn_agents`.
 - TUI conversation, scrolling, tool cards, and agent pane.
+- Highlighted TUI conversation cells can be copied with user and assistant text.
+- TUI `ORCHESTRATORS`, `AGENTS`, and active `SCHEDULED` runtime views, plus a
+  placeholder `MEMORY` view for future typed user-memory, history, and runtime
+  inspection.
 - Separate `tachyon-tui` crate and shared `tachyon-client` IPC crate.
 - Initial `tachyon-orchestrator` domain crate for tasks, attention, conversation,
   scheduler, and control concepts.
 - Authoritative `runtime.redb` task persistence, `history.redb` temporal message
   indexes, a durable history outbox, and curated `memories.redb` records.
+- Tachyond-owned durable reminders and scheduled agent work with relative or
+  local-time deadlines, restart recovery, retryable modeled chat delivery, and
+  `start_at`/`finish_by` execution semantics.
 - Separate scheduling and answerability classification for queued follow-ups,
   with conservative delegation when answerability cannot be established.
 - Bounded deferred input and ordered conversation commits.
@@ -30,6 +37,7 @@ the source of truth for the intended system and MVP requirements.
 - Conversation state, ordering, checkpoints, streaming, and synthesis owned by
   `tachyon-foreground`; Ghost has no Conversation role.
 - Environment-only provider secrets.
+- Daemon-safe CLI removal of curated memory with `tachyon memory wipe`.
 
 ## Partial
 
@@ -40,8 +48,10 @@ the source of truth for the intended system and MVP requirements.
   cancelling work.
 - Worker output is visible, but task identity and parentage are inferred rather
   than carried by structured events.
-- Runtime task state and persistent-worker recovery are durable; work requests,
-  schedules, and complete restart reconciliation remain partial.
+- Runtime task state, one-shot reminders, scheduled agent work, and
+  persistent-worker recovery are durable; scheduled work is visible through the
+  TUI, while recurrence, task cancellation, misfire policy, and complete restart
+  reconciliation remain partial.
 - The redb-backed Memory service has typed CRUD and revocation, but the Memory
   Agent, scoped retrieval, and proposal-validation integration are incomplete.
 - Warm worker sessions can be reused by orchestration policy, with default
@@ -59,10 +69,10 @@ the source of truth for the intended system and MVP requirements.
   and termination TTL metadata.
 - Persistent sessions are reported to the recreated Foreground process after daemon
   startup so it can regain control of them.
-- Persistent session metadata, workspace reconstruction, Foreground conversation
-  checkpoints, and serializable IPython variable recovery now survive a
-  Tachyond restart. External handles and complex unserializable objects remain
-  explicit artifact/checkpoint responsibilities.
+- Persistent worker metadata, workspace reconstruction, and serializable IPython
+  variable recovery survive a Tachyond restart. Foreground deliberately starts a
+  fresh conversation checkpoint and turn sequence. External handles and complex
+  unserializable objects remain explicit artifact/checkpoint responsibilities.
 - Local execution uses workspace restrictions, not a hard security boundary.
 
 ## Not Implemented

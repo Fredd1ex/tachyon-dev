@@ -10,7 +10,7 @@ use std::io;
 use std::time::Duration;
 
 use tachyon_api::transport::Connection;
-use tachyon_api::types::{AgentInfo, ApiRequest, ApiResponse, DaemonInfo};
+use tachyon_api::types::{AgentInfo, ApiRequest, ApiResponse, DaemonInfo, ScheduledTaskInfo};
 
 /// Error surfaced to the caller.
 #[derive(Debug)]
@@ -101,6 +101,7 @@ impl Client {
                 origin_turn_id: None,
                 parent_task_id: None,
                 tool_call_id: None,
+                deadline_ms: None,
             },
             Duration::from_secs(10),
         )? {
@@ -113,6 +114,15 @@ impl Client {
         match self.request(&ApiRequest::AgentList, Duration::from_secs(5))? {
             ApiResponse::Agents { agents } => Ok(agents),
             _ => Err(ClientError::Api("unexpected list response".into())),
+        }
+    }
+
+    pub fn scheduled_task_list(&mut self) -> Result<Vec<ScheduledTaskInfo>, ClientError> {
+        match self.request(&ApiRequest::ScheduledTaskList, Duration::from_secs(5))? {
+            ApiResponse::ScheduledTasks { schedules } => Ok(schedules),
+            _ => Err(ClientError::Api(
+                "unexpected scheduled task list response".into(),
+            )),
         }
     }
 

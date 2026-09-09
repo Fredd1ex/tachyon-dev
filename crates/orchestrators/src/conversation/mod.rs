@@ -7,7 +7,12 @@ pub mod prompt;
 
 use crate::capabilities::Capability;
 
-pub const CAPABILITIES: &[Capability] = &[Capability::DelegateOne, Capability::DelegateMany];
+pub const CAPABILITIES: &[Capability] = &[
+    Capability::DelegateOne,
+    Capability::DelegateMany,
+    Capability::Memory,
+    Capability::Schedule,
+];
 
 pub const DELEGATION_CAPABILITIES: &[Capability] =
     &[Capability::DelegateOne, Capability::DelegateMany];
@@ -17,8 +22,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn conversation_exposes_only_delegation_tools() {
-        assert_eq!(CAPABILITIES, DELEGATION_CAPABILITIES);
+    fn conversation_exposes_contextual_daemon_services() {
+        assert!(CAPABILITIES.contains(&Capability::Memory));
+        assert!(CAPABILITIES.contains(&Capability::Schedule));
+        assert!(!DELEGATION_CAPABILITIES.contains(&Capability::Memory));
+        assert!(!DELEGATION_CAPABILITIES.contains(&Capability::Schedule));
     }
 }
 

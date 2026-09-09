@@ -1,12 +1,12 @@
 # v0.4.0 - Tachyond Kernel
 
-Estimated progress: **18%**. Status: **Early**.
+Estimated progress: **24%**. Status: **Early**.
 
 ## Scope
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| durable scheduler / cron | Missing | Dependency-triggered startup and lifecycle reaping exist, but no durable temporal scheduler or cron model. |
+| durable scheduler / cron | Partial | Durable reminders and agent `start_at`/`finish_by` work support local or relative deadlines, restart recovery, and retryable modeled delivery; recurrence and schedule management remain. |
 | commitments | Missing | Present only in design documents. |
 | resource scheduling | Missing | No resource requests, capacity model, admission control, or allocation ledger. |
 | worker supervision | Partial | Tachyond owns processes, assignments, generations, three-turn Short workers, daemon-bound Long workers, and Persistent supervisor reattachment; health and restart policy remain incomplete. |
@@ -63,4 +63,4 @@ Detailed storage requirements are in
 2. Implement `runtime.redb` and one-time Markdown import.
 3. Move task/agent reads and writes off Markdown.
 4. Build restart reconciliation on durable events and snapshots.
-5. Add durable queues, retries, cancellation escalation, and cron.
+5. Extend scheduled work with recurrence, list/cancel management, and explicit misfire policies.

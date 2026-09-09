@@ -10,16 +10,18 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
+use chrono::{Datelike, Duration as ChronoDuration, Local, LocalResult, TimeZone};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 
 use tachyon_api::types::{
     AgentEvent as StructuredAgentEvent, AgentInfo, AgentState, ApiRequest, ApiResponse,
-    BackgroundCoordinatorInfo, DaemonInfo, EventEnvelope, EventStream, HistoryRole,
-    LifecycleRecommendation, LifetimeClass, MemoryRecallItem, MemoryRecallKind,
-    PendingWorkReviewInfo, WorkOutcome, WorkRequest, WorkResult, WorkReviewContext,
-    WorkReviewDecision, WorkReviewFailure, WorkReviewRecommendation, WorkReviewRequest,
-    PROTO_VERSION,
+    BackgroundCoordinatorInfo, BackgroundScheduleAction, BackgroundScheduleDecision,
+    BackgroundScheduleRequest, DaemonInfo, EventEnvelope, EventStream, HistoryKind, HistoryRole,
+    LifecycleRecommendation, LifetimeClass, MemoryMutationResult, MemoryRecallItem,
+    MemoryRecallKind, PendingWorkReviewInfo, ReminderInfo, ScheduleDay, WorkOutcome, WorkRequest,
+    WorkResult, WorkReviewContext, WorkReviewDecision, WorkReviewFailure, WorkReviewRecommendation,
+    WorkReviewRequest, PROTO_VERSION,
 };
 use tachyon_api::{
     InteractionCommand, InteractionCommandEnvelope, InteractionEvent, InteractionEventEnvelope,
@@ -29,7 +31,7 @@ use tachyon_util::guard;
 
 use crate::history_store::HistoryStore;
 use crate::runtime_store::{HistoryProjection, RuntimeStore, RuntimeTaskRecord};
-use tachyon_memory::{explicit_preference, MemoryStore, PreferenceObservation};
+use tachyon_memory::{MemoryMutationSource, MemoryStore};
 
 const DEFAULT_BACKGROUND_REVIEW_TIMEOUT_SECS: u64 = 20;
 
@@ -73,11 +75,19 @@ struct PendingReview {
     request: WorkReviewRequest,
 }
 
+enum CoordinatorRequest {
+    WorkReview(WorkReviewRequest),
+    Schedule {
+        request: BackgroundScheduleRequest,
+        response: mpsc::SyncSender<BackgroundScheduleDecision>,
+    },
+}
+
 struct Registry {
     tasks: HashMap<String, Task>,
     works: HashMap<String, WorkRecord>,
     foreground_id: Option<String>,
-    review_tx: Option<mpsc::SyncSender<WorkReviewRequest>>,
+    coordinator_tx: Option<mpsc::SyncSender<CoordinatorRequest>>,
     background_online: bool,
     background_generation: u64,
     runtime_store: Option<Arc<RuntimeStore>>,
@@ -93,7 +103,7 @@ impl Default for Registry {
             tasks: HashMap::new(),
             works: HashMap::new(),
             foreground_id: None,
-            review_tx: None,
+            coordinator_tx: None,
             background_online: false,
             background_generation: 0,
             runtime_store: None,
@@ -211,6 +221,65 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn schedule_due_at_ms(
+    now_ms: u64,
+    delay_seconds: Option<u64>,
+    local_time: Option<&str>,
+    day: Option<ScheduleDay>,
+) -> Result<u64, String> {
+    match (delay_seconds, local_time, day) {
+        (Some(delay), None, None) if (1..=31_536_000).contains(&delay) => {
+            Ok(now_ms.saturating_add(delay.saturating_mul(1000)))
+        }
+        (None, Some(local_time), Some(day)) => {
+            let (hour, minute) = local_time
+                .split_once(':')
+                .ok_or_else(|| "local time must use 24-hour HH:MM format".to_string())?;
+            let hour = hour
+                .parse::<u32>()
+                .map_err(|_| "local time has an invalid hour".to_string())?;
+            let minute = minute
+                .parse::<u32>()
+                .map_err(|_| "local time has an invalid minute".to_string())?;
+            if hour > 23 || minute > 59 {
+                return Err("local time must use 24-hour HH:MM format".into());
+            }
+            let now = Local
+                .timestamp_millis_opt(now_ms as i64)
+                .single()
+                .ok_or_else(|| "current local time is unavailable".to_string())?;
+            let offset_days = match day {
+                ScheduleDay::Next | ScheduleDay::Today => 0,
+                ScheduleDay::Tomorrow => 1,
+            };
+            let date = now
+                .date_naive()
+                .checked_add_signed(ChronoDuration::days(offset_days))
+                .ok_or_else(|| "scheduled date is out of range".to_string())?;
+            let resolve = |date: chrono::NaiveDate| -> Result<chrono::DateTime<Local>, String> {
+                match Local.with_ymd_and_hms(date.year(), date.month(), date.day(), hour, minute, 0)
+                {
+                    LocalResult::Single(value) => Ok(value),
+                    LocalResult::Ambiguous(first, _) => Ok(first),
+                    LocalResult::None => Err("local time does not exist in this timezone".into()),
+                }
+            };
+            let mut candidate = resolve(date)?;
+            if day == ScheduleDay::Next && candidate.timestamp_millis() <= now_ms as i64 {
+                let tomorrow = date
+                    .checked_add_signed(ChronoDuration::days(1))
+                    .ok_or_else(|| "scheduled date is out of range".to_string())?;
+                candidate = resolve(tomorrow)?;
+            }
+            if candidate.timestamp_millis() <= now_ms as i64 {
+                return Err("scheduled time is already in the past".into());
+            }
+            Ok(candidate.timestamp_millis() as u64)
+        }
+        _ => Err("provide either delay_seconds or local_time with day".into()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn work_fingerprint(
     task: &str,
@@ -221,6 +290,7 @@ fn work_fingerprint(
     origin_turn_id: &Option<String>,
     parent_task_id: &Option<String>,
     tool_call_id: &Option<String>,
+    deadline_ms: &Option<u64>,
 ) -> String {
     serde_json::to_string(&(
         task,
@@ -231,6 +301,7 @@ fn work_fingerprint(
         origin_turn_id,
         parent_task_id,
         tool_call_id,
+        deadline_ms,
     ))
     .unwrap_or_default()
 }
@@ -275,6 +346,55 @@ fn encode_interaction_command(
     metadata.turn_id = turn_id;
     serde_json::to_string(&InteractionCommandEnvelope { metadata, command })
         .map_err(|error| format!("encode interaction command: {error}"))
+}
+
+fn encode_reminder_notification(reminder: &ReminderInfo) -> Result<String, String> {
+    let metadata = InteractionMetadata {
+        protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
+        message_id: format!("reminder-delivery-{}", reminder.id),
+        correlation_id: reminder.id.clone(),
+        causation_id: Some(reminder.id.clone()),
+        conversation_id: reminder.conversation_id.clone(),
+        turn_id: None,
+        generation: 0,
+        occurred_at_ms: unix_now_ms(),
+    };
+    serde_json::to_string(&InteractionCommandEnvelope {
+        metadata,
+        command: InteractionCommand::NotifyUser {
+            text: reminder.text.clone(),
+            model: true,
+        },
+    })
+    .map_err(|error| format!("encode reminder notification: {error}"))
+}
+
+fn encode_scheduled_task_notification(
+    task: &tachyon_api::ScheduledTaskInfo,
+    result: &str,
+) -> Result<String, String> {
+    let metadata = InteractionMetadata {
+        protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
+        message_id: format!("scheduled-task-delivery-{}", task.id),
+        correlation_id: task.id.clone(),
+        causation_id: Some(task.id.clone()),
+        conversation_id: task.conversation_id.clone(),
+        turn_id: None,
+        generation: 0,
+        occurred_at_ms: unix_now_ms(),
+    };
+    let context = format!(
+        "A scheduled agent task has finished. Present its result to the user as a concise standalone update.\nObjective: {}\nResult:\n{}",
+        task.objective, result
+    );
+    serde_json::to_string(&InteractionCommandEnvelope {
+        metadata,
+        command: InteractionCommand::NotifyUser {
+            text: context,
+            model: true,
+        },
+    })
+    .map_err(|error| format!("encode scheduled task notification: {error}"))
 }
 
 fn reap_warm_workers(registry: &Arc<Mutex<Registry>>) {
@@ -416,11 +536,14 @@ fn history_projection(data: &str) -> Option<HistoryProjection> {
     Some(HistoryProjection {
         schema_version: 1,
         event_id: envelope.metadata.message_id,
+        kind: HistoryKind::Conversation,
         conversation_id: envelope.metadata.conversation_id,
         turn_id: envelope.metadata.turn_id,
         occurred_at_ms: envelope.metadata.occurred_at_ms,
         role,
         text,
+        task_id: None,
+        task_state: None,
     })
 }
 
@@ -463,45 +586,217 @@ fn persist_interaction_history(registry: &Arc<Mutex<Registry>>, data: &str) {
     }
 }
 
-fn observe_explicit_preference(registry: &Arc<Mutex<Registry>>, data: &str) {
+fn acknowledge_reminder_notification(registry: &Arc<Mutex<Registry>>, data: &str) {
     let Ok(envelope) = serde_json::from_str::<InteractionEventEnvelope>(data) else {
         return;
     };
-    let InteractionEvent::UserTurnAccepted { text } = &envelope.event else {
-        return;
-    };
-    let Some(record) = explicit_preference(PreferenceObservation {
-        event_id: &envelope.metadata.message_id,
-        conversation_id: &envelope.metadata.conversation_id,
-        turn_id: envelope.metadata.turn_id.as_deref(),
-        text,
-        occurred_at_ms: envelope.metadata.occurred_at_ms,
-    }) else {
-        return;
-    };
-    let store = registry.lock().unwrap().memory_store.clone();
-    let Some(store) = store else {
-        eprintln!("tachyond: memory store missing for preference observation");
-        return;
-    };
-    if let Err(error) = store.put(&record) {
-        eprintln!("tachyond: save preference {}: {error}", record.id);
+    if !matches!(
+        envelope.event,
+        InteractionEvent::UserVisibleNotificationPublished { .. }
+    ) {
         return;
     }
-    let turn = envelope
+    let store = registry.lock().unwrap().runtime_store.clone();
+    let Some(store) = store else { return };
+    if envelope
         .metadata
-        .turn_id
-        .as_deref()
-        .and_then(|turn| turn.parse::<u64>().ok());
-    emit_memory_event(
-        registry,
-        envelope.metadata.conversation_id,
-        envelope.metadata.turn_id,
-        StructuredAgentEvent::MemorySaved {
-            turn,
-            memory_id: record.id,
-        },
-    );
+        .correlation_id
+        .starts_with("scheduled-task-")
+    {
+        if let Err(error) =
+            store.acknowledge_scheduled_task_notification(&envelope.metadata.correlation_id)
+        {
+            eprintln!(
+                "tachyond: acknowledge scheduled task {}: {error}",
+                envelope.metadata.correlation_id
+            );
+        }
+        return;
+    }
+    if !envelope.metadata.correlation_id.starts_with("reminder-") {
+        return;
+    }
+    match store.acknowledge_reminder_delivery(
+        &envelope.metadata.correlation_id,
+        envelope.metadata.occurred_at_ms,
+    ) {
+        Ok(reminder) => emit_schedule_event(
+            registry,
+            reminder.conversation_id.clone(),
+            reminder.turn,
+            StructuredAgentEvent::ReminderFired {
+                turn: Some(reminder.turn),
+                reminder_id: reminder.id,
+            },
+        ),
+        Err(error) => eprintln!(
+            "tachyond: acknowledge reminder {}: {error}",
+            envelope.metadata.correlation_id
+        ),
+    }
+}
+
+fn scheduled_result_text(data: &str) -> (String, bool) {
+    let result = serde_json::from_str::<EventEnvelope>(data)
+        .ok()
+        .and_then(|event| match event.kind {
+            StructuredAgentEvent::WorkResult { result } => Some(result),
+            _ => None,
+        });
+    let Some(result) = result else {
+        return (data.to_string(), false);
+    };
+    match result.outcome {
+        WorkOutcome::Completed { result, .. } => (result.clone(), false),
+        WorkOutcome::Blocked { reason } => (format!("Blocked: {reason}"), true),
+        WorkOutcome::Failed { message } => (format!("Failed: {message}"), true),
+        WorkOutcome::Cancelled { reason } => (format!("Cancelled: {reason}"), true),
+        WorkOutcome::TimedOut { deadline_ms } => {
+            (format!("Timed out at deadline {deadline_ms}."), true)
+        }
+    }
+}
+
+fn execute_scheduled_task(
+    registry: Arc<Mutex<Registry>>,
+    store: Arc<RuntimeStore>,
+    task: tachyon_api::ScheduledTaskInfo,
+) {
+    let work_id = task
+        .work_id
+        .clone()
+        .unwrap_or_else(|| format!("scheduled-work-{}", task.id));
+    let deadline_ms = match task.mode {
+        tachyon_api::ScheduledTaskMode::FinishBy => task.due_at_ms,
+        tachyon_api::ScheduledTaskMode::StartAt => {
+            unix_now_ms().saturating_add(worker_result_timeout().as_millis() as u64)
+        }
+    };
+    if deadline_ms <= unix_now_ms() {
+        let _ = store.store_scheduled_task_result(
+            &task.id,
+            "The task deadline passed before execution could begin.",
+            true,
+        );
+        return;
+    }
+    let request = ApiRequest::BackgroundDelegate {
+        task: task.objective.clone(),
+        cwd: None,
+        depends_on: Vec::new(),
+        lifetime_class: LifetimeClass::Short,
+        purpose: "scheduled_task".into(),
+        logical_task_id: Some(work_id.clone()),
+        origin_turn_id: Some(task.turn.to_string()),
+        parent_task_id: None,
+        tool_call_id: Some(task.id.clone()),
+        deadline_ms: Some(deadline_ms),
+    };
+    if let ApiResponse::Error { message, .. } = dispatch(&request, &registry) {
+        let _ = store.store_scheduled_task_result(&task.id, &message, true);
+        return;
+    }
+    loop {
+        let result = registry
+            .lock()
+            .unwrap()
+            .works
+            .get(&work_id)
+            .and_then(|work| work.terminal_result.clone());
+        if let Some(result) = result {
+            let (text, failed) = scheduled_result_text(&result);
+            if let Err(error) = store.store_scheduled_task_result(&task.id, &text, failed) {
+                eprintln!("tachyond: store scheduled task result {}: {error}", task.id);
+            }
+            return;
+        }
+        if unix_now_ms() > deadline_ms.saturating_add(1_000) {
+            let _ = store.store_scheduled_task_result(
+                &task.id,
+                "The scheduled task did not complete before its deadline.",
+                true,
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn run_reminder_scheduler(registry: Arc<Mutex<Registry>>, shutdown: Arc<AtomicBool>) {
+    if let Some(store) = registry.lock().unwrap().runtime_store.clone() {
+        if let Err(error) = store.recover_scheduled_tasks() {
+            eprintln!("tachyond: recover scheduled tasks: {error}");
+        }
+    }
+    while !shutdown.load(Ordering::SeqCst) {
+        let (store, user_connected) = {
+            let registry = registry.lock().unwrap();
+            (
+                registry.runtime_store.clone(),
+                registry
+                    .tasks
+                    .get(FOREGROUND_ID)
+                    .is_some_and(|foreground| !foreground.subs.is_empty()),
+            )
+        };
+        if let Some(store) = store {
+            match store.claim_ready_scheduled_tasks(unix_now_ms(), 8) {
+                Ok(tasks) => {
+                    for task in tasks {
+                        let task_registry = Arc::clone(&registry);
+                        let task_store = Arc::clone(&store);
+                        std::thread::spawn(move || {
+                            execute_scheduled_task(task_registry, task_store, task)
+                        });
+                    }
+                }
+                Err(error) => eprintln!("tachyond: poll scheduled tasks: {error}"),
+            }
+            if user_connected {
+                match store.claim_scheduled_task_notifications(unix_now_ms(), 8) {
+                    Ok(notifications) => {
+                        for (task, result) in notifications {
+                            let delivery = encode_scheduled_task_notification(&task, &result)
+                                .and_then(|command| {
+                                    task_input(&registry, FOREGROUND_ID).and_then(|input| {
+                                        write_task_input(input, FOREGROUND_ID, &command)
+                                    })
+                                });
+                            if let Err(error) = delivery {
+                                eprintln!("tachyond: deliver scheduled task {}: {error}", task.id);
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!("tachyond: poll scheduled task results: {error}"),
+                }
+                match store.claim_due_reminders(unix_now_ms(), 32) {
+                    Ok(reminders) => {
+                        for reminder in reminders {
+                            let delivery =
+                                encode_reminder_notification(&reminder).and_then(|command| {
+                                    task_input(&registry, FOREGROUND_ID).and_then(|input| {
+                                        write_task_input(input, FOREGROUND_ID, &command)
+                                    })
+                                });
+                            if let Err(error) = delivery {
+                                eprintln!("tachyond: deliver reminder {}: {error}", reminder.id);
+                                if let Err(release_error) =
+                                    store.release_reminder_delivery(&reminder.id)
+                                {
+                                    eprintln!(
+                                        "tachyond: release reminder {}: {release_error}",
+                                        reminder.id
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!("tachyond: poll reminders: {error}"),
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 fn emit_memory_event(
@@ -530,28 +825,63 @@ fn emit_memory_event(
     }
 }
 
-fn wants_history_recall(query: &str) -> bool {
-    let query = query.to_ascii_lowercase();
-    [
-        "history",
-        "what did we",
-        "what were we",
-        "worked on",
-        "working on",
-        "previously",
-        "earlier",
-        "yesterday",
-        "last week",
-        "last monday",
-        "last tuesday",
-        "last wednesday",
-        "last thursday",
-        "last friday",
-        "last saturday",
-        "last sunday",
-    ]
-    .iter()
-    .any(|marker| query.contains(marker))
+fn emit_schedule_event(
+    registry: &Arc<Mutex<Registry>>,
+    conversation_id: String,
+    turn: u64,
+    kind: StructuredAgentEvent,
+) {
+    let sequence = DAEMON_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let envelope = EventEnvelope {
+        event_id: sequence,
+        session_id: BACKGROUND_ID.into(),
+        conversation_id: Some(conversation_id),
+        turn_id: Some(turn.to_string()),
+        task_id: None,
+        parent_task_id: None,
+        tool_call_id: None,
+        actor: tachyon_api::Actor::Background,
+        sequence,
+        occurred_at_ms: unix_now_ms(),
+        kind,
+    };
+    if let Ok(data) = serde_json::to_string(&envelope) {
+        push_event(registry, FOREGROUND_ID, EventStream::Stdout, &data);
+    }
+}
+
+fn coordinate_schedule(
+    registry: &Arc<Mutex<Registry>>,
+    action: BackgroundScheduleAction,
+) -> Result<BackgroundScheduleAction, String> {
+    let sequence = DAEMON_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let request = BackgroundScheduleRequest {
+        request_id: format!("schedule-command-{sequence}"),
+        action: action.clone(),
+    };
+    let coordinator = registry
+        .lock()
+        .unwrap()
+        .coordinator_tx
+        .clone()
+        .ok_or_else(|| "background coordinator unavailable".to_string())?;
+    let (response_tx, response_rx) = mpsc::sync_channel(1);
+    coordinator
+        .try_send(CoordinatorRequest::Schedule {
+            request: request.clone(),
+            response: response_tx,
+        })
+        .map_err(|_| "background coordinator queue unavailable".to_string())?;
+    let decision = response_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .map_err(|_| "background coordinator schedule decision timed out".to_string())?;
+    if decision.request_id != request.request_id || decision.action != action {
+        return Err("background coordinator returned a mismatched schedule decision".into());
+    }
+    if !decision.approved {
+        return Err(decision.reason);
+    }
+    Ok(decision.action)
 }
 
 fn history_recall_window(query: &str, now_ms: u64) -> (u64, u64) {
@@ -635,6 +965,8 @@ fn recall_task_history(
         .take(limit)
         .map(|(_, record)| MemoryRecallItem {
             kind: MemoryRecallKind::TaskHistory,
+            memory_id: None,
+            descriptor: None,
             text: format!(
                 "{} [{}]: {}",
                 record.info.id, record.info.state, record.info.task
@@ -1011,8 +1343,6 @@ fn start_ready_tasks(registry: &Arc<Mutex<Registry>>) {
                     let work = reg.works.get_mut(work_id)?;
                     work.request.generation = generation;
                     work.request.assignment = assignment;
-                    work.request.deadline_ms =
-                        unix_now_ms().saturating_add(worker_result_timeout().as_millis() as u64);
                     Some(work.request.clone())
                 });
                 if let Some(request) = &work_request {
@@ -1116,7 +1446,7 @@ fn handle_work_candidate(
         }
         return;
     }
-    let (request, review_tx) = {
+    let (request, coordinator_tx) = {
         let mut reg = registry.lock().unwrap();
         let Some(task) = reg.tasks.get(worker_id) else {
             return;
@@ -1165,11 +1495,12 @@ fn handle_work_candidate(
         work.review = Some(PendingReview {
             request: request.clone(),
         });
-        (request, reg.review_tx.clone())
+        (request, reg.coordinator_tx.clone())
     };
-    let queued = review_tx
-        .as_ref()
-        .is_some_and(|tx| tx.try_send(request.clone()).is_ok());
+    let queued = coordinator_tx.as_ref().is_some_and(|tx| {
+        tx.try_send(CoordinatorRequest::WorkReview(request.clone()))
+            .is_ok()
+    });
     if !queued {
         fail_pending_review(
             registry,
@@ -1482,7 +1813,7 @@ fn push_event(registry: &Arc<Mutex<Registry>>, id: &str, stream: EventStream, da
     }
     handle_context_compaction(registry, id, &correlated_data);
     persist_interaction_history(registry, &correlated_data);
-    observe_explicit_preference(registry, &correlated_data);
+    acknowledge_reminder_notification(registry, &correlated_data);
     log_event(id, &stream, &correlated_data);
     if completed {
         start_ready_tasks(registry);
@@ -1718,12 +2049,12 @@ fn main() -> std::process::ExitCode {
         memory_store: Some(memory_store),
         ..Registry::default()
     }));
-    let (review_tx, review_rx) = mpsc::sync_channel(64);
-    reg.lock().unwrap().review_tx = Some(review_tx);
+    let (coordinator_tx, coordinator_rx) = mpsc::sync_channel(64);
+    reg.lock().unwrap().coordinator_tx = Some(coordinator_tx);
     let background_registry = Arc::clone(&reg);
     let background_shutdown = Arc::clone(&shutdown);
     let background = std::thread::spawn(move || {
-        supervise_background(background_registry, review_rx, background_shutdown)
+        supervise_background(background_registry, coordinator_rx, background_shutdown)
     });
     if let Err(error) = project_pending_history(&reg) {
         eprintln!("tachyond: replay history outbox: {error}");
@@ -1820,6 +2151,10 @@ fn main() -> std::process::ExitCode {
             Err(e) => eprintln!("tachyond: failed to start foreground: {e}"),
         }
     }
+
+    let reminder_registry = Arc::clone(&reg);
+    let reminder_shutdown = Arc::clone(&shutdown);
+    std::thread::spawn(move || run_reminder_scheduler(reminder_registry, reminder_shutdown));
 
     let server_reg = Arc::clone(&reg);
     let server_shutdown = Arc::clone(&shutdown);
@@ -2085,6 +2420,7 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
             query,
             conversation_id,
             turn,
+            include_history,
             max_items,
             max_chars,
         } => {
@@ -2109,7 +2445,7 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
                     return ApiResponse::error(format!("memory recall failed: {error}"));
                 }
             };
-            let recall_history = wants_history_recall(query);
+            let recall_history = *include_history;
             let task_entries = if recall_history {
                 let Some(runtime) = runtime else {
                     return ApiResponse::error("runtime store unavailable");
@@ -2142,6 +2478,15 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
                 .into_iter()
                 .map(|record| MemoryRecallItem {
                     kind: MemoryRecallKind::Preference,
+                    memory_id: Some(record.id),
+                    descriptor: Some(tachyon_api::types::MemoryDescriptor {
+                        kind: record.kind,
+                        namespace: record.namespace,
+                        relation: record.predicate,
+                        scope: record.scope,
+                        cardinality: record.cardinality,
+                        topics: record.topics,
+                    }),
                     text: record.value,
                     occurred_at_ms: record.updated_at_ms,
                 })
@@ -2150,6 +2495,8 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
                 .into_iter()
                 .map(|entry| MemoryRecallItem {
                     kind: MemoryRecallKind::History,
+                    memory_id: None,
+                    descriptor: None,
                     text: format!("{:?}: {}", entry.role, entry.text),
                     occurred_at_ms: entry.occurred_at_ms,
                 })
@@ -2208,6 +2555,230 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
             }
             ApiResponse::MemoryRecall { items, truncated }
         }
+        MemoryMutate {
+            intent,
+            source_event_id,
+            conversation_id,
+            turn,
+            occurred_at_ms,
+        } => {
+            let memory = registry.lock().unwrap().memory_store.clone();
+            let Some(memory) = memory else {
+                return ApiResponse::MemoryMutation {
+                    result: MemoryMutationResult::Unavailable,
+                };
+            };
+            let result = match memory.apply_intent(
+                intent,
+                MemoryMutationSource {
+                    event_id: source_event_id,
+                    conversation_id,
+                    turn_id: *turn,
+                    occurred_at_ms: *occurred_at_ms,
+                },
+            ) {
+                Ok(result) => result,
+                Err(error) => MemoryMutationResult::Rejected {
+                    reason: error.to_string(),
+                },
+            };
+            if !matches!(result, MemoryMutationResult::Ignored) {
+                emit_memory_event(
+                    registry,
+                    conversation_id.clone(),
+                    Some(turn.to_string()),
+                    StructuredAgentEvent::MemoryMutation {
+                        turn: Some(*turn),
+                        result: result.clone(),
+                    },
+                );
+            }
+            ApiResponse::MemoryMutation { result }
+        }
+        ReminderCreate {
+            source_event_id,
+            conversation_id,
+            turn,
+            text,
+            delay_seconds,
+            local_time,
+            day,
+            created_at_ms,
+        } => {
+            let text = text.trim();
+            if text.is_empty() || text.chars().count() > 500 {
+                return ApiResponse::error("reminder text must contain 1 to 500 characters");
+            }
+            let now_ms = unix_now_ms();
+            let due_at_ms =
+                match schedule_due_at_ms(now_ms, *delay_seconds, local_time.as_deref(), *day) {
+                    Ok(due_at_ms) => due_at_ms,
+                    Err(error) => return ApiResponse::error(error),
+                };
+            let store = registry.lock().unwrap().runtime_store.clone();
+            let Some(store) = store else {
+                return ApiResponse::error("runtime store unavailable");
+            };
+            let action = BackgroundScheduleAction::Create {
+                source_event_id: source_event_id.clone(),
+                conversation_id: conversation_id.clone(),
+                turn: *turn,
+                text: text.to_string(),
+                delay_seconds: *delay_seconds,
+                local_time: local_time.clone(),
+                day: *day,
+                created_at_ms: *created_at_ms,
+            };
+            if let Err(error) = coordinate_schedule(registry, action) {
+                return ApiResponse::error(format!("schedule coordination failed: {error}"));
+            }
+            let id = format!("reminder-{created_at_ms}-{turn}");
+            match store.create_reminder(
+                &id,
+                source_event_id,
+                conversation_id,
+                *turn,
+                text,
+                now_ms,
+                due_at_ms,
+            ) {
+                Ok(reminder) => {
+                    emit_schedule_event(
+                        registry,
+                        conversation_id.clone(),
+                        *turn,
+                        StructuredAgentEvent::ReminderScheduled {
+                            turn: Some(*turn),
+                            reminder_id: reminder.id.clone(),
+                            due_at_ms: reminder.due_at_ms,
+                        },
+                    );
+                    ApiResponse::Reminder { reminder }
+                }
+                Err(error) => ApiResponse::error(format!("create reminder failed: {error}")),
+            }
+        }
+        ReminderList => {
+            if let Err(error) = coordinate_schedule(registry, BackgroundScheduleAction::List) {
+                return ApiResponse::error(format!("schedule coordination failed: {error}"));
+            }
+            let store = registry.lock().unwrap().runtime_store.clone();
+            let Some(store) = store else {
+                return ApiResponse::error("runtime store unavailable");
+            };
+            match store.active_reminders() {
+                Ok(reminders) => ApiResponse::Reminders { reminders },
+                Err(error) => ApiResponse::error(format!("list reminders failed: {error}")),
+            }
+        }
+        ReminderCancel {
+            id,
+            conversation_id,
+            turn,
+        } => {
+            if let Err(error) = coordinate_schedule(
+                registry,
+                BackgroundScheduleAction::Cancel { id: id.clone() },
+            ) {
+                return ApiResponse::error(format!("schedule coordination failed: {error}"));
+            }
+            let store = registry.lock().unwrap().runtime_store.clone();
+            let Some(store) = store else {
+                return ApiResponse::error("runtime store unavailable");
+            };
+            match store.cancel_reminder(id) {
+                Ok(reminder) => {
+                    emit_schedule_event(
+                        registry,
+                        conversation_id.clone(),
+                        *turn,
+                        StructuredAgentEvent::ReminderCancelled {
+                            turn: Some(*turn),
+                            reminder_id: reminder.id.clone(),
+                        },
+                    );
+                    ApiResponse::Reminder { reminder }
+                }
+                Err(error) => ApiResponse::error(format!("cancel reminder failed: {error}")),
+            }
+        }
+        ScheduledTaskCreate {
+            source_event_id,
+            conversation_id,
+            turn,
+            objective,
+            mode,
+            delay_seconds,
+            local_time,
+            day,
+            created_at_ms,
+        } => {
+            let objective = objective.trim();
+            if objective.is_empty() || objective.chars().count() > 4_000 {
+                return ApiResponse::error("task objective must contain 1 to 4000 characters");
+            }
+            let now_ms = unix_now_ms();
+            let due_at_ms =
+                match schedule_due_at_ms(now_ms, *delay_seconds, local_time.as_deref(), *day) {
+                    Ok(due_at_ms) => due_at_ms,
+                    Err(error) => return ApiResponse::error(error),
+                };
+            let action = BackgroundScheduleAction::CreateTask {
+                source_event_id: source_event_id.clone(),
+                conversation_id: conversation_id.clone(),
+                turn: *turn,
+                objective: objective.to_string(),
+                mode: *mode,
+                delay_seconds: *delay_seconds,
+                local_time: local_time.clone(),
+                day: *day,
+                created_at_ms: *created_at_ms,
+            };
+            if let Err(error) = coordinate_schedule(registry, action) {
+                return ApiResponse::error(format!("schedule coordination failed: {error}"));
+            }
+            let store = registry.lock().unwrap().runtime_store.clone();
+            let Some(store) = store else {
+                return ApiResponse::error("runtime store unavailable");
+            };
+            let id = format!("scheduled-task-{created_at_ms}-{turn}");
+            match store.create_scheduled_task(
+                &id,
+                source_event_id,
+                conversation_id,
+                *turn,
+                objective,
+                *mode,
+                now_ms,
+                due_at_ms,
+            ) {
+                Ok(schedule) => {
+                    emit_schedule_event(
+                        registry,
+                        conversation_id.clone(),
+                        *turn,
+                        StructuredAgentEvent::ScheduledTaskCreated {
+                            turn: Some(*turn),
+                            schedule_id: schedule.id.clone(),
+                            due_at_ms: schedule.due_at_ms,
+                            mode: schedule.mode,
+                        },
+                    );
+                    ApiResponse::ScheduledTask { schedule }
+                }
+                Err(error) => ApiResponse::error(format!("create scheduled task failed: {error}")),
+            }
+        }
+        ScheduledTaskList => {
+            let store = registry.lock().unwrap().runtime_store.clone();
+            let Some(store) = store else {
+                return ApiResponse::error("runtime store unavailable");
+            };
+            match store.scheduled_tasks() {
+                Ok(schedules) => ApiResponse::ScheduledTasks { schedules },
+                Err(error) => ApiResponse::error(format!("list scheduled tasks failed: {error}")),
+            }
+        }
         AgentStart {
             task,
             cwd,
@@ -2218,6 +2789,7 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
             origin_turn_id,
             parent_task_id,
             tool_call_id,
+            deadline_ms,
         }
         | BackgroundDelegate {
             task,
@@ -2229,6 +2801,7 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
             origin_turn_id,
             parent_task_id,
             tool_call_id,
+            deadline_ms,
         } => {
             let delegated_by_background = matches!(req, BackgroundDelegate { .. });
             let work_identity = if delegated_by_background {
@@ -2248,6 +2821,7 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
                         origin_turn_id,
                         parent_task_id,
                         tool_call_id,
+                        deadline_ms,
                     ),
                 ))
             } else {
@@ -2289,8 +2863,9 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
                         objective: task.clone(),
                         generation,
                         assignment,
-                        deadline_ms: unix_now_ms()
-                            .saturating_add(worker_result_timeout().as_millis() as u64),
+                        deadline_ms: deadline_ms.unwrap_or_else(|| {
+                            unix_now_ms().saturating_add(worker_result_timeout().as_millis() as u64)
+                        }),
                         lifetime_class: *lifetime_class,
                     };
                     reg.works.insert(
@@ -2418,8 +2993,9 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
                     objective: task.clone(),
                     generation: 0,
                     assignment: 0,
-                    deadline_ms: unix_now_ms()
-                        .saturating_add(worker_result_timeout().as_millis() as u64),
+                    deadline_ms: deadline_ms.unwrap_or_else(|| {
+                        unix_now_ms().saturating_add(worker_result_timeout().as_millis() as u64)
+                    }),
                     lifetime_class: *lifetime_class,
                 };
                 reg.works.insert(
@@ -3107,6 +3683,15 @@ fn write_review_request(
     stdin.flush()
 }
 
+fn write_schedule_request(
+    stdin: &mut std::process::ChildStdin,
+    request: &BackgroundScheduleRequest,
+) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *stdin, request).map_err(std::io::Error::other)?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()
+}
+
 fn current_review_request(
     registry: &Arc<Mutex<Registry>>,
     request: &WorkReviewRequest,
@@ -3123,10 +3708,14 @@ fn current_review_request(
 
 fn supervise_background(
     registry: Arc<Mutex<Registry>>,
-    rx: mpsc::Receiver<WorkReviewRequest>,
+    rx: mpsc::Receiver<CoordinatorRequest>,
     shutdown: Arc<AtomicBool>,
 ) {
     let mut generation = 0_u64;
+    let schedule_responses = Arc::new(Mutex::new(HashMap::<
+        String,
+        mpsc::SyncSender<BackgroundScheduleDecision>,
+    >::new()));
     while !shutdown.load(Ordering::SeqCst) {
         let mut child = match spawn_background() {
             Ok(child) => child,
@@ -3157,8 +3746,20 @@ fn supervise_background(
         registry.lock().unwrap().background_online = true;
         if let Some(stdout) = child.stdout.take() {
             let decision_registry = Arc::clone(&registry);
+            let schedule_responses = Arc::clone(&schedule_responses);
             std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if let Ok(decision) = serde_json::from_str::<BackgroundScheduleDecision>(&line)
+                    {
+                        if let Some(response) = schedule_responses
+                            .lock()
+                            .unwrap()
+                            .remove(&decision.request_id)
+                        {
+                            let _ = response.send(decision);
+                        }
+                        continue;
+                    }
                     match serde_json::from_str::<WorkReviewDecision>(&line) {
                         Ok(decision) => apply_work_review(&decision_registry, decision),
                         Err(error) => {
@@ -3184,13 +3785,28 @@ fn supervise_background(
         }
         while !restart && !shutdown.load(Ordering::SeqCst) {
             match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(request) => {
-                    if let Some(request) = current_review_request(&registry, &request) {
-                        if write_review_request(&mut stdin, &request).is_err() {
+                Ok(command) => match command {
+                    CoordinatorRequest::WorkReview(request) => {
+                        if let Some(request) = current_review_request(&registry, &request) {
+                            if write_review_request(&mut stdin, &request).is_err() {
+                                restart = true;
+                            }
+                        }
+                    }
+                    CoordinatorRequest::Schedule { request, response } => {
+                        schedule_responses
+                            .lock()
+                            .unwrap()
+                            .insert(request.request_id.clone(), response);
+                        if write_schedule_request(&mut stdin, &request).is_err() {
+                            schedule_responses
+                                .lock()
+                                .unwrap()
+                                .remove(&request.request_id);
                             restart = true;
                         }
                     }
-                }
+                },
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     registry.lock().unwrap().background_online = false;
@@ -3210,6 +3826,7 @@ fn supervise_background(
         registry.lock().unwrap().background_online = false;
         let _ = child.kill();
         let _ = child.wait();
+        schedule_responses.lock().unwrap().clear();
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
 }
@@ -3287,14 +3904,7 @@ fn spawn_warm_ghost(id: &str, workspace: &str) -> std::io::Result<Child> {
 /// Spawn the standalone Conversational Agent. Returns
 /// (id, child, stdin).
 fn spawn_foreground() -> std::io::Result<(String, Child, std::process::ChildStdin)> {
-    let mut cmd = Command::new(foreground_path());
-    cmd.arg("--agent-id").arg(FOREGROUND_ID);
-
-    // The Conversational Agent's workspace should be the directory the daemon
-    // was launched from (the user's project when they ran `tachyon` there).
-    if let Ok(cwd) = std::env::current_dir() {
-        cmd.arg("--cwd").arg(&cwd).current_dir(&cwd);
-    }
+    let mut cmd = foreground_command();
 
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -3307,6 +3917,21 @@ fn spawn_foreground() -> std::io::Result<(String, Child, std::process::ChildStdi
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdin"))?;
     let id = FOREGROUND_ID.to_string();
     Ok((id, child, stdin))
+}
+
+fn foreground_command() -> Command {
+    let mut cmd = Command::new(foreground_path());
+    cmd.arg("--agent-id")
+        .arg(FOREGROUND_ID)
+        .arg("--new-session");
+
+    // The Conversational Agent's workspace should be the directory the daemon
+    // was launched from (the user's project when they ran `tachyon` there).
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.arg("--cwd").arg(&cwd).current_dir(&cwd);
+    }
+
+    cmd
 }
 
 /// Run on a thread: pump a ghost's stdout/stderr to subscribers and finish the
@@ -3651,17 +4276,18 @@ fn handle_foreground_spawn(registry: &Arc<Mutex<Registry>>, spec: &str, foregrou
 }
 
 fn collect_worker_result(registry: Arc<Mutex<Registry>>, work_id: String, foreground_id: String) {
-    let (rx, request, worker_id) = {
+    let (rx, request, worker_id, scheduled) = {
         let mut reg = registry.lock().unwrap();
         let Some(work) = reg.works.get(&work_id) else {
             return;
         };
         let request = work.request.clone();
         let worker_id = work.worker_id.clone();
+        let scheduled = work.info.purpose == "scheduled_task";
         let Some(rx) = reg.subscribe_work(&work_id) else {
             return;
         };
-        (rx, request, worker_id)
+        (rx, request, worker_id, scheduled)
     };
     std::thread::spawn(move || {
         let remaining_ms = request.deadline_ms.saturating_sub(unix_now_ms());
@@ -3696,6 +4322,9 @@ fn collect_worker_result(registry: Arc<Mutex<Registry>>, work_id: String, foregr
             Err(mpsc::RecvTimeoutError::Disconnected) => None,
         };
         let Some(event) = event else { return };
+        if scheduled {
+            return;
+        }
         let Ok(envelope) = serde_json::from_str::<EventEnvelope>(&event.data) else {
             return;
         };
@@ -3854,6 +4483,32 @@ fn drain_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tachyon_api::types::{MemoryIntent, MemoryMutationKind};
+
+    #[test]
+    fn absolute_local_deadlines_distinguish_today_tomorrow_and_next() {
+        let now = Local
+            .with_ymd_and_hms(2026, 1, 10, 13, 0, 0)
+            .single()
+            .unwrap();
+        let now_ms = now.timestamp_millis() as u64;
+        assert!(schedule_due_at_ms(now_ms, None, Some("12:00"), Some(ScheduleDay::Today)).is_err());
+
+        let next_ms =
+            schedule_due_at_ms(now_ms, None, Some("12:00"), Some(ScheduleDay::Next)).unwrap();
+        let next = Local.timestamp_millis_opt(next_ms as i64).single().unwrap();
+        assert_eq!(next.date_naive().to_string(), "2026-01-11");
+        assert_eq!(next.format("%H:%M").to_string(), "12:00");
+
+        let tomorrow_ms =
+            schedule_due_at_ms(now_ms, None, Some("08:00"), Some(ScheduleDay::Tomorrow)).unwrap();
+        let tomorrow = Local
+            .timestamp_millis_opt(tomorrow_ms as i64)
+            .single()
+            .unwrap();
+        assert_eq!(tomorrow.date_naive().to_string(), "2026-01-11");
+        assert_eq!(tomorrow.format("%H:%M").to_string(), "08:00");
+    }
 
     #[test]
     fn foreground_commands_are_versioned_and_preserve_multiline_turns() {
@@ -3878,6 +4533,16 @@ mod tests {
             decoded.command,
             InteractionCommand::AcceptUserTurn { text } if text == "line one\nline two"
         ));
+    }
+
+    #[test]
+    fn daemon_launches_foreground_with_a_fresh_checkpoint() {
+        let command = foreground_command();
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(&args[..3], &["--agent-id", FOREGROUND_ID, "--new-session"]);
     }
 
     fn task(id: &str, state: AgentState) -> Task {
@@ -3927,11 +4592,11 @@ mod tests {
 
     fn review_registry(
         lifetime_class: LifetimeClass,
-    ) -> (Arc<Mutex<Registry>>, mpsc::Receiver<WorkReviewRequest>) {
-        let (review_tx, review_rx) = mpsc::sync_channel(4);
+    ) -> (Arc<Mutex<Registry>>, mpsc::Receiver<CoordinatorRequest>) {
+        let (coordinator_tx, coordinator_rx) = mpsc::sync_channel(4);
         let mut registry = Registry {
             background_generation: 7,
-            review_tx: Some(review_tx),
+            coordinator_tx: Some(coordinator_tx),
             ..Registry::default()
         };
         let mut worker = task("worker", AgentState::Running);
@@ -3962,7 +4627,7 @@ mod tests {
                 subs: Vec::new(),
             },
         );
-        (Arc::new(Mutex::new(registry)), review_rx)
+        (Arc::new(Mutex::new(registry)), coordinator_rx)
     }
 
     fn completed_candidate() -> EventEnvelope {
@@ -4571,35 +5236,38 @@ mod tests {
     }
 
     #[test]
-    fn accepted_explicit_preference_is_saved_but_an_ordinary_task_is_not() {
+    fn typed_memory_mutation_commits_before_reporting_success() {
         let directory = tempfile::tempdir().unwrap();
         let memory = Arc::new(MemoryStore::open(directory.path().join("memories.redb")).unwrap());
         let registry = Arc::new(Mutex::new(Registry {
             memory_store: Some(Arc::clone(&memory)),
             ..Registry::default()
         }));
-        for (message_id, text) in [
-            ("preference", "I prefer concise status updates."),
-            ("task", "Implement database regeneration tests."),
-        ] {
-            let event = InteractionEventEnvelope {
-                metadata: InteractionMetadata {
-                    protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
-                    message_id: message_id.into(),
-                    correlation_id: message_id.into(),
-                    causation_id: None,
-                    conversation_id: "conversation-1".into(),
-                    turn_id: Some("1".into()),
-                    generation: 0,
-                    occurred_at_ms: 123,
+        let response = dispatch(
+            &ApiRequest::MemoryMutate {
+                intent: MemoryIntent::Remember {
+                    descriptor: tachyon_api::types::MemoryDescriptor::default(),
+                    value: "likes pickles".into(),
                 },
-                event: InteractionEvent::UserTurnAccepted { text: text.into() },
-            };
-            observe_explicit_preference(&registry, &serde_json::to_string(&event).unwrap());
-        }
+                source_event_id: "message-1".into(),
+                conversation_id: "conversation-1".into(),
+                turn: 1,
+                occurred_at_ms: 123,
+            },
+            &registry,
+        );
+        assert!(matches!(
+            response,
+            ApiResponse::MemoryMutation {
+                result: MemoryMutationResult::Applied {
+                    kind: MemoryMutationKind::Remember,
+                    ..
+                }
+            }
+        ));
         let records = memory.list().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].value, "I prefer concise status updates.");
+        assert_eq!(records[0].value, "likes pickles");
     }
 
     #[test]
@@ -4607,15 +5275,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let memory = Arc::new(MemoryStore::open(directory.path().join("memories.redb")).unwrap());
         memory
-            .put(
-                &explicit_preference(PreferenceObservation {
+            .apply_intent(
+                &MemoryIntent::Remember {
+                    descriptor: tachyon_api::types::MemoryDescriptor::default(),
+                    value: "prefers concise Rust answers".into(),
+                },
+                MemoryMutationSource {
                     event_id: "preference",
                     conversation_id: "conversation-1",
-                    turn_id: Some("1"),
-                    text: "I prefer concise Rust answers.",
+                    turn_id: 1,
                     occurred_at_ms: 100,
-                })
-                .unwrap(),
+                },
             )
             .unwrap();
         let history = Arc::new(HistoryStore::open(&directory.path().join("history.redb")).unwrap());
@@ -4623,11 +5293,14 @@ mod tests {
             .apply(&HistoryProjection {
                 schema_version: 1,
                 event_id: "history".into(),
+                kind: HistoryKind::Conversation,
                 conversation_id: "conversation-1".into(),
                 turn_id: Some("2".into()),
                 occurred_at_ms: 200,
                 role: HistoryRole::Assistant,
                 text: "Implemented the Rust database layer.".into(),
+                task_id: None,
+                task_state: None,
             })
             .unwrap();
         let registry = Arc::new(Mutex::new(Registry {
@@ -4652,6 +5325,7 @@ mod tests {
                 query: "What did we work on in the Rust history?".into(),
                 conversation_id: "conversation-1".into(),
                 turn: 3,
+                include_history: true,
                 max_items: 4,
                 max_chars: 1000,
             },
@@ -4671,6 +5345,23 @@ mod tests {
         assert!(items
             .iter()
             .any(|item| item.kind == MemoryRecallKind::TaskHistory));
+
+        let response = dispatch(
+            &ApiRequest::MemoryRecall {
+                query: "concise Rust answers".into(),
+                conversation_id: "conversation-1".into(),
+                turn: 4,
+                include_history: false,
+                max_items: 4,
+                max_chars: 1000,
+            },
+            &registry,
+        );
+        let ApiResponse::MemoryRecall { items, .. } = response else {
+            panic!("expected memory recall response");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, MemoryRecallKind::Preference);
     }
 
     #[test]
@@ -4680,6 +5371,94 @@ mod tests {
             history_recall_window("what did we do yesterday?", 10 * DAY_MS + 123),
             (9 * DAY_MS, 10 * DAY_MS)
         );
+    }
+
+    #[test]
+    fn reminder_dispatch_commits_lists_and_cancels() {
+        let directory = tempfile::tempdir().unwrap();
+        let (coordinator_tx, coordinator_rx) = mpsc::sync_channel(4);
+        std::thread::spawn(move || {
+            while let Ok(command) = coordinator_rx.recv() {
+                if let CoordinatorRequest::Schedule { request, response } = command {
+                    let _ = response.send(BackgroundScheduleDecision {
+                        request_id: request.request_id,
+                        action: request.action,
+                        approved: true,
+                        reason: "validated".into(),
+                    });
+                }
+            }
+        });
+        let registry = Arc::new(Mutex::new(Registry {
+            coordinator_tx: Some(coordinator_tx),
+            runtime_store: Some(Arc::new(
+                RuntimeStore::open(&directory.path().join("runtime.redb")).unwrap(),
+            )),
+            ..Registry::default()
+        }));
+        let response = dispatch(
+            &ApiRequest::ReminderCreate {
+                source_event_id: "source-1".into(),
+                conversation_id: FOREGROUND_ID.into(),
+                turn: 1,
+                text: "Your coffee is ready.".into(),
+                delay_seconds: Some(60),
+                local_time: None,
+                day: None,
+                created_at_ms: 123,
+            },
+            &registry,
+        );
+        let ApiResponse::Reminder { reminder } = response else {
+            panic!("expected reminder response");
+        };
+        assert_eq!(reminder.text, "Your coffee is ready.");
+        assert!(reminder.due_at_ms > reminder.created_at_ms);
+
+        let ApiResponse::Reminders { reminders } = dispatch(&ApiRequest::ReminderList, &registry)
+        else {
+            panic!("expected reminders response");
+        };
+        assert_eq!(reminders, [reminder.clone()]);
+
+        let ApiResponse::Reminder { reminder } = dispatch(
+            &ApiRequest::ReminderCancel {
+                id: reminder.id.clone(),
+                conversation_id: FOREGROUND_ID.into(),
+                turn: 2,
+            },
+            &registry,
+        ) else {
+            panic!("expected cancelled reminder response");
+        };
+        assert_eq!(
+            reminder.status,
+            tachyon_api::types::ReminderStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn reminder_notification_carries_stable_delivery_identity() {
+        let reminder = ReminderInfo {
+            id: "reminder-123-1".into(),
+            conversation_id: FOREGROUND_ID.into(),
+            turn: 1,
+            text: "Your coffee is ready.".into(),
+            created_at_ms: 123,
+            due_at_ms: 60_123,
+            status: tachyon_api::types::ReminderStatus::Delivering,
+        };
+        let encoded = encode_reminder_notification(&reminder).unwrap();
+        let envelope: InteractionCommandEnvelope = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(envelope.metadata.correlation_id, reminder.id);
+        assert_eq!(
+            envelope.metadata.message_id,
+            "reminder-delivery-reminder-123-1"
+        );
+        assert!(matches!(
+            envelope.command,
+            InteractionCommand::NotifyUser { text, .. } if text == "Your coffee is ready."
+        ));
     }
 
     #[test]

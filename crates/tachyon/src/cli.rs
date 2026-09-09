@@ -78,6 +78,9 @@ pub enum Command {
     /// Query canonical conversation history by Unix millisecond range.
     History(HistoryArgs),
 
+    /// Manage Tachyon's curated memory store.
+    Memory(MemoryArgs),
+
     /// Manage the Tachyon daemon.
     Daemon(DaemonArgs),
 
@@ -182,6 +185,18 @@ pub struct HistoryArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct MemoryArgs {
+    #[command(subcommand)]
+    pub action: MemoryAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MemoryAction {
+    /// Permanently wipe all curated memories.
+    Wipe,
+}
+
+#[derive(Args, Debug)]
 pub struct DaemonArgs {
     /// Action to perform (default: status).
     #[command(subcommand)]
@@ -238,4 +253,21 @@ pub struct SetModelArgs {
 pub struct GetArgs {
     /// Config key, e.g. `model` or `base_url`.
     pub key: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_wipe_is_a_complete_command_without_confirmation_flags() {
+        let cli = Cli::try_parse_from(["tachyon", "memory", "wipe"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::Memory(MemoryArgs {
+                action: MemoryAction::Wipe
+            }))
+        ));
+    }
 }

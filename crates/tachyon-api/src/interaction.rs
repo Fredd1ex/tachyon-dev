@@ -50,12 +50,26 @@ pub struct InteractionCommandEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum InteractionCommand {
-    BeginConversation { reset: bool },
-    AcceptUserTurn { text: String },
-    CancelConversation { reason: String },
-    PublishBackgroundUpdate { event: EventEnvelope },
-    RestoreOperationalState { sessions: Vec<RecoveredSession> },
-    NotifyUser { text: String },
+    BeginConversation {
+        reset: bool,
+    },
+    AcceptUserTurn {
+        text: String,
+    },
+    CancelConversation {
+        reason: String,
+    },
+    PublishBackgroundUpdate {
+        event: EventEnvelope,
+    },
+    RestoreOperationalState {
+        sessions: Vec<RecoveredSession>,
+    },
+    NotifyUser {
+        text: String,
+        #[serde(default)]
+        model: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

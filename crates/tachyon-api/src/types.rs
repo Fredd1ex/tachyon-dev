@@ -340,6 +340,8 @@ pub enum ApiRequest {
         parent_task_id: Option<String>,
         #[serde(default)]
         tool_call_id: Option<String>,
+        #[serde(default)]
+        deadline_ms: Option<u64>,
     },
     /// Submit work through the Background Coordinator boundary. Tachyond
     /// owns worker creation and returns the same authoritative agent stream.
@@ -360,6 +362,8 @@ pub enum ApiRequest {
         parent_task_id: Option<String>,
         #[serde(default)]
         tool_call_id: Option<String>,
+        #[serde(default)]
+        deadline_ms: Option<u64>,
     },
     /// `tachyon list` (aliases: ps, ls)
     AgentList,
@@ -434,11 +438,54 @@ pub enum ApiRequest {
         query: String,
         conversation_id: String,
         turn: u64,
+        #[serde(default)]
+        include_history: bool,
         #[serde(default = "default_memory_recall_items")]
         max_items: u32,
         #[serde(default = "default_memory_recall_chars")]
         max_chars: u32,
     },
+    /// Apply one model-proposed memory action after daemon-side validation.
+    MemoryMutate {
+        intent: MemoryIntent,
+        source_event_id: String,
+        conversation_id: String,
+        turn: u64,
+        occurred_at_ms: u64,
+    },
+    /// Persist a one-shot user reminder. Tachyond computes and owns the deadline.
+    ReminderCreate {
+        source_event_id: String,
+        conversation_id: String,
+        turn: u64,
+        text: String,
+        delay_seconds: Option<u64>,
+        local_time: Option<String>,
+        day: Option<ScheduleDay>,
+        created_at_ms: u64,
+    },
+    /// List reminders that have not reached a terminal state.
+    ReminderList,
+    /// Cancel a pending reminder by its daemon-authoritative ID.
+    ReminderCancel {
+        id: String,
+        conversation_id: String,
+        turn: u64,
+    },
+    /// Schedule daemon-owned agent work to start at, or finish by, a deadline.
+    ScheduledTaskCreate {
+        source_event_id: String,
+        conversation_id: String,
+        turn: u64,
+        objective: String,
+        mode: ScheduledTaskMode,
+        delay_seconds: Option<u64>,
+        local_time: Option<String>,
+        day: Option<ScheduleDay>,
+        created_at_ms: u64,
+    },
+    /// List pending or running daemon-owned scheduled agent work.
+    ScheduledTaskList,
 }
 
 fn default_history_limit() -> u32 {
@@ -461,14 +508,29 @@ pub enum HistoryRole {
     Notification,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryKind {
+    #[default]
+    Conversation,
+    Task,
+    ConversationSummary,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoryEntry {
     pub event_id: String,
+    #[serde(default)]
+    pub kind: HistoryKind,
     pub conversation_id: String,
     pub turn_id: Option<String>,
     pub occurred_at_ms: u64,
     pub role: HistoryRole,
     pub text: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub task_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -489,8 +551,222 @@ pub enum MemoryRecallKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryRecallItem {
     pub kind: MemoryRecallKind,
+    #[serde(default)]
+    pub memory_id: Option<String>,
+    #[serde(default)]
+    pub descriptor: Option<MemoryDescriptor>,
     pub text: String,
     pub occurred_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryKind {
+    Fact,
+    #[default]
+    Preference,
+    Constraint,
+    Goal,
+    Routine,
+    Relationship,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryCardinality {
+    One,
+    #[default]
+    Many,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryDescriptor {
+    #[serde(default)]
+    pub kind: MemoryKind,
+    #[serde(default = "default_memory_namespace")]
+    pub namespace: String,
+    #[serde(default = "default_memory_relation")]
+    pub relation: String,
+    #[serde(default = "default_memory_scope")]
+    pub scope: String,
+    #[serde(default)]
+    pub cardinality: MemoryCardinality,
+    #[serde(default)]
+    pub topics: Vec<String>,
+}
+
+fn default_memory_namespace() -> String {
+    "uncategorized".into()
+}
+
+fn default_memory_relation() -> String {
+    "prefers".into()
+}
+
+fn default_memory_scope() -> String {
+    "global".into()
+}
+
+impl Default for MemoryDescriptor {
+    fn default() -> Self {
+        Self {
+            kind: MemoryKind::Preference,
+            namespace: default_memory_namespace(),
+            relation: default_memory_relation(),
+            scope: default_memory_scope(),
+            cardinality: MemoryCardinality::Many,
+            topics: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum MemoryIntent {
+    Ignore,
+    Remember {
+        #[serde(default)]
+        descriptor: MemoryDescriptor,
+        value: String,
+    },
+    Forget {
+        target_ids: Vec<String>,
+    },
+    Correct {
+        target_ids: Vec<String>,
+        #[serde(default)]
+        descriptor: MemoryDescriptor,
+        value: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryMutationKind {
+    Remember,
+    Forget,
+    Correct,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MemoryMutationResult {
+    Ignored,
+    Applied {
+        kind: MemoryMutationKind,
+        memory_id: String,
+        replaced_memory_id: Option<String>,
+    },
+    AlreadyApplied {
+        kind: MemoryMutationKind,
+        memory_id: String,
+    },
+    Rejected {
+        reason: String,
+    },
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReminderStatus {
+    Pending,
+    Delivering,
+    Delivered,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleDay {
+    Next,
+    Today,
+    Tomorrow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReminderInfo {
+    pub id: String,
+    pub conversation_id: String,
+    pub turn: u64,
+    pub text: String,
+    pub created_at_ms: u64,
+    pub due_at_ms: u64,
+    pub status: ReminderStatus,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduledTaskMode {
+    StartAt,
+    FinishBy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduledTaskStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledTaskInfo {
+    pub id: String,
+    pub conversation_id: String,
+    pub turn: u64,
+    pub objective: String,
+    pub mode: ScheduledTaskMode,
+    pub created_at_ms: u64,
+    pub due_at_ms: u64,
+    pub status: ScheduledTaskStatus,
+    pub work_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackgroundScheduleRequest {
+    pub request_id: String,
+    pub action: BackgroundScheduleAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum BackgroundScheduleAction {
+    Create {
+        source_event_id: String,
+        conversation_id: String,
+        turn: u64,
+        text: String,
+        delay_seconds: Option<u64>,
+        local_time: Option<String>,
+        day: Option<ScheduleDay>,
+        created_at_ms: u64,
+    },
+    List,
+    Cancel {
+        id: String,
+    },
+    CreateTask {
+        source_event_id: String,
+        conversation_id: String,
+        turn: u64,
+        objective: String,
+        mode: ScheduledTaskMode,
+        delay_seconds: Option<u64>,
+        local_time: Option<String>,
+        day: Option<ScheduleDay>,
+        created_at_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackgroundScheduleDecision {
+    pub request_id: String,
+    pub action: BackgroundScheduleAction,
+    pub approved: bool,
+    pub reason: String,
 }
 
 /// The kind of a streamed event line.
@@ -555,6 +831,29 @@ pub enum AgentEvent {
         turn: Option<u64>,
         preference_count: u32,
         history_count: u32,
+    },
+    MemoryMutation {
+        turn: Option<u64>,
+        result: MemoryMutationResult,
+    },
+    ReminderScheduled {
+        turn: Option<u64>,
+        reminder_id: String,
+        due_at_ms: u64,
+    },
+    ReminderCancelled {
+        turn: Option<u64>,
+        reminder_id: String,
+    },
+    ReminderFired {
+        turn: Option<u64>,
+        reminder_id: String,
+    },
+    ScheduledTaskCreated {
+        turn: Option<u64>,
+        schedule_id: String,
+        due_at_ms: u64,
+        mode: ScheduledTaskMode,
     },
     Status {
         turn: Option<u64>,
@@ -675,23 +974,54 @@ pub struct EventEnvelope {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApiResponse {
     /// A generic success with an optional message.
-    Ok { message: Option<String> },
+    Ok {
+        message: Option<String>,
+    },
     /// A typed error.
-    Error { code: u16, message: String },
+    Error {
+        code: u16,
+        message: String,
+    },
     /// Response to `DaemonStatus`.
-    DaemonStatus { info: DaemonInfo },
+    DaemonStatus {
+        info: DaemonInfo,
+    },
     /// Response to `AgentStart` / `AgentStatus` / `AgentCat`.
-    Agent { info: AgentInfo },
+    Agent {
+        info: AgentInfo,
+    },
     /// Response to `AgentList` / `Top`.
-    Agents { agents: Vec<AgentInfo> },
+    Agents {
+        agents: Vec<AgentInfo>,
+    },
     /// Response to `AgentLogs`.
-    Logs { id: String, lines: Vec<String> },
+    Logs {
+        id: String,
+        lines: Vec<String>,
+    },
     /// Canonical user-visible history in chronological order.
-    History { entries: Vec<HistoryEntry> },
+    History {
+        entries: Vec<HistoryEntry>,
+    },
     /// Bounded private context assembled by the Memory Agent.
     MemoryRecall {
         items: Vec<MemoryRecallItem>,
         truncated: bool,
+    },
+    MemoryMutation {
+        result: MemoryMutationResult,
+    },
+    Reminder {
+        reminder: ReminderInfo,
+    },
+    Reminders {
+        reminders: Vec<ReminderInfo>,
+    },
+    ScheduledTask {
+        schedule: ScheduledTaskInfo,
+    },
+    ScheduledTasks {
+        schedules: Vec<ScheduledTaskInfo>,
     },
     /// Response to `AgentExec`.
     Exec {
@@ -701,12 +1031,20 @@ pub enum ApiResponse {
         stderr: String,
     },
     /// Response to `AgentAttach`.
-    Attach { id: String, output: String },
+    Attach {
+        id: String,
+        output: String,
+    },
     /// A streamed event line from an `AgentSubscribe`/`ForegroundSubscribe`
     /// connection.
-    Event { stream: EventStream, data: String },
+    Event {
+        stream: EventStream,
+        data: String,
+    },
     /// Acknowledgement after `AgentChat` / `ForegroundChat`.
-    Chat { id: String },
+    Chat {
+        id: String,
+    },
 }
 
 impl ApiResponse {
@@ -785,6 +1123,7 @@ mod tests {
             origin_turn_id: Some("turn-4".into()),
             parent_task_id: Some("task-1".into()),
             tool_call_id: Some("call-7".into()),
+            deadline_ms: None,
         };
         let wire = serde_json::to_string(&request).unwrap();
         assert!(wire.contains(r#""cmd":"background_delegate""#));
@@ -807,6 +1146,7 @@ mod tests {
                 origin_turn_id: None,
                 parent_task_id: None,
                 tool_call_id: None,
+                deadline_ms: None,
             }
         );
 
@@ -1026,11 +1366,23 @@ mod tests {
             query: "what did we work on yesterday?".into(),
             conversation_id: "conversation-1".into(),
             turn: 7,
+            include_history: true,
             max_items: 8,
             max_chars: 4096,
         };
         let wire = serde_json::to_string(&request).unwrap();
         assert_eq!(serde_json::from_str::<ApiRequest>(&wire).unwrap(), request);
+        let legacy = serde_json::from_str::<ApiRequest>(
+            r#"{"cmd":"memory_recall","query":"preferences","conversation_id":"conversation-1","turn":7,"max_items":8,"max_chars":4096}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            ApiRequest::MemoryRecall {
+                include_history: false,
+                ..
+            }
+        ));
 
         let event = AgentEvent::MemoryRecalled {
             turn: Some(7),
@@ -1039,5 +1391,95 @@ mod tests {
         };
         let wire = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&wire).unwrap(), event);
+
+        let mutation = ApiRequest::MemoryMutate {
+            intent: MemoryIntent::Correct {
+                target_ids: vec!["preference-1".into()],
+                descriptor: MemoryDescriptor::default(),
+                value: "dislikes pickles".into(),
+            },
+            source_event_id: "message-7".into(),
+            conversation_id: "conversation-1".into(),
+            turn: 7,
+            occurred_at_ms: 123,
+        };
+        let wire = serde_json::to_string(&mutation).unwrap();
+        assert_eq!(serde_json::from_str::<ApiRequest>(&wire).unwrap(), mutation);
+    }
+
+    #[test]
+    fn reminder_requests_and_responses_round_trip() {
+        let request = ApiRequest::ReminderCreate {
+            source_event_id: "turn-1:123:1".into(),
+            conversation_id: "foreground".into(),
+            turn: 1,
+            text: "Your coffee is ready.".into(),
+            delay_seconds: Some(60),
+            local_time: None,
+            day: None,
+            created_at_ms: 123,
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<ApiRequest>(&wire).unwrap(), request);
+
+        let reminder = ReminderInfo {
+            id: "reminder-123-1".into(),
+            conversation_id: "foreground".into(),
+            turn: 1,
+            text: "Your coffee is ready.".into(),
+            created_at_ms: 123,
+            due_at_ms: 60_123,
+            status: ReminderStatus::Pending,
+        };
+        let response = ApiResponse::Reminder {
+            reminder: reminder.clone(),
+        };
+        let wire = serde_json::to_string(&response).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ApiResponse>(&wire).unwrap(),
+            ApiResponse::Reminder { reminder: decoded } if decoded == reminder
+        ));
+    }
+
+    #[test]
+    fn scheduled_task_deadlines_round_trip() {
+        let request = ApiRequest::ScheduledTaskCreate {
+            source_event_id: "turn-2:456:task".into(),
+            conversation_id: "foreground".into(),
+            turn: 2,
+            objective: "Get the weather forecast.".into(),
+            mode: ScheduledTaskMode::FinishBy,
+            delay_seconds: None,
+            local_time: Some("20:00".into()),
+            day: Some(ScheduleDay::Next),
+            created_at_ms: 456,
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<ApiRequest>(&wire).unwrap(), request);
+
+        let response = ApiResponse::ScheduledTask {
+            schedule: ScheduledTaskInfo {
+                id: "scheduled-task-456-2".into(),
+                conversation_id: "foreground".into(),
+                turn: 2,
+                objective: "Get the weather forecast.".into(),
+                mode: ScheduledTaskMode::FinishBy,
+                created_at_ms: 456,
+                due_at_ms: 60_456,
+                status: ScheduledTaskStatus::Pending,
+                work_id: None,
+            },
+        };
+        let wire = serde_json::to_string(&response).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ApiResponse>(&wire).unwrap(),
+            ApiResponse::ScheduledTask { schedule }
+                if schedule.id == "scheduled-task-456-2"
+                    && schedule.mode == ScheduledTaskMode::FinishBy
+        ));
+        assert_eq!(
+            serde_json::to_string(&ApiRequest::ScheduledTaskList).unwrap(),
+            r#"{"cmd":"scheduled_task_list"}"#
+        );
     }
 }

@@ -17,6 +17,7 @@ Tachyond is responsible for:
 - Relaying stdout, stderr, structured events, and terminal state.
 - Accepting user or agent control requests through the Unix socket API.
 - Persisting task metadata and lifecycle decisions.
+- Persisting and delivering one-shot reminders and scheduled agent work.
 - Enforcing dependency ordering for tasks that declare prerequisites.
 - Reconnecting restored agents after a daemon restart.
 
@@ -57,6 +58,28 @@ Requests include operations for:
 
 Responses are typed API values. Streaming requests return event envelopes over
 the same connection until the stream ends.
+
+## Scheduling
+
+Foreground exposes contextual reminder creation, listing, and cancellation,
+plus scheduled agent work with `start_at` and `finish_by` semantics.
+The Background Coordinator validates each typed scheduling command and returns
+it to Tachyond, which owns the timer and durable state in `runtime.redb`.
+Relative delays and absolute local `HH:MM` times are converted into
+daemon-authoritative wall-clock deadlines when committed.
+When a reminder becomes due, Tachyond sends private trigger context to
+Foreground. The Conversation model produces a new standalone chat message, and
+delivery remains retryable until Foreground acknowledges publication. Overdue
+pending reminders are recovered after daemon restart. If no user-facing
+subscriber is connected when a deadline passes, the reminder remains pending
+and is delivered when Tachyon is opened again.
+
+For agent work, `start_at` waits until the deadline before launching a worker;
+`finish_by` launches immediately and passes the requested time through as the
+worker's hard deadline. Results are stored durably and published through the
+same modeled standalone notification path. Scheduled work is available through
+a typed list API for runtime inspection. Recurrence, named timezone expressions,
+task cancellation, and explicit misfire policies remain.
 
 ## Agent Lifecycle
 
@@ -171,8 +194,9 @@ identity and workspace. Generation tracking prevents an old process or stale
 subscription from modifying the restored instance.
 
 Agents that cannot be restored are marked failed and remain inspectable for
-diagnostics. The user-facing conversation may start fresh; durable background
-task metadata remains daemon-owned.
+diagnostics. The user-facing Foreground always starts with a fresh checkpoint
+and turn sequence; durable background task, history, and curated-memory data
+remain independently daemon-owned.
 
 ## V2 Task Bridge
 

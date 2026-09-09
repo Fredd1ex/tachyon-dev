@@ -8,7 +8,7 @@ Estimated progress: **40%**. Status: **In progress**.
 | --- | --- | --- |
 | context-length tracking | Partial | Per-call context use and configured windows drive scheduling; hard per-role token budgets remain. |
 | compaction scheduling | Partial | Tachyond durably schedules at 65% of the configured context window, signals the model owner, and records epoch acknowledgements; semantic summary generation remains. |
-| Memory Agent | Partial | The managed identity observes explicit preferences, validates durable records, serves private recall, and emits TUI indicators; model-proposed corrections remain. |
+| Memory Agent | Partial | The Conversation Agent contextually invokes a bounded private memory tool for recall or typed mutation; Tachyond validates atomic changes and emits inline TUI badges. Ordinary turns have no memory preflight. User-facing inspection remains. |
 | snapshots | Partial | Conversation and IPython checkpoints exist; complete versioned runtime snapshots do not. |
 | generation rollover | Partial | Worker generations guard some stale process updates, but rollover is not a durable end-to-end protocol. |
 | research memories | Early | Foreground can retain correlated evidence locally; there is no durable typed research-memory model. |
@@ -40,7 +40,7 @@ Estimated progress: **40%**. Status: **In progress**.
 ## Next Work
 
 1. Add semantic summary generation to the durable compaction protocol.
-2. Implement model-proposed preference correction and confirmation flows.
+2. Add user-facing memory inspection and optional confirmation controls.
 3. Evaluate hybrid embedding retrieval once lexical ranking has representative scale tests.
 4. Implement generation rollover and stale-publication tests.
 5. Add research-memory and failure-reuse indexes.

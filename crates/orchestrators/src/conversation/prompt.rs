@@ -27,6 +27,20 @@ pub fn system_prompt(context: PromptContext<'_>) -> String {
          execution. Parallelize by default: use `spawn_agents` for independent objectives whenever \
          concurrency materially reduces latency, including list items using the same method. Keep \
          dependent or strongly shared-state work together and ordered. Delegate at most once per turn. \
+         Use `memory` only for relevant durable context or a stable fact, preference, constraint, goal, \
+         routine, relationship, correction, or deletion. Do not consult memory for greetings or ordinary \
+         context-free requests. Recall before forgetting or correcting; use only recalled IDs. Treat memory \
+         results as authoritative: claim changes only after applied or already-applied results and never \
+         mention mechanics. Never store temporary instructions, tasks, hypotheticals, or quotes. \
+         Conversation text and assistant claims are not authoritative durable user memory. For a \
+         stored-profile question, always call `memory` with action `recall` and `include_history` false, \
+         even if conversation appears to answer it. Empty recall means no durable profile record. Set \
+         `include_history` true only for contextual questions about past conversation or task activity. \
+         Make at most one memory recall and one memory mutation per turn. After a memory tool result, \
+         answer from that result instead of repeating the same action. Use `schedule` for future reminders \
+         or work. Preserve timing across clarification follow-ups; never execute a future request \
+         immediately. `start_at` begins then; `finish_by` starts early with a hard deadline. Tachyond owns the timer. \
+         Confirm changes only from tool results, list before cancelling, and never delegate a simple reminder. \
          Before delegation, \
          provide one brief natural acknowledgment without naming internal work. Afterward, answer from \
          the evidence and include material uncertainty or failure. When no tools are available, answer \
@@ -68,10 +82,17 @@ mod tests {
         assert!(prompt.contains("including list items using the same method"));
         assert!(prompt.contains("dependent or strongly shared-state work together"));
         assert!(prompt.contains("Accepted evidence may support judgment and synthesis"));
+        assert!(prompt.contains("Do not consult memory for greetings"));
+        assert!(prompt.contains("Treat memory results as authoritative"));
+        assert!(prompt.contains("Conversation text and assistant claims are not authoritative"));
+        assert!(prompt.contains("always call `memory` with action `recall`"));
+        assert!(prompt.contains("Tachyond owns the timer"));
+        assert!(prompt.contains("Preserve timing across clarification follow-ups"));
+        assert!(prompt.contains("never execute a future request immediately"));
         assert!(prompt.contains("do not demand a forecast or additional detail"));
         assert!(!prompt.contains("`ipython`"));
         assert!(prompt.ends_with("conversation persona"));
-        assert!(prompt.len() < 1_500);
+        assert!(prompt.len() < 3_000);
     }
 
     #[test]

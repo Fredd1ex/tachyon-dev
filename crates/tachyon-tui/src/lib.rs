@@ -13,6 +13,8 @@
 //!   PageUp/Down  page within or select trace turns
 //!   End          return to the latest turn
 //!   Ctrl+O       toggle inline traces for the current turn
+//!   y             copy the selected chat cell
+//!   Ctrl+Shift+C  copy the selected or latest chat cell
 //!   Ctrl+C / Esc / /exit  quit
 //!
 //! Slash commands: /exit, /await, /stop, /release, /replan, /kill
@@ -34,6 +36,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::block::Title;
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table,
 };
@@ -42,9 +45,12 @@ use ratatui::Terminal;
 
 use tachyon_api::types::{
     Actor, AgentEvent, AgentInfo, AgentState, ApiResponse, DaemonInfo, EventEnvelope, EventStream,
-    LifetimeClass, WorkOutcome,
+    LifetimeClass, MemoryMutationKind, MemoryMutationResult, ScheduledTaskInfo, ScheduledTaskMode,
+    ScheduledTaskStatus, WorkOutcome,
 };
-use tachyon_api::{InteractionEvent, InteractionEventEnvelope, FOREGROUND_ID, MEMORY_ID};
+use tachyon_api::{
+    InteractionEvent, InteractionEventEnvelope, BACKGROUND_ID, FOREGROUND_ID, MEMORY_ID,
+};
 
 use tachyon_client::{Client, Subscription};
 
@@ -67,6 +73,11 @@ mod icon {
     pub const COLLAPSED: &str = "";
     pub const EXPANDED: &str = "";
     pub const BULLET: &str = "";
+    pub const SCROLL: &str = "󰍽";
+    pub const CLOSE: &str = "󰅖";
+    pub const HELP: &str = "";
+    pub const LIVE: &str = "󰐊";
+    pub const TURN: &str = "";
 }
 
 // ---- names from config ---------------------------------------------------
@@ -200,17 +211,7 @@ fn ready_earlier_turn(threads: &[Thread]) -> Option<u64> {
 }
 
 fn ready_notice(turn: u64) -> String {
-    format!("  {} response {turn} ready · click to view ", icon::SUCCESS)
-}
-
-fn turn_index_for_id(thread: &Thread, projection: &TurnProjection, turn: u64) -> Option<usize> {
-    projection.cells.iter().position(|cell| {
-        thread.items[cell.prompt]
-            .turn
-            .as_deref()
-            .and_then(|turn| turn.parse::<u64>().ok())
-            == Some(turn)
-    })
+    format!("{} response {turn} ready", icon::SUCCESS)
 }
 
 fn mark_ready_turn_seen(threads: &mut [Thread], turn: u64) {
@@ -279,6 +280,29 @@ struct TurnMetrics {
     self_usage: Option<TokenTotals>,
     #[serde(default)]
     worker_usage: HashMap<String, TokenTotals>,
+    #[serde(default)]
+    memory: MemoryTurnMetrics,
+    #[serde(default)]
+    schedule: ScheduleTurnMetrics,
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct MemoryTurnMetrics {
+    saved: u32,
+    forgotten: u32,
+    corrected: u32,
+    failed: u32,
+    recalled_preferences: u32,
+    recalled_history: u32,
+}
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct ScheduleTurnMetrics {
+    scheduled: u32,
+    #[serde(default)]
+    tasks_scheduled: u32,
+    cancelled: u32,
+    fired: u32,
 }
 
 impl Thread {
@@ -591,7 +615,15 @@ enum TuiEvent {
 enum PaneTab {
     Foreground,
     Agents,
+    Scheduled,
+    Memory,
 }
+
+const ORCHESTRATORS_TAB_LABEL: &str = " ORCHESTRATORS ";
+const WINDOW_LOGO: &str = "󰘵";
+const WINDOW_LOGO_BUTTON: &str = " 󰘵 ";
+const INPUT_PROMPT_MARKER: &str = "❯ ";
+// const INPUT_PROMPT_MARKER: &str = "⌥ ";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ClickTarget {
@@ -815,6 +847,29 @@ fn build_turn_cells(thread: &Thread) -> Vec<TurnCell> {
             prompt_timestamp: item.timestamp,
         })
         .collect::<Vec<_>>();
+    let user_turns = cells
+        .iter()
+        .filter_map(|cell| thread.items[cell.prompt].turn.as_deref())
+        .collect::<BTreeSet<_>>();
+    cells.extend(
+        thread
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.kind == ItemKind::Reply
+                    && item
+                        .turn
+                        .as_deref()
+                        .is_none_or(|turn| !user_turns.contains(turn))
+            })
+            .map(|(prompt, item)| TurnCell {
+                prompt,
+                items: vec![prompt],
+                prompt_timestamp: item.timestamp,
+            }),
+    );
+    cells.sort_by_key(|cell| cell.prompt);
     let mut by_turn = HashMap::<&str, usize>::new();
     let mut by_prompt = HashMap::<usize, usize>::new();
     for (cell, turn) in cells.iter().enumerate() {
@@ -830,7 +885,7 @@ fn build_turn_cells(thread: &Thread) -> Vec<TurnCell> {
     }
     let mut current = None;
     for (index, item) in thread.items.iter().enumerate() {
-        if item.kind == ItemKind::User {
+        if by_prompt.contains_key(&index) {
             current = by_prompt.get(&index).copied();
             continue;
         }
@@ -1414,6 +1469,35 @@ fn load_session() -> Vec<Thread> {
     }
 }
 
+fn archive_session_turns(threads: &mut [Thread], daemon_pid: Option<u32>) {
+    let prefix = format!("archived:{}:", daemon_pid.unwrap_or_default());
+    let archive = |turn: String| {
+        if turn.starts_with("archived:") {
+            turn
+        } else {
+            format!("{prefix}{turn}")
+        }
+    };
+    for thread in threads {
+        for item in &mut thread.items {
+            item.turn = item.turn.take().map(&archive);
+        }
+        thread.completed_turns = std::mem::take(&mut thread.completed_turns)
+            .into_iter()
+            .map(&archive)
+            .collect();
+        thread.unread_turns.clear();
+        thread.metrics = std::mem::take(&mut thread.metrics)
+            .into_iter()
+            .map(|(turn, metrics)| (archive(turn), metrics))
+            .collect();
+        thread.metric_revisions = std::mem::take(&mut thread.metric_revisions)
+            .into_iter()
+            .map(|(turn, revision)| (archive(turn), revision))
+            .collect();
+    }
+}
+
 // ---- main loop -----------------------------------------------------------
 
 pub fn run() -> io::Result<()> {
@@ -1424,12 +1508,10 @@ pub fn run() -> io::Result<()> {
         .ok()
         .and_then(|pid| pid.trim().parse::<u32>().ok());
     let daemon_changed = current_daemon_pid.is_some() && current_daemon_pid != previous_daemon_pid;
-    let mut threads: Vec<Thread> = if daemon_changed {
-        let _ = std::fs::remove_file(session_file());
-        vec![Thread::new_foreground()]
-    } else {
-        load_session()
-    };
+    let mut threads = load_session();
+    if daemon_changed {
+        archive_session_turns(&mut threads, previous_daemon_pid);
+    }
     if let Some(pid) = current_daemon_pid {
         let _ = std::fs::write(daemon_session_file(), pid.to_string());
     }
@@ -1443,6 +1525,7 @@ pub fn run() -> io::Result<()> {
     let mut seen_events: HashSet<(String, u64)> = HashSet::new();
     let mut seen_interactions: HashSet<(String, String, u64)> = HashSet::new();
     let mut agent_infos: HashMap<String, AgentInfo> = HashMap::new();
+    let mut scheduled_tasks: Vec<ScheduledTaskInfo> = Vec::new();
     let config = tachyon_util::config::Config::load();
     let mut daemon: Option<DaemonInfo> = None;
     let mut daemon_since: Option<Instant> = None;
@@ -1517,6 +1600,10 @@ pub fn run() -> io::Result<()> {
                             agent_infos.clear();
                         }
                     }
+                    match c.scheduled_task_list() {
+                        Ok(schedules) => scheduled_tasks = schedules,
+                        Err(_) => scheduled_tasks.clear(),
+                    }
                     let max_focus = pane_agent_ids(&agent_infos).len()
                         + usize::from(agent_infos.contains_key(FOREGROUND_ID));
                     if focus > max_focus {
@@ -1527,6 +1614,7 @@ pub fn run() -> io::Result<()> {
                     daemon = None;
                     daemon_since = None;
                     agent_infos.clear();
+                    scheduled_tasks.clear();
                 }
             }
         }
@@ -1696,6 +1784,7 @@ pub fn run() -> io::Result<()> {
                         daemon.as_ref(),
                         daemon_since,
                         &agent_infos,
+                        &scheduled_tasks,
                         pane_tab,
                     );
                 }
@@ -1725,10 +1814,8 @@ pub fn run() -> io::Result<()> {
                     daemon.as_ref(),
                     &agent_infos,
                     &threads,
-                    &config,
-                    if daemon_changed { "fresh" } else { "active" },
                     open_trace,
-                    &transcript_view,
+                    transcript_scroll.follow,
                 );
 
                 if commands_open {
@@ -1752,7 +1839,12 @@ pub fn run() -> io::Result<()> {
                         if key.modifiers.contains(KeyModifiers::CONTROL)
                             && key.modifiers.contains(KeyModifiers::SHIFT) =>
                     {
-                        yank_reply(&threads, focus);
+                        yank_chat_cell(&threads, open_trace);
+                    }
+                    KeyCode::Char('y')
+                        if !pane_open && input.is_empty() && open_trace.is_some() =>
+                    {
+                        yank_chat_cell(&threads, open_trace);
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1768,6 +1860,13 @@ pub fn run() -> io::Result<()> {
                         open_worker = None;
                     }
                     KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        commands_open = !commands_open;
+                        if commands_open {
+                            pane_open = false;
+                            info_open = false;
+                        }
+                    }
+                    KeyCode::Char('?') if input.is_empty() => {
                         commands_open = !commands_open;
                         if commands_open {
                             pane_open = false;
@@ -1885,7 +1984,9 @@ pub fn run() -> io::Result<()> {
                     | KeyCode::Char('k')
                     | KeyCode::Char('r')
                     | KeyCode::Char('u')
-                        if pane_open && input.is_empty() =>
+                        if pane_open
+                            && matches!(pane_tab, PaneTab::Foreground | PaneTab::Agents)
+                            && input.is_empty() =>
                     {
                         let verb = if key.code == KeyCode::Char('a') {
                             "await"
@@ -1902,7 +2003,11 @@ pub fn run() -> io::Result<()> {
                         };
                         pane_control(verb, focus, &agent_infos, &mut threads);
                     }
-                    KeyCode::Char('S') if pane_open && input.is_empty() => {
+                    KeyCode::Char('S')
+                        if pane_open
+                            && matches!(pane_tab, PaneTab::Foreground | PaneTab::Agents)
+                            && input.is_empty() =>
+                    {
                         daemon_control("start", &mut threads);
                     }
                     KeyCode::Enter => {
@@ -1980,14 +2085,26 @@ pub fn run() -> io::Result<()> {
                         backspace_at(&mut input, &mut input_cursor);
                     }
                     KeyCode::Left if pane_open && input.is_empty() => {
-                        pane_tab = PaneTab::Foreground;
-                        if focus > 1 {
+                        pane_tab = match pane_tab {
+                            PaneTab::Foreground => PaneTab::Foreground,
+                            PaneTab::Agents => PaneTab::Foreground,
+                            PaneTab::Scheduled => PaneTab::Agents,
+                            PaneTab::Memory => PaneTab::Scheduled,
+                        };
+                        if pane_tab == PaneTab::Foreground && focus > 1 {
                             focus = 0;
                         }
                     }
                     KeyCode::Right if pane_open && input.is_empty() => {
-                        pane_tab = PaneTab::Agents;
-                        if focus < 2 && !pane_agent_ids(&agent_infos).is_empty() {
+                        pane_tab = match pane_tab {
+                            PaneTab::Foreground => PaneTab::Agents,
+                            PaneTab::Agents => PaneTab::Scheduled,
+                            PaneTab::Scheduled | PaneTab::Memory => PaneTab::Memory,
+                        };
+                        if pane_tab == PaneTab::Agents
+                            && focus < 2
+                            && !pane_agent_ids(&agent_infos).is_empty()
+                        {
                             focus = 2;
                         }
                     }
@@ -2029,76 +2146,7 @@ pub fn run() -> io::Result<()> {
                         MouseEventKind::Down(MouseButton::Left) => {
                             let size = terminal.size()?;
                             if m.row == size.height.saturating_sub(1) {
-                                let controls = footer_controls(open_trace, transcript_view.turns);
-                                let controls_start = 12u16;
-                                if let Some(ready_turn) = ready_earlier_turn(&threads) {
-                                    let ready_start =
-                                        11u16.saturating_add(controls.chars().count() as u16);
-                                    let ready_width =
-                                        ready_notice(ready_turn).chars().count() as u16;
-                                    if m.column >= ready_start
-                                        && m.column < ready_start.saturating_add(ready_width)
-                                    {
-                                        let target =
-                                            foreground_thread(&threads).and_then(|(_, thread)| {
-                                                turn_index_for_id(
-                                                    thread,
-                                                    &turn_projection,
-                                                    ready_turn,
-                                                )
-                                            });
-                                        if let Some(turn) = target {
-                                            transcript_scroll.follow = false;
-                                            transcript_scroll.new_activity = false;
-                                            transcript_scroll.top =
-                                                transcript_view.starts[turn].saturating_sub(1).min(
-                                                    transcript_view
-                                                        .total_height
-                                                        .saturating_sub(transcript_view.viewport),
-                                                );
-                                            open_trace = None;
-                                            open_worker = None;
-                                        }
-                                        mark_ready_turn_seen(&mut threads, ready_turn);
-                                        continue;
-                                    }
-                                }
-                                if m.column >= controls_start
-                                    && m.column < controls_start + controls.chars().count() as u16
-                                {
-                                    let relative = m.column - controls_start;
-                                    let char_offset = |needle: &str| {
-                                        controls
-                                            .find(needle)
-                                            .map(|byte| controls[..byte].chars().count() as u16)
-                                            .unwrap_or(u16::MAX)
-                                    };
-                                    let help_start = char_offset("HELP").saturating_sub(2);
-                                    let trace_start = char_offset("TRACE").saturating_sub(2);
-                                    let info_start = char_offset("INFO").saturating_sub(2);
-                                    if relative < help_start {
-                                        pane_open = true;
-                                        commands_open = false;
-                                        info_open = false;
-                                    } else if relative < trace_start {
-                                        commands_open = true;
-                                        pane_open = false;
-                                        info_open = false;
-                                    } else if relative < info_start {
-                                        if let Some(turn) = ctrl_o_target(
-                                            &transcript_view,
-                                            transcript_scroll.follow,
-                                        ) {
-                                            toggle_trace(&mut open_trace, turn);
-                                            open_worker = None;
-                                        }
-                                    } else {
-                                        info_open = true;
-                                        pane_open = false;
-                                        commands_open = false;
-                                    }
-                                    continue;
-                                }
+                                continue;
                             }
                             if pane_open {
                                 let chat_area = Rect {
@@ -2114,9 +2162,22 @@ pub fn run() -> io::Result<()> {
                                 );
                                 let inner_x = pane.x.saturating_add(1);
                                 let inner_right = pane.x + pane.width.saturating_sub(1);
-                                let tabs_x = pane.x.saturating_add(2);
-                                let foreground_width = " FOREGROUND ".chars().count() as u16;
-                                let agents_x = tabs_x.saturating_add(foreground_width + 1);
+                                let tabs_x = pane.x.saturating_add(
+                                    1 + WINDOW_LOGO_BUTTON.chars().count() as u16 + 1,
+                                );
+                                let orchestrators_width =
+                                    ORCHESTRATORS_TAB_LABEL.chars().count() as u16;
+                                let agents_x = tabs_x.saturating_add(orchestrators_width + 1);
+                                let agents_width =
+                                    format!(" AGENTS ({}) ", pane_agent_ids(&agent_infos).len())
+                                        .chars()
+                                        .count() as u16;
+                                let scheduled_x = agents_x.saturating_add(agents_width + 1);
+                                let scheduled_width =
+                                    format!(" SCHEDULED ({}) ", scheduled_tasks.len())
+                                        .chars()
+                                        .count() as u16;
+                                let memory_x = scheduled_x.saturating_add(scheduled_width + 1);
                                 if m.row >= pane.y
                                     && m.row <= pane.y.saturating_add(1)
                                     && m.column >= tabs_x
@@ -2124,8 +2185,12 @@ pub fn run() -> io::Result<()> {
                                 {
                                     pane_tab = if m.column < agents_x {
                                         PaneTab::Foreground
-                                    } else {
+                                    } else if m.column < scheduled_x {
                                         PaneTab::Agents
+                                    } else if m.column < memory_x {
+                                        PaneTab::Scheduled
+                                    } else {
+                                        PaneTab::Memory
                                     };
                                     continue;
                                 }
@@ -2148,6 +2213,8 @@ pub fn run() -> io::Result<()> {
                                                 focus = row + 2;
                                             }
                                         }
+                                        PaneTab::Scheduled => {}
+                                        PaneTab::Memory => {}
                                     }
                                     continue;
                                 }
@@ -2286,6 +2353,112 @@ fn record_correlated_metrics(threads: &mut Vec<Thread>, envelope: &EventEnvelope
                     assignment,
                     token_totals(*prompt_tokens, *completion_tokens, *total_tokens),
                 );
+            threads[root]
+                .metric_revisions
+                .insert(turn.clone(), revision);
+        }
+        (
+            _,
+            AgentEvent::MemoryRecalled {
+                preference_count,
+                history_count,
+                ..
+            },
+        ) => {
+            let Some(turn) = envelope.turn_id.as_ref() else {
+                return;
+            };
+            let memory = &mut threads[root]
+                .metrics
+                .entry(turn.clone())
+                .or_default()
+                .memory;
+            memory.recalled_preferences = memory.recalled_preferences.max(*preference_count);
+            memory.recalled_history = memory.recalled_history.max(*history_count);
+            threads[root]
+                .metric_revisions
+                .insert(turn.clone(), revision);
+        }
+        (_, AgentEvent::MemoryMutation { result, .. }) => {
+            let Some(turn) = envelope.turn_id.as_ref() else {
+                return;
+            };
+            let memory = &mut threads[root]
+                .metrics
+                .entry(turn.clone())
+                .or_default()
+                .memory;
+            match result {
+                MemoryMutationResult::Applied { kind, .. } => match kind {
+                    MemoryMutationKind::Remember => memory.saved = memory.saved.saturating_add(1),
+                    MemoryMutationKind::Forget => {
+                        memory.forgotten = memory.forgotten.saturating_add(1)
+                    }
+                    MemoryMutationKind::Correct => {
+                        memory.corrected = memory.corrected.saturating_add(1)
+                    }
+                },
+                MemoryMutationResult::Rejected { .. } | MemoryMutationResult::Unavailable => {
+                    memory.failed = memory.failed.saturating_add(1)
+                }
+                MemoryMutationResult::Ignored | MemoryMutationResult::AlreadyApplied { .. } => {}
+            }
+            threads[root]
+                .metric_revisions
+                .insert(turn.clone(), revision);
+        }
+        (_, AgentEvent::ReminderScheduled { .. }) => {
+            let Some(turn) = envelope.turn_id.as_ref() else {
+                return;
+            };
+            let schedule = &mut threads[root]
+                .metrics
+                .entry(turn.clone())
+                .or_default()
+                .schedule;
+            schedule.scheduled = schedule.scheduled.saturating_add(1);
+            threads[root]
+                .metric_revisions
+                .insert(turn.clone(), revision);
+        }
+        (_, AgentEvent::ScheduledTaskCreated { .. }) => {
+            let Some(turn) = envelope.turn_id.as_ref() else {
+                return;
+            };
+            let schedule = &mut threads[root]
+                .metrics
+                .entry(turn.clone())
+                .or_default()
+                .schedule;
+            schedule.tasks_scheduled = schedule.tasks_scheduled.saturating_add(1);
+            threads[root]
+                .metric_revisions
+                .insert(turn.clone(), revision);
+        }
+        (_, AgentEvent::ReminderCancelled { .. }) => {
+            let Some(turn) = envelope.turn_id.as_ref() else {
+                return;
+            };
+            let schedule = &mut threads[root]
+                .metrics
+                .entry(turn.clone())
+                .or_default()
+                .schedule;
+            schedule.cancelled = schedule.cancelled.saturating_add(1);
+            threads[root]
+                .metric_revisions
+                .insert(turn.clone(), revision);
+        }
+        (_, AgentEvent::ReminderFired { .. }) => {
+            let Some(turn) = envelope.turn_id.as_ref() else {
+                return;
+            };
+            let schedule = &mut threads[root]
+                .metrics
+                .entry(turn.clone())
+                .or_default()
+                .schedule;
+            schedule.fired = schedule.fired.saturating_add(1);
             threads[root]
                 .metric_revisions
                 .insert(turn.clone(), revision);
@@ -2483,7 +2656,7 @@ fn apply_interaction_event(thread: &mut Thread, envelope: InteractionEventEnvelo
             thread.streaming = false;
         }
         InteractionEvent::UserVisibleNotificationPublished { text } => {
-            thread.add_turn(ItemKind::System, text, turn)
+            thread.add_turn(ItemKind::Reply, text, turn)
         }
     }
 }
@@ -2655,22 +2828,13 @@ fn apply_correlated_agent_event(
                 envelope_turn.map(str::to_owned),
             );
         }
-        AgentEvent::MemorySaved { turn, .. } => thread.add_turn(
-            ItemKind::System,
-            "[memory saved] user preference".into(),
-            projected_turn(turn, envelope_turn),
-        ),
-        AgentEvent::MemoryRecalled {
-            turn,
-            preference_count,
-            history_count,
-        } => thread.add_turn(
-            ItemKind::System,
-            format!(
-                "[memory recalled] {preference_count} preferences · {history_count} history items"
-            ),
-            projected_turn(turn, envelope_turn),
-        ),
+        AgentEvent::MemorySaved { .. }
+        | AgentEvent::MemoryRecalled { .. }
+        | AgentEvent::MemoryMutation { .. }
+        | AgentEvent::ReminderScheduled { .. }
+        | AgentEvent::ReminderCancelled { .. }
+        | AgentEvent::ReminderFired { .. }
+        | AgentEvent::ScheduledTaskCreated { .. } => {}
         AgentEvent::Error { turn, message } => {
             thread.add_turn(
                 ItemKind::Error,
@@ -2876,23 +3040,29 @@ fn tachyon_cli_command() -> std::process::Command {
     std::process::Command::new("tachyon")
 }
 
-/// Copy the focused thread's last reply to the system clipboard (via
-/// wl-copy/xclip/xsel) or, if none is available, to a file + stdout note.
-fn yank_reply(threads: &[Thread], focus: usize) {
-    let index = if focus == 0 { 0 } else { focus - 1 };
-    let Some(t) = threads.get(index) else { return };
-    let text = t
-        .items
-        .iter()
-        .rev()
-        .find(|i| i.kind == ItemKind::Reply)
-        .map(|i| i.text.clone())
-        .unwrap_or_default();
-    if text.is_empty() {
+/// Copy the highlighted conversation cell, or the latest cell when none is selected.
+fn yank_chat_cell(threads: &[Thread], selected: Option<usize>) {
+    let Some(text) = selected_chat_cell_text(threads, selected) else {
         return;
-    }
+    };
     // Never write status text to stderr while the alternate-screen TUI is active.
     let _ = copy_to_clipboard(&text);
+}
+
+fn selected_chat_cell_text(threads: &[Thread], selected: Option<usize>) -> Option<String> {
+    let thread = threads.iter().find(|thread| thread.is_foreground)?;
+    let cells = build_turn_cells(thread);
+    let cell = cells.get(selected.unwrap_or_else(|| cells.len().saturating_sub(1)))?;
+    let mut sections = Vec::new();
+    for item in cell.items.iter().map(|index| &thread.items[*index]) {
+        let label = match item.kind {
+            ItemKind::User => names().user.as_str(),
+            ItemKind::Reply => names().conversation.as_str(),
+            _ => continue,
+        };
+        sections.push(format!("{label}:\n{}", item.text.trim()));
+    }
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
@@ -3040,27 +3210,39 @@ fn status_badge(text: &str, color: Color) -> Span<'static> {
     )
 }
 
-fn draw_command_palette(f: &mut Frame, area: Rect) {
-    let popup = popup_rect(area, 68, 28);
-    let block = Block::default()
-        .title(" HELP ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title_style(
+fn popup_title(label: &'static str) -> Title<'static> {
+    Title::from(Line::from(vec![
+        Span::styled(
+            WINDOW_LOGO_BUTTON,
+            Style::default().fg(Color::Black).bg(Color::White),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            label,
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        )
-        .title_alignment(Alignment::Center)
+        ),
+    ]))
+    .alignment(Alignment::Left)
+}
+
+fn draw_command_palette(f: &mut Frame, area: Rect) {
+    let popup = popup_rect(area, 68, 29);
+    let block = Block::default()
+        .title(popup_title(" HELP "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
         .style(Style::default().bg(Color::Rgb(12, 12, 15)));
     let commands = vec![
+        Line::from(""),
         help_section("KEYBINDS"),
         Line::from(""),
-        help_key("Ctrl+P", "toggle help"),
+        help_key("? / Ctrl+P", "toggle help"),
         help_key("Tab", "agents pane"),
         help_key("Ctrl+O", "toggle inline traces for the current turn"),
-        help_key("Ctrl+Shift+C", "copy last reply"),
+        help_key("y / Ctrl+Shift+C", "copy selected chat cell"),
         help_key("Shift+Enter", "insert newline"),
         help_key("Up / Down", "select a turn and expand its traces"),
         help_key("PageUp / PageDown", "page through selected traces"),
@@ -3098,16 +3280,9 @@ fn draw_info_panel(
 ) {
     let popup = popup_rect(area, 58, 25);
     let block = Block::default()
-        .title(" INFO ")
+        .title(popup_title(" INFO "))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .title_alignment(Alignment::Center)
         .style(Style::default().bg(Color::Rgb(12, 12, 15)));
     let section = |title: &str| {
         Line::from(Span::styled(
@@ -3216,6 +3391,7 @@ fn draw_info_panel(
         .unwrap_or_else(|| "not available".into());
     let cwd = truncate_text(&cwd, popup.width.saturating_sub(18) as usize);
     let lines = vec![
+        Line::from(""),
         section("SESSION"),
         Line::from(""),
         value("state", session_label.to_string()),
@@ -3257,18 +3433,32 @@ fn main_conversation_layout(
     activity: &str,
 ) -> CellLayout {
     let prompt = &thread.items[cell.prompt];
+    if prompt.kind == ItemKind::Reply {
+        return standalone_reply_layout(thread, cell, width, latest_timestamp);
+    }
     let mut lines = Vec::new();
     let mut hits = Vec::new();
     let mut push = |line: Line<'static>, target: Hit| {
         lines.push(line);
         hits.push(target);
     };
+    let is_latest = cell
+        .items
+        .iter()
+        .any(|index| thread.items[*index].timestamp == latest_timestamp);
+    let metadata_style = if is_latest {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
     let badges = turn_cell_badges(thread, cell);
     let response = turn_response(thread, cell);
     let turn_suffix = prompt
         .turn
         .as_deref()
-        .map(|turn| format!("  󰐖 {turn}"))
+        .map(|turn| format!("  {} {turn}", icon::TURN))
         .unwrap_or_default();
     let trailing = format!("{turn_suffix}  [{}]", timestamp_label(prompt.timestamp));
     let label = format!(" {} ", names().user);
@@ -3283,7 +3473,7 @@ fn main_conversation_layout(
         .saturating_sub(Line::from(header.clone()).width() + Line::raw(&trailing).width())
         .max(1);
     header.push(Span::raw(" ".repeat(padding)));
-    header.push(Span::styled(trailing, Style::default().fg(Color::Gray)));
+    header.push(Span::styled(trailing, metadata_style));
     push(Line::from(header), None);
     push(Line::raw(""), None);
     let body_width = width.saturating_sub(4).min(92) as usize;
@@ -3346,7 +3536,7 @@ fn main_conversation_layout(
             let response_turn_suffix = response
                 .turn
                 .as_deref()
-                .map(|turn| format!("  󰐖 {turn}"))
+                .map(|turn| format!("  {} {turn}", icon::TURN))
                 .unwrap_or_default();
             let mut header = vec![Span::styled(
                 format!(" {} ", names().conversation),
@@ -3363,12 +3553,7 @@ fn main_conversation_layout(
                 .saturating_sub(Line::from(header.clone()).width() + Line::raw(&trailing).width())
                 .max(1);
             header.push(Span::raw(" ".repeat(padding)));
-            header.push(Span::styled(
-                trailing,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            header.push(Span::styled(trailing, metadata_style));
             push(Line::from(header), None);
             let metadata = badges.clone();
             if !metadata.is_empty() {
@@ -3402,6 +3587,58 @@ fn main_conversation_layout(
     CellLayout { lines, hits }
 }
 
+fn standalone_reply_layout(
+    thread: &Thread,
+    cell: &TurnCell,
+    width: u16,
+    latest_timestamp: u64,
+) -> CellLayout {
+    let response = &thread.items[cell.prompt];
+    let metadata_style = if response.timestamp == latest_timestamp {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let trailing = format!("  [{}]", timestamp_label(response.timestamp));
+    let mut header = vec![Span::styled(
+        format!(" {} ", names().conversation),
+        Style::default()
+            .fg(Color::Black)
+            .bg(name_block_background(Color::Green))
+            .add_modifier(Modifier::BOLD),
+    )];
+    if response.turn.is_some() {
+        header.push(Span::styled(
+            "  RESTORED",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    let padding = (width as usize)
+        .saturating_sub(Line::from(header.clone()).width() + Line::raw(&trailing).width())
+        .max(1);
+    header.push(Span::raw(" ".repeat(padding)));
+    header.push(Span::styled(trailing, metadata_style));
+    let mut lines = vec![Line::from(header), Line::raw("")];
+    let mut hits = vec![None, None];
+    let body_width = width.saturating_sub(4).min(92) as usize;
+    let color = if response.timestamp == latest_timestamp {
+        Color::White
+    } else {
+        Color::Gray
+    };
+    for line in markdown_body_lines(&sanitize_reply_text(&response.text), body_width, color) {
+        lines.push(line);
+        hits.push(None);
+    }
+    lines.push(Line::raw(""));
+    hits.push(None);
+    CellLayout { lines, hits }
+}
+
 fn turn_cell_layout(
     thread_index: usize,
     turn_index: usize,
@@ -3424,6 +3661,14 @@ fn turn_cell_layout(
         active,
         activity,
     );
+    for hit in &mut layout.hits {
+        *hit = Some(ClickTarget::TraceSummary(turn_index));
+    }
+    if open {
+        for line in &mut layout.lines {
+            line.style = line.style.bg(Color::Rgb(30, 32, 36));
+        }
+    }
     let mut diagnostic_items = cell
         .items
         .iter()
@@ -3463,9 +3708,6 @@ fn turn_cell_layout(
         .count();
     if diagnostic_items.is_empty() {
         return layout;
-    }
-    for hit in &mut layout.hits {
-        *hit = Some(ClickTarget::TraceSummary(turn_index));
     }
     if !open {
         return layout;
@@ -5205,7 +5447,15 @@ fn compact_current_dir() -> String {
     let Ok(path) = std::env::current_dir() else {
         return "?".into();
     };
-    let full = path.display().to_string();
+    let full = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .and_then(|home| {
+            path.strip_prefix(home)
+                .ok()
+                .map(std::path::Path::to_path_buf)
+        })
+        .map(|relative| format!("~/{}", relative.display()))
+        .unwrap_or_else(|| path.display().to_string());
     if full.chars().count() <= 28 {
         return full;
     }
@@ -5307,6 +5557,8 @@ fn turn_cell_badges(thread: &Thread, cell: &TurnCell) -> String {
                 });
             badges.push(format!("{} total {}", icon::TOKENS, format_count(total)));
         }
+        badges.extend(memory_badges(&metrics.memory, false));
+        badges.extend(schedule_badges(&metrics.schedule, false));
     }
     badges.join(" · ")
 }
@@ -5467,6 +5719,8 @@ fn turn_badges(thread: &Thread, turn: Option<&str>, timestamp: u64, show_traces:
                 format!("{} total {}", icon::TOKENS, format_count(total))
             });
         }
+        badges.extend(memory_badges(&metrics.memory, show_traces));
+        badges.extend(schedule_badges(&metrics.schedule, show_traces));
     } else if let Some(turn) = turn.and_then(|value| value.parse::<u64>().ok()) {
         if let Some((prompt, completion, total)) = thread.usage.get(&turn) {
             if show_traces {
@@ -5483,6 +5737,81 @@ fn turn_badges(thread: &Thread, turn: Option<&str>, timestamp: u64, show_traces:
         }
     }
     badges.join(" · ")
+}
+
+fn memory_badges(memory: &MemoryTurnMetrics, detailed: bool) -> Vec<String> {
+    let mut badges = Vec::new();
+    if memory.saved > 0 {
+        badges.push(if detailed {
+            format!("memory saved {}", memory.saved)
+        } else {
+            "memory saved".into()
+        });
+    }
+    if memory.forgotten > 0 {
+        badges.push(if detailed {
+            format!("memory forgotten {}", memory.forgotten)
+        } else {
+            "memory forgotten".into()
+        });
+    }
+    if memory.corrected > 0 {
+        badges.push(if detailed {
+            format!("memory updated {}", memory.corrected)
+        } else {
+            "memory updated".into()
+        });
+    }
+    let recalled = memory
+        .recalled_preferences
+        .saturating_add(memory.recalled_history);
+    if recalled > 0 {
+        badges.push(if detailed {
+            format!(
+                "memory recalled {} preferences + {} history",
+                memory.recalled_preferences, memory.recalled_history
+            )
+        } else {
+            format!("memory recalled {recalled}")
+        });
+    }
+    if memory.failed > 0 {
+        badges.push("memory unchanged".into());
+    }
+    badges
+}
+
+fn schedule_badges(schedule: &ScheduleTurnMetrics, detailed: bool) -> Vec<String> {
+    let mut badges = Vec::new();
+    if schedule.scheduled > 0 {
+        badges.push(if detailed {
+            format!("reminders scheduled {}", schedule.scheduled)
+        } else {
+            "reminder scheduled".into()
+        });
+    }
+    if schedule.tasks_scheduled > 0 {
+        badges.push(if detailed {
+            format!("agent tasks scheduled {}", schedule.tasks_scheduled)
+        } else {
+            "agent task scheduled".into()
+        });
+    }
+    if schedule.cancelled > 0 {
+        badges.push(if detailed {
+            format!("reminders cancelled {}", schedule.cancelled)
+        } else {
+            "reminder cancelled".into()
+        });
+    }
+    if schedule.fired > 0 {
+        badges.push(if detailed {
+            format!("reminders fired {}", schedule.fired)
+        } else {
+            "reminder fired".into()
+        });
+    }
+    badges
 }
 
 fn format_count(value: impl Into<u64>) -> String {
@@ -5690,7 +6019,7 @@ fn draw_input(
     for (li, text) in input_lines.iter().enumerate() {
         let mut spans: Vec<Span> = Vec::new();
         // Prompt marker on the first line only.
-        let prefix = if li == 0 { "❯ " } else { "  " };
+        let prefix = if li == 0 { INPUT_PROMPT_MARKER } else { "  " };
         spans.push(Span::styled(prefix, Style::default().fg(Color::Cyan)));
 
         if input.is_empty() && li == 0 {
@@ -5761,62 +6090,47 @@ fn draw_input(
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// Vim-style statusline below the input: a bold brand segment, a clear
-/// daemon-state segment, and key bindings on the right.
-fn worker_activity_counts(
-    agent_infos: &HashMap<String, AgentInfo>,
-) -> (usize, usize, usize, usize) {
-    let mut counts = (0, 0, 0, 0);
-    for agent in agent_infos
+/// Compact contextual guidance that stays subordinate to the conversation.
+fn footer_mode_text(open_trace: Option<usize>, follow: bool) -> Option<String> {
+    if open_trace.is_some() {
+        Some(format!(
+            "TRACE    ↑↓ select · {} Pg scroll · {} Esc close · {} help",
+            icon::SCROLL,
+            icon::CLOSE,
+            icon::HELP
+        ))
+    } else if !follow {
+        Some(format!(
+            "HISTORY    ↑↓ select · {} End live · {} help",
+            icon::LIVE,
+            icon::HELP
+        ))
+    } else {
+        None
+    }
+}
+
+fn status_task_count(agent_infos: &HashMap<String, AgentInfo>) -> usize {
+    agent_infos
         .values()
-        .filter(|agent| agent.id != FOREGROUND_ID && agent.id != MEMORY_ID)
-    {
-        match agent.state {
-            AgentState::Starting | AgentState::Running => counts.0 += 1,
-            AgentState::Waiting => counts.1 += 1,
-            AgentState::Failed => counts.2 += 1,
-            AgentState::Completed | AgentState::Terminated | AgentState::Released => counts.3 += 1,
-            _ => {}
-        }
-    }
-    counts
+        .filter(|agent| {
+            agent.id != FOREGROUND_ID
+                && agent.id != MEMORY_ID
+                && agent.id != BACKGROUND_ID
+                && matches!(
+                    agent.state,
+                    AgentState::Starting | AgentState::Running | AgentState::Waiting
+                )
+        })
+        .count()
 }
 
-fn worker_activity_summary(agent_infos: &HashMap<String, AgentInfo>) -> Option<String> {
-    let (running, waiting, failed, completed) = worker_activity_counts(agent_infos);
-    let mut parts = Vec::new();
-    if running > 0 {
-        parts.push(format!("{running} active"));
+fn status_task_label(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 task".into()),
+        count => Some(format!("{count} tasks")),
     }
-    if waiting > 0 {
-        parts.push(format!("{waiting} idle"));
-    }
-    if failed > 0 {
-        parts.push(format!("{failed} failed"));
-    }
-    if completed > 0 {
-        parts.push(format!("{completed} done"));
-    }
-    (!parts.is_empty()).then(|| format!(" {} ", parts.join(" · ")))
-}
-
-fn footer_mode_text(open_trace: Option<usize>, turns: usize) -> String {
-    match open_trace {
-        Some(turn) => format!(
-            "{} TRACE · turn {}/{} · arrows select · Pg scroll · End live",
-            icon::EXPANDED,
-            turn + 1,
-            turns
-        ),
-        None => format!("{} TRACE", icon::COLLAPSED),
-    }
-}
-
-fn footer_controls(open_trace: Option<usize>, turns: usize) -> String {
-    format!(
-        " 󰀄 AGENTS ·  HELP · {} · 󰋼 INFO ",
-        footer_mode_text(open_trace, turns)
-    )
 }
 
 fn draw_statusline(
@@ -5825,98 +6139,95 @@ fn draw_statusline(
     daemon: Option<&DaemonInfo>,
     agent_infos: &HashMap<String, AgentInfo>,
     threads: &[Thread],
-    config: &tachyon_util::config::Config,
-    session_label: &str,
     open_trace: Option<usize>,
-    view: &TranscriptView,
+    follow: bool,
 ) {
-    let (dtext, dbg) = match daemon {
-        Some(info) if info.provider_ready => (" ● ".to_string(), Color::Green),
-        Some(_) => (" ● ".to_string(), Color::Yellow),
-        None => (" × ".to_string(), Color::Red),
+    let (daemon_label, state_color) = match daemon {
+        Some(info) if info.provider_ready => (None, Color::Green),
+        Some(_) => (Some("no API key"), Color::Yellow),
+        None => (Some("offline"), Color::Red),
     };
-    let brand = Span::styled(
-        " TACHYON ",
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Gray)
-            .add_modifier(Modifier::BOLD),
-    );
-    let state = Span::styled(dtext, Style::default().fg(dbg).add_modifier(Modifier::BOLD));
-    let activity = worker_activity_summary(agent_infos);
-    let controls = footer_controls(open_trace, view.turns);
-    let ready = ready_earlier_turn(threads).map(ready_notice);
-    let session = (session_label == "fresh")
-        .then(|| Span::styled(" FRESH ", Style::default().fg(Color::DarkGray)));
-    let cwd = Span::styled(
-        format!(" 󰉋 {} ", compact_current_dir()),
-        Style::default().fg(Color::DarkGray),
-    );
-    let context = threads
-        .iter()
-        .find(|thread| thread.is_foreground)
-        .and_then(|thread| thread.usage.iter().max_by_key(|(turn, _)| *turn))
-        .and_then(|(_, (prompt, _, _))| {
-            config.model.context_length.map(|limit| {
-                let percent = (*prompt as f64 / limit as f64 * 100.0).min(100.0);
-                format!(" ctx:{percent:.0}% ")
-            })
-        });
-    let context_span = context.map(|text| Span::styled(text, Style::default().fg(Color::DarkGray)));
-    let activity_span =
-        activity.map(|text| Span::styled(text, Style::default().fg(Color::DarkGray)));
-    let left_width = brand.content.chars().count()
-        + 2
-        + controls.chars().count()
-        + ready.as_ref().map_or(0, |text| text.chars().count());
-    let mut right_spans = Vec::new();
-    let mut right_width = 0usize;
-    let mut add_right = |span: Span<'static>| {
-        if !right_spans.is_empty() {
-            let divider = Span::styled(" · ", Style::default().fg(Color::DarkGray));
-            right_spans.push(divider.clone());
-            right_width += divider.content.chars().count();
+    if let Some(mode) = footer_mode_text(open_trace, follow) {
+        let (label, controls) = mode.split_once("    ").unwrap_or((&mode, ""));
+        let sections = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(2)])
+            .split(area);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!(" {label} "),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(controls, Style::default().fg(Color::DarkGray)),
+            ])),
+            sections[0],
+        );
+        f.render_widget(
+            Paragraph::new(Span::styled("● ", Style::default().fg(state_color)))
+                .alignment(Alignment::Right),
+            sections[1],
+        );
+        return;
+    }
+
+    let task = status_task_label(status_task_count(agent_infos));
+    let mut right = Vec::new();
+    let mut push_right = |span: Span<'static>| {
+        if !right.is_empty() {
+            right.push(Span::raw("     "));
         }
-        right_width += span.content.chars().count();
-        right_spans.push(span);
+        right.push(span);
     };
-    if let Some(session) = session {
-        add_right(session);
+    if let Some(task) = task {
+        push_right(Span::styled(task, Style::default().fg(Color::DarkGray)));
     }
-    add_right(cwd);
-    if let Some(context_span) = context_span {
-        add_right(context_span);
+    if let Some(ready) = ready_earlier_turn(threads).map(ready_notice) {
+        push_right(Span::styled(ready, Style::default().fg(Color::Green)));
     }
-    if let Some(activity_span) = activity_span {
-        add_right(activity_span);
+    if let Some(label) = daemon_label {
+        push_right(Span::styled(label, Style::default().fg(Color::DarkGray)));
     }
-    add_right(Span::styled(
+    push_right(Span::styled(
         format!(
-            " v{} ",
+            "{WINDOW_LOGO}  v{}",
             daemon
                 .map(|info| info.version.as_str())
                 .unwrap_or(env!("CARGO_PKG_VERSION"))
         ),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Gray),
     ));
-    add_right(state);
-    let gap = area.width.saturating_sub((left_width + right_width) as u16);
-    let mut line = vec![
-        brand,
-        Span::raw("  "),
-        Span::styled(controls, Style::default().fg(Color::DarkGray)),
-    ];
-    if let Some(ready) = ready {
-        line.push(Span::styled(
-            ready,
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    line.push(Span::raw(" ".repeat(gap as usize)));
-    line.extend(right_spans);
-    f.render_widget(Paragraph::new(Line::from(line)), area);
+    right.push(Span::styled(" ● ", Style::default().fg(state_color)));
+    let right_width = right
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>() as u16;
+    let sections = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(right_width)])
+        .split(area);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " TACHYON ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(compact_current_dir(), Style::default().fg(Color::DarkGray)),
+        ])),
+        sections[0],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(right)).alignment(Alignment::Right),
+        sections[1],
+    );
 }
 
 fn draw_agent_pane(
@@ -5927,6 +6238,7 @@ fn draw_agent_pane(
     daemon: Option<&DaemonInfo>,
     daemon_since: Option<Instant>,
     agent_infos: &HashMap<String, AgentInfo>,
+    scheduled_tasks: &[ScheduledTaskInfo],
     tab: PaneTab,
 ) {
     f.render_widget(Clear, area);
@@ -5957,17 +6269,32 @@ fn draw_agent_pane(
         .count();
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" FOREGROUND ", tab_style(tab == PaneTab::Foreground)),
+            Span::styled(
+                WINDOW_LOGO_BUTTON,
+                Style::default().fg(Color::Black).bg(Color::White),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                ORCHESTRATORS_TAB_LABEL,
+                tab_style(tab == PaneTab::Foreground),
+            ),
             Span::raw(" "),
             Span::styled(
                 format!(" AGENTS ({worker_count}) "),
                 tab_style(tab == PaneTab::Agents),
             ),
+            Span::raw(" "),
+            Span::styled(
+                format!(" SCHEDULED ({}) ", scheduled_tasks.len()),
+                tab_style(tab == PaneTab::Scheduled),
+            ),
+            Span::raw(" "),
+            Span::styled(" MEMORY ", tab_style(tab == PaneTab::Memory)),
         ])),
         Rect {
-            x: area.x.saturating_add(2),
+            x: area.x.saturating_add(1),
             y: area.y,
-            width: area.width.saturating_sub(4),
+            width: area.width.saturating_sub(2),
             height: 1,
         },
     );
@@ -6024,6 +6351,9 @@ fn draw_agent_pane(
                         Style::default()
                     }),
                 );
+            }
+            if let Some(info) = agent_infos.get(MEMORY_ID) {
+                rows.push(Row::new(memory_service_columns(info)));
             }
             let background = daemon.map(|info| &info.background);
             let pending_reviews = background.map_or(0, |info| info.pending_reviews.len());
@@ -6110,6 +6440,50 @@ fn draw_agent_pane(
                     .collect()
             }
         }
+        PaneTab::Scheduled => {
+            if scheduled_tasks.is_empty() {
+                vec![Row::new(vec![
+                    Cell::from("No scheduled tasks"),
+                    Cell::from("-"),
+                    Cell::from("-"),
+                    Cell::from("-"),
+                    Cell::from("-"),
+                    Cell::from("Schedule future work from the conversation"),
+                ])
+                .style(Style::default().fg(Color::DarkGray))]
+            } else {
+                scheduled_tasks
+                    .iter()
+                    .map(|schedule| Row::new(scheduled_task_columns(schedule)))
+                    .collect()
+            }
+        }
+        PaneTab::Memory => vec![
+            Row::new(vec![
+                Cell::from("User profile"),
+                Cell::from("planned"),
+                Cell::from("memories.redb"),
+                Cell::from("typed read/write"),
+                Cell::from("-"),
+                Cell::from("Durable facts, preferences, and corrections"),
+            ]),
+            Row::new(vec![
+                Cell::from("History"),
+                Cell::from("planned"),
+                Cell::from("history.redb"),
+                Cell::from("typed read"),
+                Cell::from("-"),
+                Cell::from("Conversation and task activity"),
+            ]),
+            Row::new(vec![
+                Cell::from("Runtime"),
+                Cell::from("planned"),
+                Cell::from("runtime.redb"),
+                Cell::from("typed read"),
+                Cell::from("-"),
+                Cell::from("Schedules, workers, and runtime state"),
+            ]),
+        ],
     };
     f.render_widget(
         Table::new(rows, widths)
@@ -6119,9 +6493,17 @@ fn draw_agent_pane(
         sections[0],
     );
     f.render_widget(
-        Paragraph::new(
-            "left/right tabs · click a row to focus · s stop · r restart · u resume · k kill",
-        )
+        Paragraph::new(match tab {
+            PaneTab::Scheduled => {
+                "left/right tabs · durable scheduled work · worker appears when execution starts"
+            }
+            PaneTab::Memory => {
+                "left/right tabs · placeholder · inspection and modification controls planned"
+            }
+            PaneTab::Foreground | PaneTab::Agents => {
+                "left/right tabs · click a row to focus · s stop · r restart · u resume · k kill"
+            }
+        })
         .alignment(Alignment::Center)
         .style(
             Style::default()
@@ -6130,6 +6512,48 @@ fn draw_agent_pane(
         ),
         sections[1],
     );
+}
+
+fn scheduled_task_columns(schedule: &ScheduledTaskInfo) -> [String; 6] {
+    let status = match schedule.status {
+        ScheduledTaskStatus::Pending => "pending",
+        ScheduledTaskStatus::Running => "running",
+        ScheduledTaskStatus::Completed => "completed",
+        ScheduledTaskStatus::Failed => "failed",
+        ScheduledTaskStatus::Cancelled => "cancelled",
+    };
+    let mode = match schedule.mode {
+        ScheduledTaskMode::StartAt => "start at",
+        ScheduledTaskMode::FinishBy => "finish by",
+    };
+    let remaining_ms = schedule.due_at_ms.saturating_sub(now_seconds());
+    let deadline = if remaining_ms == 0 {
+        "due now".into()
+    } else {
+        format!(
+            "in {}",
+            format_duration(Duration::from_millis(remaining_ms))
+        )
+    };
+    [
+        truncate_text(&format!("schedule t{}", schedule.turn), 17),
+        status.into(),
+        mode.into(),
+        deadline,
+        format_age(schedule.created_at_ms / 1_000),
+        truncate_text(&schedule.objective, 48),
+    ]
+}
+
+fn memory_service_columns(info: &AgentInfo) -> [String; 6] {
+    [
+        "Memory".into(),
+        state_label(agent_activity_state(info.state)).into(),
+        "context service".into(),
+        "daemon stop".into(),
+        format_age(info.created_secs),
+        truncate_text(&info.description, 48),
+    ]
 }
 
 #[allow(dead_code)]
@@ -6145,16 +6569,25 @@ fn draw_agent_pane_legacy(
 ) {
     f.render_widget(Clear, area);
     let block = Block::default()
-        .title(" AGENTS ")
+        .title(
+            Title::from(Span::styled(
+                WINDOW_LOGO_BUTTON,
+                Style::default().fg(Color::Black).bg(Color::White),
+            ))
+            .alignment(Alignment::Left),
+        )
+        .title(
+            Title::from(Span::styled(
+                " AGENTS ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Center),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .title_alignment(Alignment::Center)
         .style(Style::default().bg(Color::Rgb(18, 18, 22)));
     let daemon_state = match daemon {
         Some(info) if info.provider_ready => ("●", "online", Color::Green),
@@ -6812,7 +7245,74 @@ mod tests {
     }
 
     #[test]
-    fn worker_footer_excludes_foreground_and_calls_waiting_idle() {
+    fn window_logo_button_has_balanced_internal_padding() {
+        assert_eq!(WINDOW_LOGO_BUTTON, " 󰘵 ");
+        assert_eq!(WINDOW_LOGO_BUTTON.chars().count(), 3);
+    }
+
+    #[test]
+    fn daemon_restart_archives_turn_ids_without_discarding_chat() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        thread.add_turn(ItemKind::Reply, "answer".into(), Some("2".into()));
+        thread.completed_turns.insert("2".into());
+        thread.unread_turns.insert("2".into());
+        let mut threads = vec![thread];
+
+        archive_session_turns(&mut threads, Some(42));
+
+        assert_eq!(threads[0].items.len(), 2);
+        assert!(threads[0]
+            .items
+            .iter()
+            .all(|item| item.turn.as_deref() == Some("archived:42:2")));
+        assert!(threads[0].completed_turns.contains("archived:42:2"));
+        assert!(threads[0].unread_turns.is_empty());
+        archive_session_turns(&mut threads, Some(43));
+        assert!(threads[0]
+            .items
+            .iter()
+            .all(|item| item.turn.as_deref() == Some("archived:42:2")));
+    }
+
+    #[test]
+    fn scheduled_tab_columns_show_durable_task_state() {
+        assert_eq!(ORCHESTRATORS_TAB_LABEL, " ORCHESTRATORS ");
+        let columns = scheduled_task_columns(&ScheduledTaskInfo {
+            id: "scheduled-task-1".into(),
+            conversation_id: "foreground".into(),
+            turn: 7,
+            objective: "inspect release artifacts".into(),
+            mode: ScheduledTaskMode::StartAt,
+            created_at_ms: now_seconds(),
+            due_at_ms: now_seconds().saturating_add(60_000),
+            status: ScheduledTaskStatus::Pending,
+            work_id: None,
+        });
+        assert_eq!(columns[0], "schedule t7");
+        assert_eq!(columns[1], "pending");
+        assert_eq!(columns[2], "start at");
+        assert!(columns[3].starts_with("in "));
+        assert_eq!(columns[5], "inspect release artifacts");
+    }
+
+    #[test]
+    fn foreground_pane_describes_the_memory_service() {
+        let mut memory = agent_info(LifetimeClass::Persistent);
+        memory.id = MEMORY_ID.into();
+        memory.state = AgentState::Running;
+        memory.description = "Curate durable memory.".into();
+
+        let columns = memory_service_columns(&memory);
+        assert_eq!(columns[0], "Memory");
+        assert_eq!(columns[1], "working");
+        assert_eq!(columns[2], "context service");
+        assert_eq!(columns[3], "daemon stop");
+        assert_eq!(columns[5], "Curate durable memory.");
+    }
+
+    #[test]
+    fn task_count_excludes_foreground() {
         let mut foreground = agent_info(LifetimeClass::Long);
         foreground.id = FOREGROUND_ID.into();
         foreground.state = AgentState::Running;
@@ -6824,7 +7324,14 @@ mod tests {
             (waiting.id.clone(), waiting),
         ]);
 
-        assert_eq!(worker_activity_summary(&infos).as_deref(), Some(" 1 idle "));
+        assert_eq!(status_task_count(&infos), 1);
+    }
+
+    #[test]
+    fn status_hides_zero_tasks_and_pluralizes_active_tasks() {
+        assert_eq!(status_task_label(0), None);
+        assert_eq!(status_task_label(1).as_deref(), Some("1 task"));
+        assert_eq!(status_task_label(2).as_deref(), Some("2 tasks"));
     }
 
     #[test]
@@ -6905,6 +7412,29 @@ mod tests {
             assert!(!text.contains("> first question"));
             assert!(!text.contains("trace ·"));
         }
+    }
+
+    #[test]
+    fn selected_chat_cell_copy_includes_user_and_reply() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "first question".into(), Some("2".into()));
+        thread.add_turn(ItemKind::Reply, "first answer".into(), Some("2".into()));
+        thread.add_turn(ItemKind::User, "second question".into(), Some("3".into()));
+        thread.add_turn(ItemKind::Reply, "second answer".into(), Some("3".into()));
+        let threads = vec![thread];
+
+        let expected = format!(
+            "{}:\nfirst question\n\n{}:\nfirst answer",
+            names().user,
+            names().conversation
+        );
+        assert_eq!(
+            selected_chat_cell_text(&threads, Some(0)).as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(selected_chat_cell_text(&threads, None)
+            .expect("latest chat cell")
+            .contains("second answer"));
     }
 
     #[test]
@@ -7170,6 +7700,79 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.to_string().contains("raw diagnostic detail")));
+    }
+
+    #[test]
+    fn conversation_cell_without_traces_is_clickable_and_highlighted() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        thread.add_turn(ItemKind::Reply, "answer".into(), Some("2".into()));
+        let cell = build_turn_cells(&thread).pop().expect("chat cell");
+        let layout = turn_cell_layout(
+            0,
+            0,
+            std::slice::from_ref(&thread),
+            &cell,
+            80,
+            latest_conversation_timestamp(&thread, &cell),
+            false,
+            "",
+            true,
+            None,
+        );
+
+        assert!(layout
+            .hits
+            .iter()
+            .all(|hit| *hit == Some(ClickTarget::TraceSummary(0))));
+        assert!(layout
+            .lines
+            .iter()
+            .all(|line| line.style.bg == Some(Color::Rgb(30, 32, 36))));
+    }
+
+    #[test]
+    fn inactive_turn_metadata_is_dimmed_and_latest_metadata_is_green() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "old question".into(), Some("2".into()));
+        thread.add_turn(ItemKind::Reply, "old answer".into(), Some("2".into()));
+        thread.add_turn(ItemKind::User, "new question".into(), Some("3".into()));
+        thread.add_turn(ItemKind::Reply, "new answer".into(), Some("3".into()));
+        thread.items[0].timestamp = 1;
+        thread.items[1].timestamp = 2;
+        thread.items[2].timestamp = 3;
+        thread.items[3].timestamp = 4;
+        let cells = build_turn_cells(&thread);
+
+        let old = main_conversation_layout(&thread, &cells[0], 80, 4, false, "");
+        let latest = main_conversation_layout(&thread, &cells[1], 80, 4, false, "");
+
+        assert_eq!(
+            old.lines[0].spans.last().unwrap().style.fg,
+            Some(Color::DarkGray)
+        );
+        assert_eq!(
+            latest.lines[0].spans.last().unwrap().style.fg,
+            Some(Color::Green)
+        );
+    }
+
+    #[test]
+    fn correlated_standalone_reply_is_marked_restored() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::Reply, "recovered answer".into(), Some("2".into()));
+        let cell = build_turn_cells(&thread).pop().expect("standalone reply");
+
+        let layout = main_conversation_layout(
+            &thread,
+            &cell,
+            80,
+            latest_conversation_timestamp(&thread, &cell),
+            false,
+            "",
+        );
+
+        assert!(layout.lines[0].to_string().contains("RESTORED"));
     }
 
     #[test]
@@ -7443,18 +8046,24 @@ mod tests {
 
     #[test]
     fn footer_trace_mode_is_concise_and_contextual() {
+        assert_eq!(footer_mode_text(None, true), None);
         assert_eq!(
-            footer_mode_text(None, 3),
-            format!("{} TRACE", icon::COLLAPSED)
+            footer_mode_text(Some(1), false),
+            Some(format!(
+                "TRACE    ↑↓ select · {} Pg scroll · {} Esc close · {} help",
+                icon::SCROLL,
+                icon::CLOSE,
+                icon::HELP
+            ))
         );
         assert_eq!(
-            footer_mode_text(Some(1), 3),
-            format!(
-                "{} TRACE · turn 2/3 · arrows select · Pg scroll · End live",
-                icon::EXPANDED
-            )
+            footer_mode_text(None, false),
+            Some(format!(
+                "HISTORY    ↑↓ select · {} End live · {} help",
+                icon::LIVE,
+                icon::HELP
+            ))
         );
-        assert!(!footer_controls(None, 3).contains("INLINE TRACES"));
     }
 
     #[test]
@@ -7687,6 +8296,73 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_notification_is_projected_as_standalone_reply() {
+        let mut thread = Thread::new_foreground();
+        let mut event = interaction(InteractionEvent::UserVisibleNotificationPublished {
+            text: "Your coffee is ready.".into(),
+        });
+        event.metadata.message_id = "reminder-delivery-reminder-1".into();
+        event.metadata.correlation_id = "reminder-1".into();
+        event.metadata.turn_id = None;
+        apply_interaction_event(&mut thread, event);
+
+        assert_eq!(thread.items.len(), 1);
+        assert_eq!(thread.items[0].kind, ItemKind::Reply);
+        assert_eq!(thread.items[0].text, "Your coffee is ready.");
+        assert_eq!(thread.items[0].turn, None);
+        let cells = build_turn_cells(&thread);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].prompt, 0);
+        let layout = main_conversation_layout(
+            &thread,
+            &cells[0],
+            80,
+            latest_conversation_timestamp(&thread, &cells[0]),
+            false,
+            "",
+        );
+        assert!(!layout.lines[0].to_string().contains("RESTORED"));
+    }
+
+    #[test]
+    fn reminder_schedule_badges_report_committed_changes() {
+        assert_eq!(
+            schedule_badges(
+                &ScheduleTurnMetrics {
+                    scheduled: 1,
+                    tasks_scheduled: 0,
+                    cancelled: 0,
+                    fired: 0,
+                },
+                false,
+            ),
+            ["reminder scheduled"]
+        );
+        assert_eq!(
+            schedule_badges(
+                &ScheduleTurnMetrics {
+                    scheduled: 0,
+                    tasks_scheduled: 0,
+                    cancelled: 1,
+                    fired: 0,
+                },
+                false,
+            ),
+            ["reminder cancelled"]
+        );
+        assert_eq!(
+            schedule_badges(
+                &ScheduleTurnMetrics {
+                    tasks_scheduled: 1,
+                    ..ScheduleTurnMetrics::default()
+                },
+                false,
+            ),
+            ["agent task scheduled"]
+        );
+    }
+
+    #[test]
     fn interaction_envelope_is_decoded_before_line_fallback() {
         let wire = serde_json::to_string(&interaction(InteractionEvent::ConversationFinished {
             text: "done".into(),
@@ -7711,30 +8387,70 @@ mod tests {
     }
 
     #[test]
-    fn memory_lifecycle_events_are_visible_on_the_correlated_turn() {
-        let mut thread = Thread::new_foreground();
-        apply_agent_event(
-            &mut thread,
-            AgentEvent::MemorySaved {
-                turn: Some(2),
-                memory_id: "preference-1".into(),
-            },
-        );
-        apply_agent_event(
-            &mut thread,
-            AgentEvent::MemoryRecalled {
-                turn: Some(3),
-                preference_count: 1,
-                history_count: 4,
-            },
-        );
-        assert_eq!(thread.items[0].text, "[memory saved] user preference");
-        assert_eq!(thread.items[0].turn.as_deref(), Some("2"));
-        assert_eq!(
-            thread.items[1].text,
-            "[memory recalled] 1 preferences · 4 history items"
-        );
-        assert_eq!(thread.items[1].turn.as_deref(), Some("3"));
+    fn memory_lifecycle_events_render_beside_token_usage_without_trace_rows() {
+        let mut threads = vec![Thread::new_foreground()];
+        for (event_id, kind) in [
+            (
+                1,
+                AgentEvent::Usage {
+                    turn: Some(3),
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    context_tokens: 10,
+                    context_window: Some(100),
+                },
+            ),
+            (
+                2,
+                AgentEvent::MemoryRecalled {
+                    turn: Some(3),
+                    preference_count: 1,
+                    history_count: 4,
+                },
+            ),
+            (
+                3,
+                AgentEvent::MemoryMutation {
+                    turn: Some(3),
+                    result: MemoryMutationResult::Applied {
+                        kind: MemoryMutationKind::Remember,
+                        memory_id: "preference-1".into(),
+                        replaced_memory_id: None,
+                    },
+                },
+            ),
+        ] {
+            record_correlated_metrics(
+                &mut threads,
+                &EventEnvelope {
+                    event_id,
+                    session_id: FOREGROUND_ID.into(),
+                    conversation_id: Some(FOREGROUND_ID.into()),
+                    turn_id: Some("3".into()),
+                    task_id: None,
+                    parent_task_id: None,
+                    tool_call_id: None,
+                    actor: Actor::Foreground,
+                    sequence: event_id,
+                    occurred_at_ms: event_id,
+                    kind,
+                },
+            );
+        }
+        let thread = &threads[0];
+        assert!(thread.items.is_empty());
+        let metrics = &thread.metrics["3"];
+        let mut badges = vec![format!(
+            "{} total {}",
+            icon::TOKENS,
+            format_count(metrics.self_usage.as_ref().unwrap().total)
+        )];
+        badges.extend(memory_badges(&metrics.memory, false));
+        let badges = badges.join(" · ");
+        assert!(badges.contains("total 15"));
+        assert!(badges.contains("memory saved"));
+        assert!(badges.contains("memory recalled 5"));
     }
 
     #[test]
@@ -7859,7 +8575,10 @@ mod tests {
         thread.finish_reply("finished".into(), Some("2".into()));
 
         assert_eq!(ready_earlier_turn(&[thread]), None);
-        assert!(ready_notice(2).contains("click to view"));
+        assert_eq!(
+            ready_notice(2),
+            format!("{} response 2 ready", icon::SUCCESS)
+        );
     }
 
     #[test]
@@ -8294,6 +9013,8 @@ mod tests {
                     total: 1_000,
                 }),
                 worker_usage: HashMap::new(),
+                memory: MemoryTurnMetrics::default(),
+                schedule: ScheduleTurnMetrics::default(),
             },
         );
         let compact_badges = turn_badges(&compact_thread, Some("3"), 99_000, false);

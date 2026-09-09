@@ -29,6 +29,7 @@ globset = "0.4"
 regex = "1"
 sha2 = "0.10"
 redb = "2"
+chrono = "0.4"
 
 [workspace.dependencies.tachyon-util]
 path = "crates/tachyon-util"

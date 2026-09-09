@@ -6,5 +6,6 @@ pub mod protocol;
 pub mod store;
 
 pub use store::{
-    explicit_preference, MemoryError, MemoryRecord, MemoryStore, PreferenceObservation,
+    explicit_preference, MemoryError, MemoryMutationSource, MemoryRecord, MemoryStore,
+    PreferenceObservation, PrimitiveRecord,
 };
