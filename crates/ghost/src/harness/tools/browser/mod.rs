@@ -7,69 +7,31 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tachyon_model::ToolSpec;
 
-use super::{
-    decode_input, Capability, Tool, ToolContext, ToolError, ToolErrorCode, ToolFuture, ToolResult,
+use crate::harness::backend::{ExecRequest, Local};
+use crate::harness::runtime::{
+    decode_input, Capability, Tool, ToolContext, ToolError, ToolErrorCode, ToolFuture,
 };
-use crate::harness::backend::{Backend, ExecRequest, Local};
-use crate::harness::tools::{agent_browser, ipython};
+
+pub const USAGE: &str = include_str!("usage.md");
+
+pub fn agent_browser() -> ToolSpec {
+    ToolSpec::new(
+        "agent_browser",
+        "Use the fixed browser. Prefer `read <URL>` for text. For interaction use `open`, `snapshot -i -c`, current refs, fresh snapshots after changes, targeted `get text`, and `close`.",
+        json!({
+            "type": "object",
+            "properties": {
+                "args": { "type": "string", "description": "One command's arguments; omit the executable and engine options." }
+            },
+            "required": ["args"],
+            "additionalProperties": false,
+        }),
+    )
+}
 
 const CAPABILITIES: &[Capability] = &[Capability::ExecuteProcess];
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(20);
 const BROWSER_MAX_OUTPUT_BYTES: usize = 8 * 1024;
-
-pub struct IpythonTool {
-    schema: ToolSpec,
-    backend: Arc<Local>,
-}
-
-impl IpythonTool {
-    pub fn new(backend: Arc<Local>) -> Self {
-        Self {
-            schema: ipython(),
-            backend,
-        }
-    }
-}
-
-impl Tool for IpythonTool {
-    fn name(&self) -> &'static str {
-        "ipython"
-    }
-
-    fn schema(&self) -> &ToolSpec {
-        &self.schema
-    }
-
-    fn capabilities(&self) -> &'static [Capability] {
-        CAPABILITIES
-    }
-
-    fn execute<'a>(&'a self, _context: &'a ToolContext, input: Value) -> ToolFuture<'a> {
-        Box::pin(async move {
-            let input: IpythonInput = decode_input(input)?;
-            if input.code.len() > 256 * 1024 {
-                return Err(ToolError::invalid("ipython code exceeds 256 KiB"));
-            }
-            let execution = self.backend.run_ipython(&input.code).await;
-            let is_error = execution.timed_out || execution.exit_code != Some(0);
-            let mut result = ToolResult::success(
-                execution.combined(),
-                json!({
-                    "exit_code": execution.exit_code,
-                    "timed_out": execution.timed_out,
-                }),
-            );
-            result.is_error = is_error;
-            Ok(result)
-        })
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IpythonInput {
-    code: String,
-}
 
 #[derive(Clone, Debug)]
 pub enum BrowserAvailability {
@@ -142,7 +104,7 @@ impl Tool for AgentBrowserTool {
             let argv = std::iter::once(request.program)
                 .chain(request.args)
                 .collect::<Vec<_>>();
-            super::exec::ExecTool::new()
+            crate::harness::runtime::ExecTool::new()
                 .execute(
                     &browser_context,
                     json!({"argv": argv, "timeout_ms": BROWSER_TIMEOUT.as_millis() as u64}),
@@ -153,9 +115,9 @@ impl Tool for AgentBrowserTool {
 }
 
 fn browser_policy(
-    base: &super::ToolPolicy,
+    base: &crate::harness::runtime::ToolPolicy,
     configured_max_output: Option<&str>,
-) -> super::ToolPolicy {
+) -> crate::harness::runtime::ToolPolicy {
     let mut policy = base.clone();
     policy.max_exec_duration = policy.max_exec_duration.min(BROWSER_TIMEOUT);
     policy.max_exec_output_bytes = policy.max_exec_output_bytes.min(BROWSER_MAX_OUTPUT_BYTES);

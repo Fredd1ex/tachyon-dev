@@ -49,8 +49,8 @@ mod tests {
         assert!(background.contains("Never address the user"));
 
         let worker = AgentRole::Worker.system_prompt(&cfg);
-        assert!(worker.contains("`ipython`"));
-        assert!(worker.contains("`agent_browser`"));
+        assert!(!worker.contains("`ipython`"));
+        assert!(!worker.contains("`agent_browser`"));
         assert!(!worker.contains("`spawn_agent`"));
         assert!(worker.contains("assigned workspace"));
         assert!(worker.len() < 750);

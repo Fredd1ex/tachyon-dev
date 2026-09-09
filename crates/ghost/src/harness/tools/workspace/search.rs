@@ -13,10 +13,10 @@ use serde_json::{json, Value};
 use tachyon_model::ToolSpec;
 use tokio::io::AsyncReadExt;
 
-use super::binary::discover;
-use super::path::resolve_existing;
-use super::traversal::{relative_utf8, walk, TraversalOptions, WalkControl};
-use super::{
+use crate::harness::runtime::binary::discover;
+use crate::harness::runtime::path::resolve_existing;
+use crate::harness::runtime::traversal::{relative_utf8, walk, TraversalOptions, WalkControl};
+use crate::harness::runtime::{
     decode_input, Capability, Tool, ToolContext, ToolError, ToolErrorCode, ToolFuture, ToolResult,
     SANITIZED_PATH,
 };

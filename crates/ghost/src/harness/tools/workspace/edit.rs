@@ -4,9 +4,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tachyon_model::ToolSpec;
 
-use super::path::resolve_write_target;
 use super::write::{atomic_replace, read_bounded_file};
-use super::{
+use crate::harness::runtime::path::resolve_write_target;
+use crate::harness::runtime::{
     decode_input, Capability, Tool, ToolContext, ToolError, ToolErrorCode, ToolFuture, ToolResult,
 };
 

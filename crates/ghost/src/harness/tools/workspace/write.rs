@@ -9,9 +9,9 @@ use tachyon_model::ToolSpec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
-use super::output_store::sync_directory;
-use super::path::{is_allowed, resolve_write_target, WriteTarget};
-use super::{
+use crate::harness::runtime::output_store::sync_directory;
+use crate::harness::runtime::path::{is_allowed, resolve_write_target, WriteTarget};
+use crate::harness::runtime::{
     decode_input, Capability, Tool, ToolContext, ToolError, ToolErrorCode, ToolFuture, ToolResult,
 };
 

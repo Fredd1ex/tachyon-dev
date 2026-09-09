@@ -11,12 +11,13 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
-use super::path::resolve_existing;
-use super::{
+use crate::harness::runtime::path::resolve_existing;
+use crate::harness::runtime::{
     decode_input, Capability, Tool, ToolContext, ToolError, ToolErrorCode, ToolFuture, ToolResult,
 };
 
 const CAPABILITIES: &[Capability] = &[Capability::ExecuteProcess];
+pub const USAGE: &str = include_str!("usage.md");
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct ExecTool {

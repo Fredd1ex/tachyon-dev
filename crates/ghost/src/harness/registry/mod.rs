@@ -7,7 +7,13 @@ use std::time::Instant;
 use serde_json::Value;
 use tachyon_model::ToolSpec;
 
-use super::{bound_utf8, Tool, ToolContext, ToolError, ToolErrorCode, ToolResult, ToolTelemetry};
+pub mod builtins;
+pub mod manifest;
+pub mod packages;
+
+use crate::harness::runtime::{
+    bound_utf8, Tool, ToolContext, ToolError, ToolErrorCode, ToolPolicy, ToolResult, ToolTelemetry,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -18,18 +24,31 @@ pub enum RegistryError {
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: HashMap<&'static str, Arc<dyn Tool>>,
+    manifests: Vec<manifest::Manifest>,
 }
 
 impl ToolRegistry {
     pub fn register<T: Tool + 'static>(&mut self, tool: T) -> Result<(), RegistryError> {
-        if self.tools.contains_key(tool.name()) {
-            return Err(RegistryError::Duplicate(tool.name().into()));
+        self.register_batch(vec![Arc::new(tool)])
+    }
+
+    // Validate the whole batch before publishing any operation.
+    pub(crate) fn register_batch(
+        &mut self,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Result<(), RegistryError> {
+        let mut names = std::collections::HashSet::new();
+        for tool in &tools {
+            if self.tools.contains_key(tool.name()) || !names.insert(tool.name()) {
+                return Err(RegistryError::Duplicate(tool.name().into()));
+            }
         }
-        self.tools.insert(tool.name(), Arc::new(tool));
+        self.tools
+            .extend(tools.into_iter().map(|tool| (tool.name(), tool)));
         Ok(())
     }
 
-    pub fn definitions(&self, policy: &super::ToolPolicy) -> Vec<ToolSpec> {
+    pub fn definitions(&self, policy: &ToolPolicy) -> Vec<ToolSpec> {
         let mut definitions = self
             .tools
             .values()
@@ -38,6 +57,23 @@ impl ToolRegistry {
             .collect::<Vec<_>>();
         definitions.sort_by(|left, right| left.name.cmp(&right.name));
         definitions
+    }
+
+    /// Only advertise package guidance when all of its documented operations
+    /// are allowed. Partial packages still expose their permitted tool schemas.
+    pub fn guidance(&self, policy: &ToolPolicy) -> String {
+        self.manifests
+            .iter()
+            .filter(|manifest| {
+                manifest.operations.iter().all(|name| {
+                    self.tools
+                        .get(name)
+                        .is_some_and(|tool| policy.permits(tool.as_ref()))
+                })
+            })
+            .map(|manifest| manifest.usage.trim())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     pub async fn execute(

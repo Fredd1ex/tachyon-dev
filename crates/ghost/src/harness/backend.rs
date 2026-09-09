@@ -2,14 +2,12 @@
 
 //! Execution backend for ghost tools.
 //!
-//! Ghost resolves every tool call (ipython/agent_browser) through a
-//! [`Backend`]. v0 ships [`Local`] — commands run on the host but are confined
-//! to a workspace directory (the "workdir jail") and run with a scrubbed
-//! environment so the agent can't touch the user's home/config/credentials.
-//!
-//! A [`Firecracker`] backend (microVM + vsock guest agent) slots in here later
-//! as the real sandbox boundary; ghost's agent logic does not change.
+//! The Python adapter uses [`Local`] for the existing persistent IPython
+//! session. Native execution and the browser use the bounded exec tool.
+//! Local processes start in the workspace with a scrubbed environment; neither
+//! cwd nor environment scrubbing is a filesystem or network security sandbox.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +18,8 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 static IPYTHON_REQUEST: AtomicU64 = AtomicU64::new(1);
+const EXEC_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const IPYTHON_INSTALL_HINT: &str = "Install IPython on Arch Linux with `pacman -S ipython` using package-install privileges; normal Ghost operation does not require those privileges.";
 
 /// A request to run a command in the agent environment.
 #[derive(Debug, Clone)]
@@ -72,15 +72,12 @@ pub trait Backend: Send + Sync {
     }
 }
 
-/// Local host execution, confined to a workspace directory.
-///
-/// Everything the agent runs starts in `workspace` with a scrubbed
-/// environment: HOME is redirected inside the workspace and well-known
-/// credential/env vars are removed, so a misbehaving agent is limited to the
-/// workspace (plus whatever it can reach through system facilities — the real
-/// hard boundary is the Firecracker backend).
+/// Local host execution starting in the workspace, not confined to it by the OS.
+/// HOME is redirected and the environment scrubbed; host process permissions
+/// still apply. No VM or other isolation boundary is implemented here.
 pub struct Local {
     workspace: PathBuf,
+    exec_path: std::ffi::OsString,
     /// Timeout for a single command.
     timeout: std::time::Duration,
     ipython: Arc<Mutex<Option<IpythonSession>>>,
@@ -96,16 +93,43 @@ impl Local {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
             workspace: workspace.into(),
+            exec_path: EXEC_PATH.into(),
             timeout: tool_timeout(),
             ipython: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Check the backend's search path without launching Python or a kernel.
+    /// This checks executable files, not whether IPython can successfully initialize.
+    pub fn check_ipython(&self) -> Result<PathBuf, String> {
+        for directory in std::env::split_paths(&self.exec_path) {
+            let executable = self.workspace.join(directory).join("ipython");
+            if std::fs::metadata(&executable).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            }) {
+                return Ok(executable);
+            }
+        }
+        Err(format!(
+            "no executable ipython found in backend PATH ({}). {IPYTHON_INSTALL_HINT} Python tools are unavailable; other capabilities remain available.",
+            self.exec_path.to_string_lossy()
+        ))
     }
 
     async fn persistent_ipython(&self, code: &str) -> ExecResult {
         let mut session = self.ipython.lock().await;
         let mut new_session = false;
         if session.is_none() {
-            let mut cmd = Command::new("ipython");
+            let executable = match self.check_ipython() {
+                Ok(executable) => executable,
+                Err(error) => {
+                    return ExecResult {
+                        stderr: error,
+                        ..Default::default()
+                    }
+                }
+            };
+            let mut cmd = Command::new(executable);
             cmd.args([
                 "--simple-prompt",
                 "--no-banner",
@@ -115,10 +139,7 @@ impl Local {
             .current_dir(&self.workspace)
             .kill_on_drop(true)
             .env_clear()
-            .env(
-                "PATH",
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            )
+            .env("PATH", &self.exec_path)
             .env("HOME", &self.workspace)
             .env("TMPDIR", "/tmp")
             .env("TACHYON_JAILED", "1")
@@ -129,7 +150,11 @@ impl Local {
                 Ok(child) => child,
                 Err(error) => {
                     return ExecResult {
-                        stderr: format!("failed to start ipython: {error}"),
+                        stderr: if error.kind() == std::io::ErrorKind::NotFound {
+                            format!("failed to start ipython: {error}. {IPYTHON_INSTALL_HINT}")
+                        } else {
+                            format!("failed to start ipython: {error}")
+                        },
                         ..Default::default()
                     };
                 }
@@ -239,10 +264,7 @@ impl Backend for Local {
         cmd.args(&req.args)
             .current_dir(&self.workspace)
             .env_clear()
-            .env(
-                "PATH",
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            )
+            .env("PATH", &self.exec_path)
             // The agent's HOME is its own workspace dir, not the user's.
             .env("HOME", &self.workspace)
             .env("TMPDIR", "/tmp")
@@ -300,14 +322,102 @@ pub fn ensure_workspace(id: &str) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{Backend, Local};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn ipython_check_is_lazy_and_uses_backend_search_order() {
+        let workspace = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut backend = Local::new(workspace.path());
+        backend.exec_path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        assert!(backend
+            .check_ipython()
+            .unwrap_err()
+            .contains("pacman -S ipython"));
+
+        let blocked = first.path().join("ipython");
+        std::fs::write(&blocked, "not executable").unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(backend.check_ipython().is_err());
+
+        let executable = second.path().join("ipython");
+        // Deliberately invalid: a presence check must never try to run it.
+        std::fs::write(&executable, "not a program").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(backend.check_ipython().unwrap(), executable);
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(backend.check_ipython().unwrap(), blocked);
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        assert_eq!(backend.check_ipython().unwrap(), executable);
+        assert!(backend.ipython.lock().await.is_none());
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn unavailable_ipython_tool_result_contains_install_hint() {
+        use crate::harness::runtime::{
+            NoopEventSink, NoopOutputStore, Tool, ToolContext, ToolIdentity, ToolPolicy,
+        };
+        use crate::harness::tools::python::IpythonTool;
+        use std::sync::Arc;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let mut backend = Local::new(workspace.path());
+        backend.exec_path = bin.path().as_os_str().into();
+        let backend = Arc::new(backend);
+        let tool = IpythonTool::new(backend.clone());
+        let context = ToolContext {
+            workspace_root: workspace.path().into(),
+            cwd: workspace.path().into(),
+            identity: ToolIdentity::default(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            policy: Arc::new(ToolPolicy::worker_default(workspace.path().into())),
+            event_sink: Arc::new(NoopEventSink),
+            output_store: Arc::new(NoopOutputStore),
+        };
+        for nonexecutable in [false, true] {
+            if nonexecutable {
+                let executable = bin.path().join("ipython");
+                std::fs::write(&executable, "not executable").unwrap();
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            }
+            let result = tool
+                .execute(&context, serde_json::json!({"code": "1 + 1"}))
+                .await
+                .unwrap();
+            assert!(result.is_error);
+            assert!(result.content.contains("pacman -S ipython"));
+            assert!(result.content.contains("package-install privileges"));
+            assert!(backend.ipython.lock().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_profile_assembly_keeps_ipython_lazy() {
+        let workspace = tempfile::tempdir().unwrap();
+        let backend = std::sync::Arc::new(Local::new(workspace.path()));
+        let profile = crate::harness::profiles::worker(
+            backend.clone(),
+            crate::harness::runtime::BrowserAvailability::Unavailable("test".into()),
+        );
+        let registry = profile.into_registry();
+        let policy = crate::harness::runtime::ToolPolicy::worker_default(workspace.path().into());
+        assert!(registry
+            .definitions(&policy)
+            .iter()
+            .any(|tool| tool.name == "ipython"));
+        assert!(backend.ipython.lock().await.is_none());
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+    }
 
     #[tokio::test]
     async fn ipython_reuses_variables_within_a_worker() {
-        if std::process::Command::new("ipython")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
+        if Local::new(std::env::temp_dir()).check_ipython().is_err() {
             return;
         }
         let workspace =
@@ -335,11 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipython_checkpoint_restores_serializable_variables() {
-        if std::process::Command::new("ipython")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
+        if Local::new(std::env::temp_dir()).check_ipython().is_err() {
             return;
         }
         let workspace = std::env::temp_dir().join(format!(
@@ -365,11 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipython_timeout_terminates_the_persistent_session() {
-        if std::process::Command::new("ipython")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
+        if Local::new(std::env::temp_dir()).check_ipython().is_err() {
             return;
         }
         let workspace = std::env::temp_dir().join(format!(

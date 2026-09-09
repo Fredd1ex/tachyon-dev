@@ -7,8 +7,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tachyon_model::ToolSpec;
 
-use super::path::resolve_existing;
-use super::{
+use crate::harness::runtime::path::resolve_existing;
+use crate::harness::runtime::{
     decode_input, Capability, Continuation, Tool, ToolContext, ToolError, ToolErrorCode,
     ToolFuture, ToolResult,
 };

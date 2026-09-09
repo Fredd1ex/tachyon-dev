@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub const USAGE: &str = include_str!("usage.md");
+
 use std::fmt::Write as _;
 
 use serde::Deserialize;
@@ -10,8 +12,8 @@ use tachyon_model::ToolSpec;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use super::path::resolve_existing;
-use super::{
+use crate::harness::runtime::path::resolve_existing;
+use crate::harness::runtime::{
     decode_input, Capability, Tool, ToolContext, ToolError, ToolErrorCode, ToolFuture, ToolResult,
 };
 

@@ -12,12 +12,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ghost::harness::agent::{run_loop as run_agent_loop, AgentLoopEvent, AgentLoopEventSink};
 use ghost::harness::backend::Local;
 use ghost::harness::browser_setup;
+use ghost::harness::profiles;
 use ghost::harness::runtime::{
-    native_registry, AgentBrowserTool, BrowserAvailability, IpythonTool, ToolContext,
-    ToolEventSink, ToolIdentity, ToolOutputStore, ToolPolicy, ToolRegistry, ToolTelemetry,
-    WorkspaceOutputStore, MAX_RETURN_BYTES,
+    BrowserAvailability, ToolContext, ToolEventSink, ToolIdentity, ToolOutputStore, ToolPolicy,
+    ToolRegistry, ToolTelemetry, WorkspaceOutputStore, MAX_RETURN_BYTES,
 };
-use ghost::model::{from_agent_config, ChatMessage, Content, Model, Role, TokenUsage};
+use ghost::harness::session::{
+    chat_checkpoint_path, compact_completed_history, compact_context_messages,
+    estimated_context_tokens, load_chat_checkpoint, write_chat_checkpoint, ChatCheckpoint,
+};
+use ghost::model::{from_agent_config, ChatMessage, Model, Role, TokenUsage};
 use ghost::role::AgentRole;
 #[cfg(test)]
 use ghost::{harness::agent::normalized_call_signature, model::ToolCall};
@@ -100,21 +104,6 @@ impl ToolEventSink for GhostToolEventSink {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ChatCheckpoint {
-    messages: Vec<ChatMessage>,
-    #[serde(default)]
-    evidence: Vec<serde_json::Value>,
-    #[serde(default = "initial_commit")]
-    next_commit: u64,
-    #[serde(default)]
-    context_epoch: u64,
-}
-
-fn initial_commit() -> u64 {
-    1
-}
-
 fn main() -> ExitCode {
     if let Some(code) = tachyon_util::guard::guard_or_exit_code() {
         return ExitCode::from(code as u8);
@@ -161,6 +150,9 @@ fn main() -> ExitCode {
             }
         };
         let backend = Arc::new(Local::new(&workspace));
+        if let Err(warning) = backend.check_ipython() {
+            eprintln!("ghost: Python capability unavailable: {warning}");
+        }
         let output_store: Arc<dyn ToolOutputStore> =
             match WorkspaceOutputStore::open(&workspace, 8 * 1024 * 1024, MAX_RETURN_BYTES).await {
                 Ok(store) => Arc::new(store),
@@ -169,18 +161,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-        let mut registry = native_registry();
-        registry
-            .register(IpythonTool::new(Arc::clone(&backend)))
-            .expect("unique built-in tool");
-        if matches!(&browser_availability, BrowserAvailability::Available) {
-            registry
-                .register(AgentBrowserTool::new(
-                    Arc::clone(&backend),
-                    browser_availability,
-                ))
-                .expect("unique built-in tool");
-        }
+        let registry = profiles::worker(backend, browser_availability).into_registry();
         let mut policy = ToolPolicy::worker_default(workspace.clone());
         policy.max_model_content_bytes = tool_context_chars();
         let policy = Arc::new(policy);
@@ -221,7 +202,14 @@ async fn run_task(
     };
     println!("[ghost] task: {task}");
     let mut messages = vec![
-        ChatMessage::new(Role::System, role.system_prompt(&cfg)),
+        ChatMessage::new(
+            Role::System,
+            ghost::harness::prompt::assembled(
+                role.config(&cfg).persona.as_deref(),
+                registry,
+                &policy,
+            ),
+        ),
         ChatMessage::new(Role::User, task.clone()),
     ];
     let event_sink = Arc::new(GhostToolEventSink::new(role, agent_id.as_deref()));
@@ -287,8 +275,11 @@ async fn run_chat(
     let mut messages = checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.messages.clone())
-        .unwrap_or_else(|| vec![ChatMessage::new(Role::System, role.system_prompt(&cfg))]);
-    let system_prompt = ChatMessage::new(Role::System, role.system_prompt(&cfg));
+        .unwrap_or_default();
+    let system_prompt = ChatMessage::new(
+        Role::System,
+        ghost::harness::prompt::assembled(role.config(&cfg).persona.as_deref(), registry, &policy),
+    );
     if let Some(system) = messages
         .iter_mut()
         .find(|message| message.role == Role::System)
@@ -439,33 +430,6 @@ async fn run_chat(
     ExitCode::SUCCESS
 }
 
-fn chat_checkpoint_path(workspace: &std::path::Path, role: AgentRole) -> PathBuf {
-    let name = match role {
-        AgentRole::Worker => "worker.json",
-        AgentRole::Background => "background.json",
-    };
-    workspace.join(".tachyon").join(name)
-}
-
-fn load_chat_checkpoint(path: &std::path::Path) -> Option<ChatCheckpoint> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|data| serde_json::from_str(&data).ok())
-}
-
-fn write_chat_checkpoint(path: &std::path::Path, checkpoint: &ChatCheckpoint) {
-    let Ok(data) = serde_json::to_vec_pretty(checkpoint) else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, data).is_ok() {
-        let _ = std::fs::rename(tmp, path);
-    }
-}
-
 fn emit_ready(role: AgentRole, agent_id: Option<&str>) {
     if let Some(event) = ready_event(role) {
         emit_event(event, role, agent_id);
@@ -506,52 +470,6 @@ fn tool_context_chars() -> usize {
         .and_then(|value| value.parse().ok())
         .filter(|value| *value >= 1_000)
         .unwrap_or(DEFAULT_TOOL_CONTEXT_CHARS)
-}
-
-fn compact_completed_history(messages: &mut Vec<ChatMessage>) {
-    messages.retain(|message| match message.role {
-        Role::System | Role::User => true,
-        Role::Assistant => message
-            .content
-            .iter()
-            .all(|content| matches!(content, Content::Text(_))),
-        Role::Tool => false,
-    });
-}
-
-fn estimated_context_tokens(messages: &[ChatMessage]) -> u32 {
-    messages
-        .iter()
-        .map(|message| {
-            serde_json::to_vec(message)
-                .map(|encoded| (encoded.len() / 4 + 1) as u32)
-                .unwrap_or_default()
-        })
-        .fold(0, u32::saturating_add)
-}
-
-fn compact_context_messages(messages: &mut Vec<ChatMessage>, target_tokens: u32) {
-    if estimated_context_tokens(messages) <= target_tokens {
-        return;
-    }
-    let mut retained = Vec::new();
-    let mut used = 0_u32;
-    if let Some(system) = messages.iter().find(|message| message.role == Role::System) {
-        used = used.saturating_add(estimated_context_tokens(std::slice::from_ref(system)));
-        retained.push((0, system.clone()));
-    }
-    for (index, message) in messages.iter().enumerate().rev() {
-        if message.role == Role::System {
-            continue;
-        }
-        let cost = estimated_context_tokens(std::slice::from_ref(message));
-        if used.saturating_add(cost) <= target_tokens || retained.len() < 3 {
-            retained.push((index.saturating_add(1), message.clone()));
-            used = used.saturating_add(cost);
-        }
-    }
-    retained.sort_by_key(|(index, _)| *index);
-    *messages = retained.into_iter().map(|(_, message)| message).collect();
 }
 
 struct GhostAgentLoopSink<'a> {
@@ -769,43 +687,6 @@ mod tests {
                 if phase == "ready" && message == "idle"
         ));
         assert!(ready_event(AgentRole::Background).is_none());
-    }
-
-    #[test]
-    fn chat_checkpoint_paths_are_role_isolated() {
-        let root = std::path::Path::new("/tmp/workspace");
-        assert!(chat_checkpoint_path(root, AgentRole::Worker).ends_with(".tachyon/worker.json"));
-        assert!(
-            chat_checkpoint_path(root, AgentRole::Background).ends_with(".tachyon/background.json")
-        );
-    }
-
-    #[test]
-    fn completed_history_drops_tool_protocol_but_keeps_transcript() {
-        let mut messages = vec![
-            ChatMessage::new(Role::System, "system"),
-            ChatMessage::new(Role::User, "objective"),
-            ChatMessage {
-                role: Role::Assistant,
-                content: vec![Content::ToolCall(ToolCall {
-                    id: "call-1".into(),
-                    name: "ipython".into(),
-                    arguments: "{}".into(),
-                })],
-            },
-            ChatMessage {
-                role: Role::Tool,
-                content: vec![Content::ToolResult {
-                    id: "call-1".into(),
-                    output: "raw output".into(),
-                }],
-            },
-            ChatMessage::new(Role::Assistant, "final finding"),
-        ];
-        compact_completed_history(&mut messages);
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[1].plain(), "objective");
-        assert_eq!(messages[2].plain(), "final finding");
     }
 
     #[test]

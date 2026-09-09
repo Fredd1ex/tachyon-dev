@@ -1,19 +1,9 @@
 #![forbid(unsafe_code)]
 
-mod adapters;
-mod artifact;
-mod binary;
-mod edit;
-mod exec;
-mod find;
-mod grep;
-mod ls;
-mod output_store;
-mod path;
-mod read;
-mod registry;
-mod traversal;
-mod write;
+pub(crate) mod binary;
+pub(crate) mod output_store;
+pub(crate) mod path;
+pub(crate) mod traversal;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -31,17 +21,15 @@ use tachyon_api::types::ArtifactRegistration;
 use tachyon_model::ToolSpec;
 use tokio_util::sync::CancellationToken;
 
-pub use adapters::{AgentBrowserTool, BrowserAvailability, IpythonTool};
-pub use artifact::ArtifactTool;
-pub use edit::EditTool;
-pub use exec::ExecTool;
-pub use find::FindTool;
-pub use grep::GrepTool;
-pub use ls::LsTool;
+pub use crate::harness::registry::{RegistryError, ToolRegistry};
+pub use crate::harness::tools::artifact::ArtifactTool;
+pub use crate::harness::tools::browser::{AgentBrowserTool, BrowserAvailability};
+pub use crate::harness::tools::exec::ExecTool;
+pub use crate::harness::tools::python::IpythonTool;
+pub use crate::harness::tools::workspace::{
+    EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool,
+};
 pub use output_store::WorkspaceOutputStore;
-pub use read::ReadTool;
-pub use registry::{RegistryError, ToolRegistry};
-pub use write::WriteTool;
 
 pub const MAX_RETURN_BYTES: usize = 1024 * 1024;
 pub const MAX_RETURN_LINES: usize = 2_000;
@@ -49,32 +37,7 @@ pub const DEFAULT_MODEL_CONTENT_BYTES: usize = 12_000;
 pub const SANITIZED_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub fn native_registry() -> ToolRegistry {
-    let mut registry = ToolRegistry::default();
-    registry
-        .register(ReadTool::new())
-        .expect("unique built-in tool");
-    registry
-        .register(WriteTool::new())
-        .expect("unique built-in tool");
-    registry
-        .register(EditTool::new())
-        .expect("unique built-in tool");
-    registry
-        .register(LsTool::new())
-        .expect("unique built-in tool");
-    registry
-        .register(FindTool::new())
-        .expect("unique built-in tool");
-    registry
-        .register(GrepTool::new())
-        .expect("unique built-in tool");
-    registry
-        .register(ExecTool::new())
-        .expect("unique built-in tool");
-    registry
-        .register(ArtifactTool::new())
-        .expect("unique built-in tool");
-    registry
+    super::registry::builtins::native().into_registry()
 }
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send + 'a>>;
