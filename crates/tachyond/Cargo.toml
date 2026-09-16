@@ -10,15 +10,24 @@ name = "tachyond"
 path = "src/main.rs"
 
 [dependencies]
+tempfile.workspace = true
 redb.workspace = true
+uuid.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tachyon-api.workspace = true
 tachyon-util.workspace = true
+tachyon-model.workspace = true
+tokio.workspace = true
 signal-hook.workspace = true
-nix.workspace = true
+nix = { workspace = true, features = ["socket"] }
+rustix = { version = "1", features = ["fs"] }
+sha2.workspace = true
+url = "2"
 tachyon-memory = { path = "../memory" }
+ghost = { path = "../ghost" }
+tokio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

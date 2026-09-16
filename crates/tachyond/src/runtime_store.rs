@@ -1,5 +1,20 @@
 use std::path::Path;
 
+pub(crate) mod admission;
+pub(crate) mod campaign_launch;
+pub(crate) mod campaign_ledger;
+pub(crate) mod coordination;
+#[cfg(target_os = "linux")]
+pub(crate) mod execution;
+pub(crate) mod groups;
+mod integration;
+pub(crate) mod model_accounting;
+mod research;
+#[cfg(target_os = "linux")]
+pub(crate) mod research_context;
+#[cfg(target_os = "linux")]
+pub(crate) mod scheduler;
+
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tachyon_api::types::{
@@ -106,8 +121,21 @@ struct ScheduledTaskRecord {
     result_delivered: bool,
 }
 
+mod compute;
+mod host_capacity;
+
 pub(crate) struct RuntimeStore {
-    database: Database,
+    pub(crate) retained: tachyond::retained_storage::RetainedStorage,
+    compute: std::sync::Mutex<compute::State>,
+    host_capacity: host_capacity::HostCapacity,
+    trace_root: std::path::PathBuf,
+    trace_limits: research_context::traces::TraceLimits,
+    pub(crate) attention_notifications:
+        std::sync::Mutex<std::collections::VecDeque<tachyon_api::work::Attention>>,
+    database: std::sync::Arc<Database>,
+    model_permits: std::sync::Mutex<model_accounting::PermitState>,
+    #[cfg(target_os = "linux")]
+    host_catalog: std::sync::Mutex<scheduler::HostCatalog>,
 }
 
 impl RuntimeStore {
@@ -122,8 +150,34 @@ impl RuntimeStore {
         }
         let database = Database::create(path)
             .map_err(|error| format!("open runtime database {}: {error}", path.display()))?;
-        let store = Self { database };
+        let database = std::sync::Arc::new(database);
+        let maximum = tachyon_util::config::Config::try_load_from(
+            &tachyon_util::config::Config::default_path(),
+        )
+        .map_err(|e| e.to_string())?
+        .campaign_resources
+        .max_retained_storage_bytes;
+        let store = Self {
+            retained: tachyond::retained_storage::RetainedStorage::new(database.clone(), maximum)?,
+            compute: Default::default(),
+            host_capacity: host_capacity::HostCapacity::new(
+                tachyon_util::config::Config::try_load_from(
+                    &tachyon_util::config::Config::default_path(),
+                )
+                .map_err(|e| e.to_string())?
+                .campaign_resources,
+            )?,
+            trace_root: path.with_extension("traces"),
+            trace_limits: research_context::traces::TraceLimits::configured()?,
+            attention_notifications: Default::default(),
+            database,
+            model_permits: Default::default(),
+            #[cfg(target_os = "linux")]
+            host_catalog: Default::default(),
+        };
         store.initialize()?;
+        store.adopt_retained_traces()?;
+        store.adopt_retained_snapshots()?;
         Ok(store)
     }
 
@@ -183,6 +237,17 @@ impl RuntimeStore {
             write
                 .open_table(SCHEDULED_TASKS)
                 .map_err(|error| format!("create scheduled tasks: {error}"))?;
+            research::initialize(&write)?;
+            write.open_table(compute::JOBS).map_err(|e| e.to_string())?;
+            write
+                .open_table(campaign_launch::LAUNCHES)
+                .map_err(|e| e.to_string())?;
+            campaign_ledger::initialize(&write)?;
+            admission::initialize(&write)?;
+            groups::initialize(&write)?;
+            coordination::initialize(&write)?;
+            #[cfg(target_os = "linux")]
+            execution::initialize(&write)?;
         }
         write
             .commit()

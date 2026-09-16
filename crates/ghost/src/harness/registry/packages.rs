@@ -44,6 +44,7 @@ impl Packages {
             .iter()
             .any(|text| text.trim().is_empty() || text.contains(['\n', '\r']))
             || manifest.usage.trim().is_empty()
+            || manifest.interface.trim().is_empty()
             || operations.is_empty()
             || operations.iter().any(|name| name.trim().is_empty())
             || operations.len() != manifest.operations.len()
@@ -126,6 +127,7 @@ mod tests {
                 name: "fake-package",
                 version: "1.0.0",
                 description: "Test capability.",
+                interface: "`fake` accepts a JSON object.",
                 usage: "Call fake with a JSON object.",
                 operations: &["fake"],
             },
@@ -143,7 +145,7 @@ mod tests {
         let native = native_registry().definitions(&policy);
         assert_eq!(
             native.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            ["artifact", "edit", "exec", "find", "grep", "ls", "read", "write"]
+            ["artifact", "ctx", "edit", "exec", "find", "grep", "ls", "read", "write"]
         );
         for available in [false, true] {
             let availability = if available {
@@ -159,9 +161,9 @@ mod tests {
                     .map(|m| m.name)
                     .collect::<Vec<_>>(),
                 if available {
-                    vec!["workspace", "exec", "artifact", "ipython", "browser"]
+                    vec!["workspace", "exec", "artifact", "ctx", "ipython", "browser"]
                 } else {
-                    vec!["workspace", "exec", "artifact", "ipython"]
+                    vec!["workspace", "exec", "artifact", "ctx", "ipython"]
                 }
             );
             let operations = profile
@@ -271,7 +273,7 @@ mod tests {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>(),
-            ["find", "grep", "ls", "read"]
+            ["ctx", "find", "grep", "ls", "read"]
         );
         let context = ToolContext {
             workspace_root: root.clone(),
@@ -282,6 +284,7 @@ mod tests {
             policy: Arc::new(policy),
             event_sink: Arc::new(NoopEventSink),
             output_store: Arc::new(NoopOutputStore),
+            host_service: None,
         };
         for name in [
             "write",
@@ -370,6 +373,7 @@ mod tests {
             policy: Arc::new(policy),
             event_sink: Arc::new(NoopEventSink),
             output_store: Arc::new(NoopOutputStore),
+            host_service: None,
         };
         let (answer, _) = run_loop(&FakeModel, &mut vec![], &registry, &context, 2, &FakeModel)
             .await

@@ -6,6 +6,7 @@ license.workspace = true
 description = "Interactive terminal interface for Tachyon"
 
 [dependencies]
+nix = { workspace = true, features = ["fs"] }
 crossterm = "0.28"
 ratatui = "0.28"
 serde = { version = "1", features = ["derive"] }

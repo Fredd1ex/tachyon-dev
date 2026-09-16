@@ -30,7 +30,6 @@ pub fn spawn_agent() -> ToolSchema {
             "type": "object",
             "properties": {
                 "task": { "type": "string" },
-                "cwd": { "type": "string" },
                 "lifetime_class": {
                     "type": "string",
                     "enum": ["short", "long", "persistent"],

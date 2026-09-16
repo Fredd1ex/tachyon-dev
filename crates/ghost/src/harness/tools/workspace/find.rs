@@ -242,6 +242,7 @@ mod tests {
             policy: Arc::new(ToolPolicy::worker_default(root)),
             event_sink: Arc::new(NoopEventSink),
             output_store: Arc::new(NoopOutputStore),
+            host_service: None,
         }
     }
 

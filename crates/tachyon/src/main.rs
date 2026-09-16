@@ -30,6 +30,9 @@ fn main() -> ExitCode {
     }
 
     let cmd = cli.command.expect("handled above");
+    if let Command::Campaign { action } = cmd {
+        return tachyon::campaign::run(action);
+    }
 
     // Only agent commands auto-start the daemon. Local administration and
     // provider commands must not spawn it implicitly.
@@ -140,7 +143,10 @@ fn dispatch(cmd: Command, p: &tachyon::style::Palette) -> ExitCode {
             limit: args.limit,
         },
         Command::Top(_) => ApiRequest::Top,
-        Command::Daemon(_) | Command::Memory(_) | Command::Providers(_) => {
+        Command::Campaign { .. }
+        | Command::Daemon(_)
+        | Command::Memory(_)
+        | Command::Providers(_) => {
             unreachable!("handled above")
         }
     };
@@ -165,6 +171,13 @@ fn start_via_foreground(
     cwd: Option<String>,
     p: &tachyon::style::Palette,
 ) -> ExitCode {
+    let cwd = match cwd.map(|path| std::fs::canonicalize(path)).transpose() {
+        Ok(cwd) => cwd.map(|path| path.to_string_lossy().into_owned()),
+        Err(error) => {
+            println!("{} {}", render(&p.bad, "workspace unavailable:"), error);
+            return ExitCode::FAILURE;
+        }
+    };
     let cwd_hint = match &cwd {
         Some(c) => format!(" (cwd: {c})"),
         None => String::new(),
@@ -175,7 +188,7 @@ fn start_via_foreground(
         render(&p.dim, &task)
     );
 
-    if let Err(e) = client.foreground_chat(task) {
+    if let Err(e) = client.foreground_chat_with_cwd(task, cwd) {
         println!("{} {}", render(&p.bad, "failed to reach foreground:"), e);
         return ExitCode::FAILURE;
     }

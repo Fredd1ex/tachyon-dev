@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub(crate) mod binary;
+pub(crate) mod cpu_jobs;
 pub(crate) mod output_store;
 pub(crate) mod path;
 pub(crate) mod traversal;
@@ -41,8 +42,14 @@ pub fn native_registry() -> ToolRegistry {
 }
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolResult, ToolError>> + Send + 'a>>;
+pub type CleanupFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 pub trait Tool: Send + Sync {
+    /// Detach this work's resources synchronously; return bounded asynchronous teardown.
+    /// Must be idempotent and must not create resources for an untouched work.
+    fn end_work(&self, _scope: uuid::Uuid) -> CleanupFuture {
+        Box::pin(async {})
+    }
     fn name(&self) -> &'static str;
     fn schema(&self) -> &ToolSpec;
     fn capabilities(&self) -> &'static [Capability];
@@ -50,6 +57,15 @@ pub trait Tool: Send + Sync {
         false
     }
     fn execute<'a>(&'a self, context: &'a ToolContext, input: Value) -> ToolFuture<'a>;
+    /// Adapters may dispatch through the active work registry; native tools need no handle.
+    fn execute_with_registry<'a>(
+        &'a self,
+        context: &'a ToolContext,
+        input: Value,
+        _registry: &'a ToolRegistry,
+    ) -> ToolFuture<'a> {
+        self.execute(context, input)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -63,6 +79,7 @@ pub enum Capability {
 #[derive(Clone, Debug, Default)]
 pub struct ToolIdentity {
     pub call_id: Option<String>,
+    pub parent_call_id: Option<String>,
     pub task_id: Option<String>,
     pub work_id: Option<String>,
     pub generation: Option<u64>,
@@ -73,6 +90,7 @@ pub struct ToolIdentity {
 impl ToolContext {
     pub fn for_call(&self, call_id: impl Into<String>) -> Self {
         let mut identity = self.identity.clone();
+        identity.parent_call_id = identity.call_id.clone();
         identity.call_id = Some(call_id.into());
         Self {
             workspace_root: self.workspace_root.clone(),
@@ -83,6 +101,7 @@ impl ToolContext {
             policy: Arc::clone(&self.policy),
             event_sink: Arc::clone(&self.event_sink),
             output_store: Arc::clone(&self.output_store),
+            host_service: self.host_service.clone(),
         }
     }
 }
@@ -119,6 +138,24 @@ pub struct ToolPolicy {
 }
 
 impl ToolPolicy {
+    pub fn constrain(&mut self, permissions: &tachyon_api::types::WorkPermissions) {
+        // Native policy only. An explicitly enabled interpreter is arbitrary code.
+        if permissions.task_type == tachyon_api::types::WorkTaskType::CodingReadOnly {
+            self.capabilities.remove(&Capability::WriteFilesystem);
+        }
+        self.enabled_tools.remove("agent_browser");
+        if !permissions.allow_exec {
+            self.enabled_tools.remove("exec");
+            self.allow_shell_exec = false;
+        }
+        if !permissions.allow_python {
+            self.enabled_tools.remove("ipython");
+        }
+        if !permissions.allow_exec && !permissions.allow_python {
+            self.capabilities.remove(&Capability::ExecuteProcess);
+        }
+    }
+
     pub fn worker_default(workspace_root: PathBuf) -> Self {
         let exec_env = ["LANG", "LC_ALL", "LC_CTYPE", "TERM"]
             .into_iter()
@@ -138,9 +175,11 @@ impl ToolPolicy {
                 "find",
                 "grep",
                 "exec",
+                "ctx",
                 "artifact",
                 "ipython",
                 "agent_browser",
+                "tools",
             ]
             .into_iter()
             .map(str::to_string)
@@ -171,7 +210,7 @@ impl ToolPolicy {
             max_traversal_entries: 100_000,
             max_exec_duration: Duration::from_secs(120),
             exec_term_grace: Duration::from_secs(2),
-            max_exec_output_bytes: MAX_RETURN_BYTES,
+            max_exec_output_bytes: 64 * 1024 * 1024,
             max_exec_command_bytes: 64 * 1024,
             allow_shell_exec: true,
             exec_shell: PathBuf::from("/bin/sh"),
@@ -190,6 +229,7 @@ impl ToolPolicy {
     }
 }
 
+#[derive(Clone)]
 pub struct ToolContext {
     pub workspace_root: PathBuf,
     pub cwd: PathBuf,
@@ -199,11 +239,54 @@ pub struct ToolContext {
     pub policy: Arc<ToolPolicy>,
     pub event_sink: Arc<dyn ToolEventSink>,
     pub output_store: Arc<dyn ToolOutputStore>,
+    /// Only broker-backed work is gated. Ordinary local exec is explicitly ungated.
+    pub host_service: Option<Arc<tachyon_model::broker::BrokerClient>>,
 }
 
 pub trait ToolEventSink: Send + Sync {
     fn emit(&self, event: ToolTelemetry);
+    fn record_result(
+        &self,
+        _name: &str,
+        _context: &ToolContext,
+        _input: &Value,
+        _result: &ToolResult,
+    ) {
+    }
     fn register_artifact(&self, artifact: ArtifactRegistration) -> Result<(), String>;
+}
+
+#[derive(Default)]
+pub struct WorkEvidenceCollector(Mutex<tachyon_api::types::WorkEvidence>);
+
+impl WorkEvidenceCollector {
+    pub fn record(&self, name: &str, context: &ToolContext, input: &Value, result: &ToolResult) {
+        let mut evidence = self.0.lock().expect("evidence lock poisoned");
+        let arguments = if input.to_string().len() <= 2048 {
+            input.clone()
+        } else {
+            json!({"omitted": "arguments exceeded evidence budget"})
+        };
+        let entry = tachyon_api::types::WorkToolEvidence {
+            call_id: context.identity.call_id.clone(),
+            parent_call_id: context.identity.parent_call_id.clone(),
+            tool_name: name.into(),
+            arguments,
+            output: serde_json::from_str(&result.to_json(8192)).expect("ToolResult JSON"),
+        };
+        // Bound the serialized bundle too: escaping and metadata can exceed content limits.
+        evidence.tools.push(entry);
+        if evidence.tools.len() > 32
+            || serde_json::to_vec(&*evidence).unwrap().len() > 16 * 1024 - 64
+        {
+            evidence.tools.pop();
+            evidence.omitted = evidence.omitted.saturating_add(1);
+        }
+    }
+
+    pub fn snapshot(&self) -> tachyon_api::types::WorkEvidence {
+        self.0.lock().expect("evidence lock poisoned").clone()
+    }
 }
 
 pub struct NoopEventSink;
@@ -217,11 +300,55 @@ impl ToolEventSink for NoopEventSink {
 }
 
 pub trait ToolOutputStore: Send + Sync {
+    /// Raw bounded page for durable export; no lossy UTF-8 conversion.
+    fn export_page<'a>(
+        &'a self,
+        _reference: &'a ToolOutputRef,
+        _offset: u64,
+    ) -> OutputStoreFuture<'a, Result<OutputPage, String>> {
+        Box::pin(async { Err("output export unavailable".into()) })
+    }
     fn put<'a>(&'a self, value: String) -> OutputStoreFuture<'a, Option<ToolOutputRef>>;
     fn get<'a>(&'a self, reference: &'a ToolOutputRef) -> OutputStoreFuture<'a, Option<String>>;
+    /// Optional bounded navigation. Stores without a work-scoped catalog fail closed.
+    fn page<'a>(
+        &'a self,
+        _reference: &'a ToolOutputRef,
+        _cursor: usize,
+        _limit: usize,
+    ) -> OutputStoreFuture<'a, Result<ToolResult, ToolError>> {
+        Box::pin(async {
+            Err(ToolError::invalid(
+                "this output store does not support scoped paging",
+            ))
+        })
+    }
+    fn references(&self) -> Vec<ToolOutputRef> {
+        Vec::new()
+    }
+    fn search_page<'a>(
+        &'a self,
+        _reference: &'a ToolOutputRef,
+        _cursor: usize,
+        _limit: usize,
+        _query: &'a str,
+    ) -> OutputStoreFuture<'a, Result<ToolResult, ToolError>> {
+        Box::pin(async {
+            Err(ToolError::invalid(
+                "this output store does not support scoped search",
+            ))
+        })
+    }
 }
 
 pub type OutputStoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub struct OutputPage {
+    pub bytes: Vec<u8>,
+    pub retained: u64,
+    pub total: u64,
+    pub storage_failed: bool,
+}
 
 pub struct NoopOutputStore;
 
@@ -335,6 +462,12 @@ impl ToolResult {
         if truncated {
             bounded.continuation = None;
         }
+        if bounded.truncated {
+            // A read digest must not describe bytes omitted from the delivered snapshot.
+            if let Some(digest) = bounded.metadata.get_mut("sha256") {
+                *digest = Value::Null;
+            }
+        }
         let encoded = serde_json::to_string(&bounded).unwrap_or_default();
         if encoded.len() <= max_bytes {
             return encoded;
@@ -362,7 +495,8 @@ pub struct Continuation {
     pub after: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolOutputRef {
     pub id: String,
 }
@@ -376,6 +510,7 @@ pub enum ToolErrorCode {
     OutsideWorkspace,
     UnsupportedBinary,
     AmbiguousEdit,
+    Conflict,
     Timeout,
     Cancelled,
     ProcessFailed,
@@ -439,6 +574,27 @@ pub(crate) fn bound_utf8(value: &str, max_bytes: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_coding_profile_preserves_native_writes_without_granting_process_tools() {
+        use super::{Capability, ToolPolicy};
+        use tachyon_api::types::{WorkPermissions, WorkTaskType};
+        for task_type in [WorkTaskType::CodingReadOnly, WorkTaskType::Coding] {
+            let mut policy = ToolPolicy::worker_default("/tmp/work".into());
+            policy.constrain(&WorkPermissions {
+                task_type: task_type.clone(),
+                allow_exec: false,
+                allow_python: false,
+            });
+            assert_eq!(
+                policy.capabilities.contains(&Capability::WriteFilesystem),
+                task_type == WorkTaskType::Coding
+            );
+            assert!(!policy.capabilities.contains(&Capability::ExecuteProcess));
+            for tool in ["exec", "ipython", "agent_browser"] {
+                assert!(!policy.enabled_tools.contains(tool));
+            }
+        }
+    }
     use serde_json::json;
 
     use super::{InMemoryOutputStore, ToolOutputStore, ToolResult};

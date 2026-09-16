@@ -78,6 +78,63 @@ impl Client {
 
     // ---- Mirrored API methods -----------------------------------------
 
+    /// Trusted host control lookup. Scope selects storage, not caller authority.
+    pub fn artifact_get(
+        &mut self,
+        scope: String,
+        id: String,
+    ) -> Result<Option<tachyon_api::types::ArtifactRegistration>, ClientError> {
+        match self.request(
+            &ApiRequest::ArtifactGet { scope, id },
+            Duration::from_secs(30),
+        )? {
+            ApiResponse::Artifact { artifact } => Ok(artifact),
+            _ => Err(ClientError::Api("unexpected artifact response".into())),
+        }
+    }
+
+    pub fn artifact_list(
+        &mut self,
+        scope: String,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<tachyon_api::types::ArtifactRegistration>, ClientError> {
+        match self.request(
+            &ApiRequest::ArtifactList {
+                scope,
+                after,
+                limit,
+            },
+            Duration::from_secs(30),
+        )? {
+            ApiResponse::ArtifactList { artifacts } => Ok(artifacts),
+            _ => Err(ClientError::Api("unexpected artifact list response".into())),
+        }
+    }
+
+    pub fn artifact_read(
+        &mut self,
+        scope: String,
+        id: String,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<u8>, ClientError> {
+        match self.request(
+            &ApiRequest::ArtifactRead {
+                scope,
+                id,
+                offset,
+                limit,
+            },
+            Duration::from_secs(30),
+        )? {
+            ApiResponse::ArtifactBytes { bytes } => Ok(bytes),
+            _ => Err(ClientError::Api(
+                "unexpected artifact bytes response".into(),
+            )),
+        }
+    }
+
     pub fn daemon_status(&mut self) -> Result<DaemonInfo, ClientError> {
         match self.request(&ApiRequest::DaemonStatus, Duration::from_secs(5))? {
             ApiResponse::DaemonStatus { info } => Ok(info),
@@ -254,7 +311,19 @@ impl Client {
 
     /// Send a message to the foreground runtime.
     pub fn foreground_chat(&mut self, text: String) -> Result<(), ClientError> {
-        match self.request(&ApiRequest::ForegroundChat { text }, Duration::from_secs(5))? {
+        self.foreground_chat_with_cwd(text, None)
+    }
+
+    /// Select an existing absolute host directory, or None for managed work.
+    pub fn foreground_chat_with_cwd(
+        &mut self,
+        text: String,
+        cwd: Option<String>,
+    ) -> Result<(), ClientError> {
+        match self.request(
+            &ApiRequest::ForegroundChat { text, cwd },
+            Duration::from_secs(5),
+        )? {
             ApiResponse::Chat { .. } => Ok(()),
             _ => Err(ClientError::Api(
                 "unexpected foreground chat response".into(),

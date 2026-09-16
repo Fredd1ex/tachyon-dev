@@ -16,7 +16,7 @@ use crate::harness::tools;
 
 pub fn native() -> Packages {
     let mut packages = Packages::default();
-    for package in [workspace(), exec(), artifact()] {
+    for package in [workspace(), exec(), artifact(), ctx()] {
         packages.register(package).expect("valid built-in package");
     }
     packages
@@ -28,6 +28,7 @@ pub fn workspace() -> Package {
             name: "workspace",
             version: env!("CARGO_PKG_VERSION"),
             description: "Workspace file inspection, search, and editing.",
+            interface: tools::workspace::INTERFACE,
             usage: tools::workspace::USAGE,
             operations: &["read", "write", "edit", "ls", "find", "grep"],
         },
@@ -42,12 +43,27 @@ pub fn workspace() -> Package {
     }
 }
 
+pub fn ctx() -> Package {
+    Package {
+        manifest: Manifest {
+            name: "ctx",
+            version: env!("CARGO_PKG_VERSION"),
+            description: "Bounded work output navigation.",
+            interface: tools::ctx::INTERFACE,
+            usage: tools::ctx::USAGE,
+            operations: &["ctx"],
+        },
+        tools: vec![Arc::new(tools::ctx::CtxTool::new())],
+    }
+}
+
 pub fn exec() -> Package {
     Package {
         manifest: Manifest {
             name: "exec",
             version: env!("CARGO_PKG_VERSION"),
             description: "Workspace process execution.",
+            interface: tools::exec::INTERFACE,
             usage: tools::exec::USAGE,
             operations: &["exec"],
         },
@@ -61,6 +77,7 @@ pub fn artifact() -> Package {
             name: "artifact",
             version: env!("CARGO_PKG_VERSION"),
             description: "Workspace artifact registration.",
+            interface: tools::artifact::INTERFACE,
             usage: tools::artifact::USAGE,
             operations: &["artifact"],
         },
@@ -74,6 +91,7 @@ pub fn ipython(backend: Arc<Local>) -> Package {
             name: "ipython",
             version: env!("CARGO_PKG_VERSION"),
             description: "Persistent workspace Python execution.",
+            interface: tools::python::INTERFACE,
             usage: tools::python::USAGE,
             operations: &["ipython"],
         },
@@ -83,7 +101,7 @@ pub fn ipython(backend: Arc<Local>) -> Package {
 
 /// Unavailable browsers contribute neither a manifest nor an operation.
 pub fn browser(backend: Arc<Local>, availability: BrowserAvailability) -> Option<Package> {
-    if !matches!(&availability, BrowserAvailability::Available) {
+    if matches!(&availability, BrowserAvailability::Unavailable(_)) {
         return None;
     }
     Some(Package {
@@ -91,6 +109,7 @@ pub fn browser(backend: Arc<Local>, availability: BrowserAvailability) -> Option
             name: "browser",
             version: env!("CARGO_PKG_VERSION"),
             description: "Read and interact with the configured browser.",
+            interface: tools::browser::INTERFACE,
             usage: tools::browser::USAGE,
             operations: &["agent_browser"],
         },

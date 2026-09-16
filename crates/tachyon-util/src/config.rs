@@ -13,6 +13,11 @@ pub use tachyon_model::{ProviderRouting, Reasoning, RoutingPreferences, RoutingP
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    #[serde(default)]
+    pub campaign_resources: ResourceLimits,
+    /// Managed worker root; defaults to the user's home directory / Agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_agent_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<Provider>,
     #[serde(default, deserialize_with = "deserialize_model")]
@@ -27,6 +32,62 @@ pub struct Config {
     pub background: Option<AgentConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<AgentConfig>,
+}
+
+/// Campaign-only logical concurrency caps. Ordinary chat does not borrow these
+/// permits; this leaves conservative headroom, not an OS scheduling guarantee.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResourceLimits {
+    pub max_retained_storage_bytes: u64,
+    pub max_campaigns: usize,
+    pub max_resident_workers: usize,
+    pub max_execution_jobs: usize,
+    pub max_cpu_jobs: usize,
+    pub max_gpu_jobs: usize,
+    /// Explicit stable device selectors. No probing or automatic discovery.
+    pub gpu_device_ids: Vec<String>,
+    pub max_model_calls: usize,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_retained_storage_bytes: 64 * 1024 * 1024 * 1024,
+            max_campaigns: 4,
+            max_resident_workers: 8,
+            max_execution_jobs: 2,
+            max_cpu_jobs: 2,
+            max_gpu_jobs: 0,
+            gpu_device_ids: Vec::new(),
+            max_model_calls: 2,
+        }
+    }
+}
+
+impl ResourceLimits {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_retained_storage_bytes == 0
+            || !(1..=64).contains(&self.max_campaigns)
+            || !(1..=256).contains(&self.max_resident_workers)
+            || !(1..=256).contains(&self.max_execution_jobs)
+            || !(1..=256).contains(&self.max_cpu_jobs)
+            || !(1..=64).contains(&self.max_model_calls)
+            || self.max_gpu_jobs > self.gpu_device_ids.len()
+            || self.gpu_device_ids.len() > 256
+            || self.gpu_device_ids.iter().enumerate().any(|(index, id)| {
+                id.is_empty()
+                    || id.len() > 128
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                    || self.gpu_device_ids[..index].contains(id)
+            })
+        {
+            return Err("campaign resource limits must be finite: campaigns 1..64, resident workers, execution jobs and CPU jobs 1..256, model calls 1..64; GPU jobs 0..inventory size with at most 256 unique bounded ASCII device IDs".into());
+        }
+        Ok(())
+    }
 }
 
 /// Role-specific overrides. Omitted fields inherit the legacy shared model
@@ -168,9 +229,39 @@ impl Config {
     }
 
     pub fn load_from(path: &Path) -> Self {
+        Self::try_load_from(path).unwrap_or_else(|error| {
+            eprintln!("tachyon: {error}; using default configuration");
+            Self::default()
+        })
+    }
+
+    pub fn try_load_from(path: &Path) -> io::Result<Self> {
         match fs::read_to_string(path) {
-            Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
-            Err(_) => Self::default(),
+            Ok(contents) => toml::from_str(&contents).map_err(|error: toml::de::Error| {
+                // TOML's Display includes source values, which may contain secrets.
+                let offset = error.span().map(|span| span.start).unwrap_or(0);
+                let line = contents.as_bytes()[..offset.min(contents.len())]
+                    .iter()
+                    .filter(|&&byte| byte == b'\n')
+                    .count()
+                    + 1;
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid configuration at {} near line {line} (TOML syntax or field type)",
+                        path.display()
+                    ),
+                )
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot read configuration at {} ({:?})",
+                    path.display(),
+                    error.kind()
+                ),
+            )),
         }
     }
 
@@ -188,12 +279,7 @@ impl Config {
         Ok(())
     }
 
-    /// Resolve the active API key for a provider without reading config files.
-    /// Environment values take precedence over the operating system credential
-    /// store, keeping temporary shell overrides possible without persisting them.
-    /// Known test/placeholder values are treated as unset so the harness fails
-    /// with a clear "no key" error instead of making authenticated calls with
-    /// a fake credential.
+    /// Default model identifier when no shared or role-specific model is set.
     pub fn default_model() -> &'static str {
         "~deepseek/deepseek-v4-flash-latest"
     }
@@ -262,7 +348,7 @@ impl Config {
         self.worker.clone().unwrap_or_default()
     }
 
-    /// Resolve the active API key for a provider **from the environment only**.
+    /// Resolve the active API key from the environment, then the OS credential store.
     /// API keys are never stored in the config file; secrets stay out of it.
     /// Known test/placeholder values are treated as unset so the harness fails
     /// with a clear "no key" error instead of making authenticated calls with
@@ -272,11 +358,29 @@ impl Config {
             "openrouter" => "OPENROUTER_API_KEY",
             _ => return None,
         };
-        let candidate = std::env::var(env_var)
-            .ok()
-            .or_else(|| crate::credentials::openrouter_key())
-            .map(|v| v.trim().to_string());
-        candidate.filter(|k| !Self::is_placeholder_key(k))
+        match Self::resolve_key_with(
+            std::env::var(env_var).ok(),
+            crate::credentials::openrouter_key,
+        ) {
+            Ok(key) => key,
+            Err(error) => {
+                eprintln!("{error}");
+                None
+            }
+        }
+    }
+
+    fn resolve_key_with(
+        environment: Option<String>,
+        read_store: impl FnOnce() -> Result<Option<String>, String>,
+    ) -> Result<Option<String>, String> {
+        let candidate = match environment {
+            Some(key) => Some(key),
+            None => read_store()?,
+        };
+        Ok(candidate
+            .map(|v| v.trim().to_string())
+            .filter(|k| !Self::is_placeholder_key(k)))
     }
 
     /// True if a key looks like a placeholder/test value that should not be
@@ -297,7 +401,161 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn campaign_resources_are_finite_configurable_and_not_model_allowances() {
+        let defaults: super::Config = toml::from_str("").unwrap();
+        assert_eq!(
+            defaults.campaign_resources.max_retained_storage_bytes,
+            64 * 1024 * 1024 * 1024
+        );
+        let storage: super::Config =
+            toml::from_str("[campaign_resources]\nmax_retained_storage_bytes = 1024\n").unwrap();
+        storage.campaign_resources.validate().unwrap();
+        assert_eq!(storage.campaign_resources.max_retained_storage_bytes, 1024);
+        let mut invalid = storage.campaign_resources;
+        invalid.max_retained_storage_bytes = 0;
+        assert!(invalid.validate().is_err());
+        assert_eq!(defaults.campaign_resources.max_campaigns, 4);
+        assert_eq!(defaults.campaign_resources.max_resident_workers, 8);
+        assert_eq!(defaults.campaign_resources.max_model_calls, 2);
+        assert_eq!(defaults.campaign_resources.max_cpu_jobs, 2);
+        assert_eq!(defaults.campaign_resources.max_gpu_jobs, 0);
+        assert!(defaults.campaign_resources.gpu_device_ids.is_empty());
+        let mut gpu = defaults.campaign_resources.clone();
+        gpu.max_gpu_jobs = 1;
+        assert!(gpu.validate().is_err());
+        gpu.gpu_device_ids = vec!["GPU-stable-0".into()];
+        gpu.validate().unwrap();
+        for inventory in [
+            vec!["".into()],
+            vec!["a,b".into()],
+            vec!["/dev/gpu".into()],
+            vec!["same".into(), "same".into()],
+        ] {
+            gpu.gpu_device_ids = inventory;
+            assert!(gpu.validate().is_err());
+        }
+        let configured: super::Config = toml::from_str(
+            "[campaign_resources]\nmax_campaigns = 2\nmax_resident_workers = 3\nmax_model_calls = 1\nmax_cpu_jobs = 3\n",
+        ).unwrap();
+        configured.campaign_resources.validate().unwrap();
+        assert_eq!(configured.campaign_resources.max_model_calls, 1);
+        assert_eq!(configured.campaign_resources.max_cpu_jobs, 3);
+        for field in [
+            "max_campaigns",
+            "max_resident_workers",
+            "max_execution_jobs",
+            "max_model_calls",
+            "max_cpu_jobs",
+        ] {
+            for value in [0, 65536] {
+                let config: super::Config =
+                    toml::from_str(&format!("[campaign_resources]\n{field} = {value}\n")).unwrap();
+                assert!(config.campaign_resources.validate().is_err());
+            }
+        }
+        assert!(
+            toml::from_str::<super::Config>("[campaign_resources]\nmax_tool_jobs = 3\n").is_err(),
+            "unsupported quotas must not be silently accepted"
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn credential_precedence_and_backend_errors() {
+        for value in [" env-key ", "", "sk-test-fake", "placeholder"] {
+            let resolved = Config::resolve_key_with(Some(value.into()), || {
+                panic!("environment must bypass store")
+            })
+            .unwrap();
+            assert_eq!(
+                resolved,
+                if value == " env-key " {
+                    Some("env-key".into())
+                } else {
+                    None
+                }
+            );
+        }
+        assert_eq!(
+            Config::resolve_key_with(None, || Ok(Some(" stored-key ".into()))).unwrap(),
+            Some("stored-key".into())
+        );
+        assert_eq!(
+            Config::resolve_key_with(None, || Ok(Some("sk-test-fake".into()))).unwrap(),
+            None
+        );
+        assert_eq!(Config::resolve_key_with(None, || Ok(None)).unwrap(), None);
+        assert_eq!(
+            Config::resolve_key_with(None, || Err("store unavailable or locked".into()))
+                .unwrap_err(),
+            "store unavailable or locked"
+        );
+    }
+
+    #[test]
+    fn config_load_reports_invalid_files_without_source_values() {
+        let root = std::env::temp_dir().join(format!(
+            "tachyon-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("config.toml");
+        assert!(Config::try_load_from(&path).unwrap().model.name.is_none());
+        for contents in [
+            "[worker]\ncontext_length = 'private-sentinel'\n",
+            "[worker]\nmodel = 'private-sentinel\n",
+        ] {
+            fs::write(&path, contents).unwrap();
+            let error = Config::try_load_from(&path).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            let message = error.to_string();
+            assert!(message.contains(&path.display().to_string()));
+            assert!(message.contains("line 2"));
+            assert!(!message.contains("private-sentinel"));
+        }
+        fs::write(&path, "[conversation]\nmodel = 'chosen-model'\n").unwrap();
+        assert_eq!(
+            Config::try_load_from(&path)
+                .unwrap()
+                .conversation_config()
+                .model
+                .as_deref(),
+            Some("chosen-model")
+        );
+        assert!(Config::try_load_from(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_root_defaults_and_configuration_are_lazy() {
+        let legacy: Config = toml::from_str("").unwrap();
+        assert!(legacy.managed_agent_root.is_none());
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(
+                crate::daemon::managed_agent_root(&legacy).unwrap(),
+                home.join("Agents")
+            );
+        }
+        let configured: Config =
+            toml::from_str("managed_agent_root = '/tmp/custom-agents'").unwrap();
+        assert_eq!(
+            crate::daemon::managed_agent_root(&configured).unwrap(),
+            PathBuf::from("/tmp/custom-agents")
+        );
+        for path in ["/", "relative"] {
+            let configured = Config {
+                managed_agent_root: Some(path.into()),
+                ..Config::default()
+            };
+            assert!(crate::daemon::managed_agent_root(&configured).is_err());
+        }
+    }
 
     #[test]
     fn routing_profile_selects_its_preferences() {

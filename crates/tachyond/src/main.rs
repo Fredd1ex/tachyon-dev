@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod allocation_policy;
 mod history_store;
 mod runtime_store;
+use tachyond::artifact_store;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -73,6 +75,7 @@ struct WorkRecord {
 #[derive(Clone)]
 struct PendingReview {
     request: WorkReviewRequest,
+    started: std::time::Instant,
 }
 
 enum CoordinatorRequest {
@@ -93,6 +96,7 @@ struct Registry {
     runtime_store: Option<Arc<RuntimeStore>>,
     history_store: Option<Arc<HistoryStore>>,
     memory_store: Option<Arc<MemoryStore>>,
+    campaigns: Option<Arc<runtime_store::campaign_launch::CampaignService>>,
     memory_started_secs: u64,
     memory_last_activity_secs: u64,
 }
@@ -109,6 +113,7 @@ impl Default for Registry {
             runtime_store: None,
             history_store: None,
             memory_store: None,
+            campaigns: None,
             memory_started_secs: unix_now(),
             memory_last_activity_secs: 0,
         }
@@ -330,6 +335,7 @@ fn encode_interaction_command(
     correlation_id: Option<String>,
     causation_id: Option<String>,
     turn_id: Option<String>,
+    cwd: Option<String>,
 ) -> Result<String, String> {
     let sequence = INTERACTION_COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let message_id = format!("interaction-command-{sequence}");
@@ -344,6 +350,7 @@ fn encode_interaction_command(
     );
     metadata.causation_id = causation_id;
     metadata.turn_id = turn_id;
+    metadata.cwd = cwd;
     serde_json::to_string(&InteractionCommandEnvelope { metadata, command })
         .map_err(|error| format!("encode interaction command: {error}"))
 }
@@ -352,6 +359,7 @@ fn encode_reminder_notification(reminder: &ReminderInfo) -> Result<String, Strin
     let metadata = InteractionMetadata {
         protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
         message_id: format!("reminder-delivery-{}", reminder.id),
+        cwd: None,
         correlation_id: reminder.id.clone(),
         causation_id: Some(reminder.id.clone()),
         conversation_id: reminder.conversation_id.clone(),
@@ -376,6 +384,7 @@ fn encode_scheduled_task_notification(
     let metadata = InteractionMetadata {
         protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
         message_id: format!("scheduled-task-delivery-{}", task.id),
+        cwd: None,
         correlation_id: task.id.clone(),
         causation_id: Some(task.id.clone()),
         conversation_id: task.conversation_id.clone(),
@@ -740,6 +749,30 @@ fn run_reminder_scheduler(registry: Arc<Mutex<Registry>>, shutdown: Arc<AtomicBo
             )
         };
         if let Some(store) = store {
+            // Best-effort compact transition only; durable questions remain available
+            // through typed CLI input even with no connected Conversation.
+            let attention = store
+                .attention_notifications
+                .lock()
+                .unwrap()
+                .drain(..)
+                .collect::<Vec<_>>();
+            if user_connected {
+                for q in attention {
+                    let text = format!("Work needs input: campaign={:?} work={:?} request={:?}. Use tachyon campaign attention list. Question: {:?}", q.campaign_id, q.work_id, q.request_id, q.question.chars().take(256).collect::<String>());
+                    if let Ok(command) = encode_interaction_command(
+                        InteractionCommand::NotifyUser { text, model: false },
+                        None,
+                        None,
+                        None,
+                        None,
+                    ) {
+                        if let Ok(input) = task_input(&registry, FOREGROUND_ID) {
+                            let _ = write_task_input(input, FOREGROUND_ID, &command);
+                        }
+                    }
+                }
+            }
             match store.claim_ready_scheduled_tasks(unix_now_ms(), 8) {
                 Ok(tasks) => {
                     for task in tasks {
@@ -1184,7 +1217,8 @@ fn claim_reusable_worker(
     parent_task_id: &Option<String>,
     tool_call_id: &Option<String>,
 ) -> Option<AgentInfo> {
-    if cwd.is_some_and(|cwd| !cwd.is_empty()) || !dependencies_satisfied(registry, depends_on) {
+    let selected = tachyon_util::daemon::selected_workspace(cwd?).ok()?;
+    if !dependencies_satisfied(registry, depends_on) {
         return None;
     }
     let task_type = if purpose.trim().is_empty() {
@@ -1194,6 +1228,10 @@ fn claim_reusable_worker(
     };
     let candidate = registry.tasks.values_mut().find(|candidate| {
         candidate.warm
+            && tachyon_util::daemon::selected_workspace(&candidate.info.workspace)
+                .ok()
+                .as_ref()
+                == Some(&selected)
             && candidate.info.retained
             && candidate.info.owner == "background"
             && candidate.info.state == AgentState::Completed
@@ -1435,9 +1473,12 @@ fn handle_work_candidate(
     worker_id: &str,
     envelope: EventEnvelope,
 ) {
-    let StructuredAgentEvent::WorkCandidate { candidate } = envelope.kind else {
+    let StructuredAgentEvent::WorkCandidate { mut candidate } = envelope.kind else {
         return;
     };
+    if let Some(timing) = candidate.timing.as_mut() {
+        timing.review_ms = None;
+    }
     let completed = matches!(candidate.outcome, WorkOutcome::Completed { .. });
     if !completed {
         let terminal = result_envelope(worker_id, candidate);
@@ -1494,6 +1535,7 @@ fn handle_work_candidate(
         };
         work.review = Some(PendingReview {
             request: request.clone(),
+            started: std::time::Instant::now(),
         });
         (request, reg.coordinator_tx.clone())
     };
@@ -1541,8 +1583,13 @@ fn fail_pending_review(
         if !matches || work.terminal_result.is_some() {
             return;
         }
-        work.review = None;
-        request.candidate.clone()
+        let review = work.review.take().unwrap();
+        let mut candidate = request.candidate.clone();
+        candidate
+            .timing
+            .get_or_insert_with(Default::default)
+            .review_ms = Some(review.started.elapsed().as_millis() as u64);
+        candidate
     };
     let result = WorkResult {
         outcome: WorkOutcome::Failed {
@@ -1562,13 +1609,14 @@ fn fail_pending_review(
 }
 
 fn apply_work_review(registry: &Arc<Mutex<Registry>>, decision: WorkReviewDecision) {
-    apply_work_review_at(registry, decision, unix_now_ms());
+    apply_work_review_at(registry, decision, unix_now_ms(), std::time::Instant::now());
 }
 
 fn apply_work_review_at(
     registry: &Arc<Mutex<Registry>>,
     decision: WorkReviewDecision,
     now_ms: u64,
+    measured_at: std::time::Instant,
 ) {
     let (request, lifecycle) = {
         let mut reg = registry.lock().unwrap();
@@ -1588,7 +1636,14 @@ fn apply_work_review_at(
         {
             return;
         }
-        let request = request.clone();
+        let mut request = request.clone();
+        request
+            .candidate
+            .timing
+            .get_or_insert_with(Default::default)
+            .review_ms = measured_at
+            .checked_duration_since(review.started)
+            .map(|elapsed| elapsed.as_millis() as u64);
         work.review = None;
         let lifecycle = match &decision.recommendation {
             WorkReviewRecommendation::Accept { lifecycle } => Some(lifecycle.clone()),
@@ -1658,9 +1713,180 @@ fn apply_work_review_at(
     }
 }
 
+// Only bounded bookkeeping lives on the event owner. Jobs retain the source
+// workspace and the original subscribers/correlation even if the worker exits
+// or is reassigned before publication finishes.
+struct ArtifactJob {
+    info: AgentInfo,
+    generation: u64,
+    assignment: u64,
+    envelope: EventEnvelope,
+    subscribers: Vec<mpsc::Sender<AgentEvent>>,
+}
+
+type ArtifactRetention = HashMap<String, (usize, Option<AgentInfo>)>;
+
+fn artifact_retention() -> &'static Mutex<ArtifactRetention> {
+    static RETENTION: OnceLock<Mutex<ArtifactRetention>> = OnceLock::new();
+    RETENTION.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl Drop for ArtifactJob {
+    fn drop(&mut self) {
+        let cleanup = {
+            let mut retained = artifact_retention().lock().unwrap();
+            let Some((count, _)) = retained.get_mut(&self.info.workspace) else {
+                return;
+            };
+            *count -= 1;
+            if *count == 0 {
+                retained
+                    .remove(&self.info.workspace)
+                    .and_then(|(_, info)| info)
+            } else {
+                None
+            }
+        };
+        if let Some(info) = cleanup {
+            cleanup_workspace(&info);
+        }
+    }
+}
+
+impl ArtifactJob {
+    fn emit(&self, envelope: &EventEnvelope) {
+        let data = correlate_event(&serde_json::to_string(envelope).unwrap(), &self.info);
+        for tx in &self.subscribers {
+            let _ = tx.send(AgentEvent {
+                stream: EventStream::Stdout,
+                data: data.clone(),
+            });
+        }
+        log_event(&self.info.id, &EventStream::Stdout, &data);
+    }
+
+    fn finish(&self, mut envelope: EventEnvelope) {
+        let sequence = DAEMON_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        envelope.event_id = sequence;
+        envelope.sequence = sequence;
+        envelope.session_id = format!("{}:artifact-publication", self.envelope.session_id);
+        envelope.actor = tachyon_api::Actor::System;
+        envelope.occurred_at_ms = unix_now_ms();
+        self.emit(&envelope);
+    }
+}
+
+fn artifact_publisher() -> &'static mpsc::SyncSender<ArtifactJob> {
+    static PUBLISHER: OnceLock<mpsc::SyncSender<ArtifactJob>> = OnceLock::new();
+    PUBLISHER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<ArtifactJob>(32);
+        std::thread::spawn(move || {
+            for job in rx {
+                let data = serde_json::to_string(&job.envelope).unwrap();
+                if let Some(published) =
+                    artifact_store::publish_event(&data, &job.info, job.generation, job.assignment)
+                {
+                    if let Ok(envelope) = serde_json::from_str(&published) {
+                        job.finish(envelope);
+                    }
+                }
+            }
+        });
+        tx
+    })
+}
+
+fn queue_artifact(
+    registry: &Arc<Mutex<Registry>>,
+    id: &str,
+    mut envelope: EventEnvelope,
+    bytes: usize,
+    publisher: &mpsc::SyncSender<ArtifactJob>,
+) {
+    let StructuredAgentEvent::ArtifactRegistered { artifact } = &mut envelope.kind else {
+        return;
+    };
+    let job = {
+        let reg = registry.lock().unwrap();
+        let Some(task) = reg.tasks.get(id) else {
+            return;
+        };
+        let stale = artifact.generation.is_some_and(|v| v != task.generation)
+            || artifact.assignment.is_some_and(|v| v != task.assignment)
+            || (task.assignment > 0
+                && (artifact.generation != Some(task.generation)
+                    || artifact.assignment != Some(task.assignment)));
+        // An old or unfenced event must not be attributed to a reused worker's new Work.
+        if stale {
+            return;
+        }
+        artifact.task_id = task.info.logical_task_id.clone();
+        artifact.work_id = task.info.logical_task_id.clone();
+        artifact.generation = Some(task.generation);
+        artifact.assignment = Some(task.assignment);
+        artifact.publication = if bytes > 32 * 1024 {
+            tachyon_api::types::ArtifactPublication::Failed {
+                reason: "stale or oversized artifact event".into(),
+            }
+        } else {
+            tachyon_api::types::ArtifactPublication::Pending
+        };
+        artifact_retention()
+            .lock()
+            .unwrap()
+            .entry(task.info.workspace.clone())
+            .or_default()
+            .0 += 1;
+        let mut subscribers = task.subs.clone();
+        if let Some(work) = task
+            .info
+            .logical_task_id
+            .as_ref()
+            .and_then(|id| reg.works.get(id))
+        {
+            subscribers.extend(work.subs.iter().cloned());
+        }
+        ArtifactJob {
+            info: task.info.clone(),
+            generation: task.generation,
+            assignment: task.assignment,
+            envelope,
+            subscribers,
+        }
+    };
+    // Emit before enqueueing: the worker never waits on the event owner or
+    // sends back through its bounded actor channel, and cannot overtake pending.
+    job.emit(&job.envelope);
+    if matches!(&job.envelope.kind, StructuredAgentEvent::ArtifactRegistered { artifact }
+        if matches!(artifact.publication, tachyon_api::types::ArtifactPublication::Failed { .. }))
+    {
+        return;
+    }
+    if let Err(error) = publisher.try_send(job) {
+        let job = match error {
+            mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job) => job,
+        };
+        let mut envelope = job.envelope.clone();
+        if let StructuredAgentEvent::ArtifactRegistered { artifact } = &mut envelope.kind {
+            artifact.publication = tachyon_api::types::ArtifactPublication::Failed {
+                reason: "artifact publication queue unavailable or full; retry with a new ID"
+                    .into(),
+            };
+        }
+        job.finish(envelope);
+    }
+}
+
 fn push_event(registry: &Arc<Mutex<Registry>>, id: &str, stream: EventStream, data: &str) {
     if stream == EventStream::Stdout {
         if let Ok(envelope) = serde_json::from_str::<EventEnvelope>(data) {
+            if matches!(
+                envelope.kind,
+                StructuredAgentEvent::ArtifactRegistered { .. }
+            ) {
+                queue_artifact(registry, id, envelope, data.len(), artifact_publisher());
+                return;
+            }
             if matches!(envelope.kind, StructuredAgentEvent::WorkCandidate { .. }) {
                 let info = registry
                     .lock()
@@ -1892,6 +2118,12 @@ fn finish_agent(
         let sequence = DAEMON_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let result = WorkResult {
             work_id: request.work_id.clone(),
+            candidate_refs: None,
+            final_context: None,
+            attempt_id: request.attempt.as_ref().map(|a| a.id.clone()),
+            evidence: Default::default(),
+            instruction_revision: None,
+            timing: None,
             objective: request.objective.clone(),
             generation: request.generation,
             assignment: request.assignment,
@@ -1917,12 +2149,12 @@ fn finish_agent(
         }
         return;
     }
-    let (workspace, is_foreground) = {
+    let is_foreground = {
         let reg = registry.lock().unwrap();
         let Some(task) = reg.tasks.get(id) else {
             return;
         };
-        (task.info.workspace.clone(), task.info.id == FOREGROUND_ID)
+        task.info.id == FOREGROUND_ID
     };
     let mut reg = registry.lock().unwrap();
     let Some(task) = reg.tasks.get_mut(id) else {
@@ -1964,15 +2196,8 @@ fn finish_agent(
     // wipe workspace-autogenerated dirs (under workspaces/<id>), never the
     // foreground's shared dir. `TACHYON_KEEP_WORKSPACES=1` disables cleanup
     // for debugging.
-    let keep = std::env::var("TACHYON_KEEP_WORKSPACES")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false);
-    if !keep && !is_foreground {
-        let ws_root = tachyon_util::daemon::workspaces_dir();
-        let workspace = std::path::Path::new(&workspace);
-        if workspace.starts_with(&ws_root) {
-            let _ = std::fs::remove_dir_all(workspace);
-        }
+    if !is_foreground {
+        cleanup_workspace(&info);
     }
 }
 
@@ -2005,6 +2230,13 @@ fn main() -> std::process::ExitCode {
         }
     };
 
+    if let Err(error) =
+        tachyon_util::daemon::managed_agent_root(&tachyon_util::config::Config::load())
+            .and_then(|root| tachyon_util::daemon::ensure_managed_agent_root(&root))
+    {
+        eprintln!("tachyond: managed root unavailable: {error}; continuing without it; managed worker requests will retry provisioning");
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
     if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))
     {
@@ -2022,6 +2254,10 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    if let Err(error) = artifact_store::initialize_retained(runtime_store.retained.clone()) {
+        eprintln!("tachyond: retained artifact storage unavailable: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
     let history_store = match HistoryStore::open(&tachyon_util::daemon::history_database_path()) {
         Ok(store) => Some(Arc::new(store)),
         Err(error) => {
@@ -2043,7 +2279,18 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
+    let campaigns = match runtime_store::campaign_launch::CampaignService::new(
+        runtime_store.clone(),
+        tachyon_util::daemon::data_dir(),
+    ) {
+        Ok(service) => Arc::new(service),
+        Err(error) => {
+            eprintln!("tachyond: campaign recovery: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let reg = Arc::new(Mutex::new(Registry {
+        campaigns: Some(campaigns.clone()),
         runtime_store: Some(runtime_store),
         history_store,
         memory_store: Some(memory_store),
@@ -2180,6 +2427,7 @@ fn main() -> std::process::ExitCode {
     }
 
     shutdown_tasks(&reg);
+    campaigns.shutdown();
     let _ = background.join();
     tachyon_util::daemon::clear_pid();
     let _ = std::fs::remove_file(tachyon_util::daemon::socket_path());
@@ -2225,6 +2473,7 @@ fn run_ipc_server(
     let socket = tachyon_util::daemon::socket_path();
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
+    std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
 
     while !shutdown.load(Ordering::SeqCst) {
@@ -2256,6 +2505,15 @@ fn run_ipc_server(
 /// closes. `AgentSubscribe` / `ForegroundSubscribe` change the connection to
 /// a streaming mode and take it over until the stream ends.
 fn handle_connection(stream: UnixStream, registry: Arc<Mutex<Registry>>) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)?.uid()
+        != nix::unistd::geteuid().as_raw()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "daemon IPC requires the same user",
+        ));
+    }
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
@@ -2368,6 +2626,136 @@ fn write_response<W: Write>(writer: &mut W, resp: &ApiResponse) -> std::io::Resu
 fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
     use ApiRequest::*;
     match req {
+        CampaignIntegrationSnapshot { .. } | CampaignIntegrate { .. } => {
+            let store = registry.lock().unwrap().runtime_store.clone();
+            store
+                .ok_or_else(|| "runtime store unavailable".to_string())
+                .and_then(|s| s.integration_request(req, &tachyon_util::daemon::data_dir()))
+                .unwrap_or_else(ApiResponse::error)
+        }
+        CampaignReconcile {
+            id,
+            receipt,
+            unisolated_development,
+            confirm_authoritative,
+        } => {
+            let service = registry.lock().unwrap().campaigns.clone();
+            service
+                .ok_or_else(|| "campaign service unavailable".to_string())
+                .and_then(|s| {
+                    s.reconcile(id, receipt, *unisolated_development, *confirm_authoritative)
+                })
+                .unwrap_or_else(ApiResponse::error)
+        }
+        CampaignInspect { id } => {
+            let service = registry.lock().unwrap().campaigns.clone();
+            service
+                .ok_or_else(|| "campaign service unavailable".to_string())
+                .and_then(|s| s.inspect(id))
+                .unwrap_or_else(ApiResponse::error)
+        }
+        LocalRetentionSet { id, archived } => {
+            let service = registry.lock().unwrap().campaigns.clone();
+            service
+                .ok_or_else(|| "campaign service unavailable".to_string())
+                .and_then(|s| s.retention(id, *archived))
+                .unwrap_or_else(ApiResponse::error)
+        }
+        LocalRetentionGet { id } => {
+            let store = registry.lock().unwrap().runtime_store.clone();
+            store
+                .ok_or_else(|| "runtime store unavailable".to_string())
+                .and_then(|s| s.retention_get(id))
+                .unwrap_or_else(ApiResponse::error)
+        }
+        CampaignRecover {
+            id,
+            unisolated_development,
+        } => {
+            let service = registry.lock().unwrap().campaigns.clone();
+            service
+                .ok_or_else(|| "campaign service unavailable".to_string())
+                .and_then(|s| s.recover(id, *unisolated_development))
+                .unwrap_or_else(ApiResponse::error)
+        }
+        CampaignAttentionList { .. } | CampaignAttentionAnswer { .. } => {
+            let store = registry.lock().unwrap().runtime_store.clone();
+            store
+                .ok_or_else(|| "runtime store unavailable".to_string())
+                .and_then(|s| s.attention_request(req))
+                .unwrap_or_else(ApiResponse::error)
+        }
+        CampaignAcceptanceGet(_) | CampaignAcceptanceDecide(_) => {
+            let store = registry.lock().unwrap().runtime_store.clone();
+            store
+                .ok_or_else(|| "runtime store unavailable".to_string())
+                .and_then(|s| s.acceptance_request(req))
+                .unwrap_or_else(ApiResponse::error)
+        }
+        CampaignProgress { id } => {
+            let service = registry.lock().unwrap().campaigns.clone();
+            service
+                .ok_or_else(|| "campaign service unavailable".to_string())
+                .and_then(|s| s.progress(id))
+                .unwrap_or_else(ApiResponse::error)
+        }
+        CampaignRun {
+            manifest,
+            unisolated_development,
+        } => {
+            let service = registry.lock().unwrap().campaigns.clone();
+            service
+                .ok_or_else(|| "campaign service unavailable".to_string())
+                .and_then(|s| s.run(manifest, *unisolated_development))
+                .unwrap_or_else(ApiResponse::error)
+        }
+        CampaignCancel { id } => {
+            let service = registry.lock().unwrap().campaigns.clone();
+            service
+                .ok_or_else(|| "campaign service unavailable".to_string())
+                .and_then(|s| s.cancel(id))
+                .unwrap_or_else(ApiResponse::error)
+        }
+        CampaignResume {
+            id,
+            unisolated_development,
+        } => {
+            let service = registry.lock().unwrap().campaigns.clone();
+            service
+                .ok_or_else(|| "campaign service unavailable".to_string())
+                .and_then(|s| s.resume(id, *unisolated_development))
+                .unwrap_or_else(ApiResponse::error)
+        }
+        CampaignContinue {
+            id,
+            request,
+            unisolated_development,
+        } => {
+            let service = registry.lock().unwrap().campaigns.clone();
+            service
+                .ok_or_else(|| "campaign service unavailable".to_string())
+                .and_then(|s| s.continue_work(id, request, *unisolated_development))
+                .unwrap_or_else(ApiResponse::error)
+        }
+        ArtifactGet { .. } | ArtifactRead { .. } | ArtifactList { .. } => {
+            artifact_store::query(req).unwrap_or_else(ApiResponse::error)
+        }
+        ResearchCreate { .. }
+        | ResearchGet { .. }
+        | ResearchList { .. }
+        | CampaignCreate { .. }
+        | CampaignGet { .. }
+        | CampaignList { .. } => {
+            // IPC runs on a connection thread. Never wait for redb's writer
+            // while holding the registry lock or routing through an actor.
+            let store = registry.lock().unwrap().runtime_store.clone();
+            match store {
+                Some(store) => store
+                    .research_request(req)
+                    .unwrap_or_else(ApiResponse::error),
+                None => ApiResponse::error("runtime store unavailable"),
+            }
+        }
         DaemonStatus => {
             let background = {
                 let reg = registry.lock().unwrap();
@@ -2804,6 +3192,13 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
             deadline_ms,
         } => {
             let delegated_by_background = matches!(req, BackgroundDelegate { .. });
+            let cwd = match cwd.as_deref().filter(|path| !path.is_empty()) {
+                Some(path) => match tachyon_util::daemon::selected_workspace(path) {
+                    Ok(path) => Some(path.to_string_lossy().into_owned()),
+                    Err(error) => return ApiResponse::error(error),
+                },
+                None => None,
+            };
             let work_identity = if delegated_by_background {
                 let Some(work_id) = logical_task_id.clone() else {
                     return ApiResponse::error(
@@ -2814,7 +3209,7 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
                     work_id,
                     work_fingerprint(
                         task,
-                        cwd,
+                        &cwd,
                         depends_on,
                         *lifetime_class,
                         purpose,
@@ -2859,6 +3254,9 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
                     let generation = worker.generation;
                     let (work_id, fingerprint) = work_identity.clone().expect("delegated work id");
                     let request = WorkRequest {
+                        context_refs: vec![],
+                        constraints: None,
+                        attempt: None,
                         work_id: work_id.clone(),
                         objective: task.clone(),
                         generation,
@@ -2911,11 +3309,15 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
             }
             let id = reg.next_id();
             let workspace = match cwd {
-                Some(c) if !c.is_empty() => c.clone(),
-                _ => tachyon_util::daemon::workspaces_dir()
-                    .join(&id)
-                    .display()
-                    .to_string(),
+                Some(c) => c,
+                None => match tachyon_util::daemon::managed_agent_root(
+                    &tachyon_util::config::Config::load(),
+                )
+                .and_then(|root| tachyon_util::daemon::provision_managed_workspace(&root, &id))
+                {
+                    Ok(path) => path.to_string_lossy().into_owned(),
+                    Err(error) => return ApiResponse::error(error),
+                },
             };
             let warm = true;
             let state = if dependencies_satisfied(&reg, depends_on) {
@@ -2989,6 +3391,9 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
             );
             let work_request = work_identity.clone().map(|(work_id, fingerprint)| {
                 let request = WorkRequest {
+                    context_refs: vec![],
+                    constraints: None,
+                    attempt: None,
                     work_id: work_id.clone(),
                     objective: task.clone(),
                     generation: 0,
@@ -3254,12 +3659,20 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
             Ok(()) => ApiResponse::Chat { id: id.clone() },
             Err(e) => ApiResponse::error(e),
         },
-        ForegroundChat { text } => {
+        ForegroundChat { text, cwd } => {
+            let cwd = match cwd {
+                Some(path) => match tachyon_util::daemon::selected_workspace(path) {
+                    Ok(path) => Some(path.to_string_lossy().into_owned()),
+                    Err(error) => return ApiResponse::error(error),
+                },
+                None => None,
+            };
             let command = encode_interaction_command(
                 InteractionCommand::AcceptUserTurn { text: text.clone() },
                 None,
                 None,
                 None,
+                cwd,
             );
             match command.and_then(|command| deliver_task(registry, FOREGROUND_ID, &command, false))
             {
@@ -3617,6 +4030,13 @@ fn stage_worker(registry: &Arc<Mutex<Registry>>, id: &str, ttl_secs: u64) -> Api
 }
 
 fn cleanup_workspace(info: &AgentInfo) {
+    {
+        let mut retained = artifact_retention().lock().unwrap();
+        if let Some((_, cleanup)) = retained.get_mut(&info.workspace) {
+            *cleanup = Some(info.clone());
+            return;
+        }
+    }
     let keep = std::env::var("TACHYON_KEEP_WORKSPACES")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
@@ -4304,7 +4724,13 @@ fn collect_worker_result(registry: Arc<Mutex<Registry>>, work_id: String, foregr
                     rx.recv().ok()
                 } else {
                     let result = WorkResult {
+                        candidate_refs: None,
+                        final_context: None,
+                        attempt_id: request.attempt.as_ref().map(|a| a.id.clone()),
+                        instruction_revision: None,
                         work_id: request.work_id.clone(),
+                        evidence: Default::default(),
+                        timing: None,
                         objective: request.objective.clone(),
                         generation: request.generation,
                         assignment: request.assignment,
@@ -4345,6 +4771,7 @@ fn collect_worker_result(registry: Arc<Mutex<Registry>>, work_id: String, foregr
                 .or_else(|| envelope.turn_id.clone()),
             Some(format!("event-{}", envelope.event_id)),
             envelope.turn_id.clone(),
+            None,
         )
         .unwrap_or_else(|_| format!("[daemon:evidence] {}", event.data));
         let _ = deliver_task(&registry, &foreground_id, &reply, false);
@@ -4415,6 +4842,7 @@ fn collect_legacy_worker_result(
                         .or_else(|| event.turn_id.clone()),
                     Some(format!("event-{}", event.event_id)),
                     event.turn_id.clone(),
+                    None,
                 )
                 .unwrap_or_else(|_| format!("[daemon:evidence] {a}")),
                 Err(_) => format!("[daemon:evidence] {a}"),
@@ -4486,6 +4914,108 @@ mod tests {
     use tachyon_api::types::{MemoryIntent, MemoryMutationKind};
 
     #[test]
+    fn research_campaign_dispatch_is_inert_and_requires_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let registry = Arc::new(Mutex::new(Registry {
+            coordinator_tx: Some(tx),
+            ..Registry::default()
+        }));
+        let request = ApiRequest::ResearchCreate {
+            command_id: "r".into(),
+            title: "Research".into(),
+            objective: "Do not execute".into(),
+        };
+        assert!(dispatch(&request, &registry)
+            .as_error()
+            .unwrap()
+            .contains("unavailable"));
+        let store = Arc::new(RuntimeStore::open(&dir.path().join("runtime.redb")).unwrap());
+        registry.lock().unwrap().runtime_store = Some(store.clone());
+        registry.lock().unwrap().campaigns = Some(Arc::new(
+            runtime_store::campaign_launch::CampaignService::new(store.clone(), dir.path().into())
+                .unwrap(),
+        ));
+        let ApiResponse::Research { research } = dispatch(&request, &registry) else {
+            panic!()
+        };
+        let request = ApiRequest::CampaignCreate {
+            command_id: "c".into(),
+            research_id: research.id,
+            title: "Campaign".into(),
+            objective: "Do not execute".into(),
+        };
+        let ApiResponse::Campaign { campaign } = dispatch(&request, &registry) else {
+            panic!()
+        };
+        assert_eq!(campaign.status, tachyon_api::types::CampaignStatus::Draft);
+        assert!(store.campaign_ledger(&campaign.id).unwrap().is_none());
+        for archived in [true, false] {
+            assert!(matches!(dispatch(&ApiRequest::LocalRetentionSet {
+                id: campaign.id.clone(), archived,
+            }, &registry), ApiResponse::LocalRetention { archived: actual, .. } if actual == archived));
+            assert!(matches!(dispatch(&ApiRequest::LocalRetentionGet {
+                id: campaign.id.clone(),
+            }, &registry), ApiResponse::LocalRetention { archived: actual, .. } if actual == archived));
+        }
+        assert!(matches!(
+            dispatch(&ApiRequest::CampaignGet { id: campaign.id }, &registry),
+            ApiResponse::Campaign { .. }
+        ));
+        assert!(
+            matches!(dispatch(&ApiRequest::ResearchList { after: None, limit: 10 }, &registry), ApiResponse::ResearchList { records, .. } if records.len() == 1)
+        );
+        assert!(
+            matches!(dispatch(&ApiRequest::CampaignList { research_id: None, after: None, limit: 10 }, &registry), ApiResponse::CampaignList { campaigns, .. } if campaigns.len() == 1)
+        );
+        let reg = registry.lock().unwrap();
+        assert!(reg.tasks.is_empty());
+        assert!(reg.works.is_empty());
+        assert!(reg.foreground_id.is_none());
+        assert!(rx.try_recv().is_err());
+        assert!(store.list_tasks().unwrap().is_empty());
+        assert!(store.scheduled_tasks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn research_campaign_ipc_uses_existing_typed_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Mutex::new(Registry {
+            runtime_store: Some(Arc::new(
+                RuntimeStore::open(&dir.path().join("runtime.redb")).unwrap(),
+            )),
+            ..Registry::default()
+        }));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let handler = std::thread::spawn(move || handle_connection(server, registry));
+        let request = ApiRequest::ResearchCreate {
+            command_id: "ipc".into(),
+            title: "IPC".into(),
+            objective: "Metadata".into(),
+        };
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut original = None;
+        for _ in 0..2 {
+            let mut bytes = serde_json::to_vec(&request).unwrap();
+            bytes.push(b'\n');
+            client.write_all(&bytes).unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let response: ApiResponse = serde_json::from_str(&line).unwrap();
+            assert!(matches!(response, ApiResponse::Research { .. }));
+            if let Some(original) = &original {
+                assert_eq!(&line, original);
+            }
+            original = Some(line);
+        }
+        drop(reader);
+        drop(client);
+        handler.join().unwrap().unwrap();
+    }
+    #[test]
     fn absolute_local_deadlines_distinguish_today_tomorrow_and_next() {
         let now = Local
             .with_ymd_and_hms(2026, 1, 10, 13, 0, 0)
@@ -4519,6 +5049,7 @@ mod tests {
             Some("request-1".into()),
             None,
             Some("4".into()),
+            Some("/tmp/selected".into()),
         )
         .unwrap();
         assert!(!wire.contains('\n'));
@@ -4529,6 +5060,7 @@ mod tests {
         );
         assert_eq!(decoded.metadata.correlation_id, "request-1");
         assert_eq!(decoded.metadata.turn_id.as_deref(), Some("4"));
+        assert_eq!(decoded.metadata.cwd.as_deref(), Some("/tmp/selected"));
         assert!(matches!(
             decoded.command,
             InteractionCommand::AcceptUserTurn { text } if text == "line one\nline two"
@@ -4612,6 +5144,9 @@ mod tests {
             "work-1".into(),
             WorkRecord {
                 request: WorkRequest {
+                    context_refs: vec![],
+                    constraints: None,
+                    attempt: None,
                     work_id: "work-1".into(),
                     objective: "inspect".into(),
                     generation: 0,
@@ -4646,7 +5181,13 @@ mod tests {
             occurred_at_ms: unix_now_ms(),
             kind: StructuredAgentEvent::WorkCandidate {
                 candidate: WorkResult {
+                    attempt_id: None,
                     work_id: "work-1".into(),
+                    candidate_refs: None,
+                    final_context: None,
+                    instruction_revision: None,
+                    evidence: Default::default(),
+                    timing: None,
                     objective: "inspect".into(),
                     generation: 0,
                     assignment: 0,
@@ -4684,6 +5225,9 @@ mod tests {
             "work-1".into(),
             WorkRecord {
                 request: WorkRequest {
+                    context_refs: vec![],
+                    constraints: None,
+                    attempt: None,
                     work_id: "work-1".into(),
                     objective: "inspect".into(),
                     generation: 0,
@@ -4765,8 +5309,11 @@ mod tests {
 
     #[test]
     fn typed_pool_claim_is_atomic_and_clears_old_assignment() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().to_string_lossy().into_owned();
         let mut registry = Registry::default();
         let mut worker = task("worker", AgentState::Completed);
+        worker.info.workspace = cwd.clone();
         worker.warm = true;
         worker.ready = true;
         worker.info.retained = true;
@@ -4778,12 +5325,35 @@ mod tests {
         worker.terminal_result = Some("old result".into());
         registry.tasks.insert("worker".into(), worker);
 
+        let unrelated = tempfile::tempdir().unwrap();
+        let unrelated = unrelated.path().to_string_lossy().into_owned();
+        for selected in [None, Some(&unrelated)] {
+            assert!(claim_reusable_worker(
+                &mut registry,
+                "wrong workspace",
+                "Research",
+                LifetimeClass::Long,
+                selected,
+                &[],
+                &None,
+                &None,
+                &None,
+                &None,
+            )
+            .is_none());
+            assert!(registry.tasks["worker"].ready);
+            assert_eq!(registry.tasks["worker"].info.state, AgentState::Completed);
+        }
+
+        // A different spelling of the same canonical identity is compatible.
+        let cwd = format!("{cwd}/.");
+
         let claimed = claim_reusable_worker(
             &mut registry,
             "new objective",
             "Research",
             LifetimeClass::Long,
-            None,
+            Some(&cwd),
             &[],
             &Some("task-2".into()),
             &Some("2".into()),
@@ -4803,7 +5373,7 @@ mod tests {
             "another objective",
             "Research",
             LifetimeClass::Long,
-            None,
+            Some(&cwd),
             &[],
             &None,
             &None,
@@ -4811,6 +5381,167 @@ mod tests {
             &None,
         )
         .is_none());
+    }
+
+    #[test]
+    fn managed_root_startup_provisioning_is_idempotent_and_honors_configuration() {
+        use tachyon_util::daemon::{
+            ensure_managed_agent_root, managed_agent_root, provision_managed_workspace,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("nested/custom-agents");
+        let config = tachyon_util::config::Config {
+            managed_agent_root: Some(root.clone()),
+            ..Default::default()
+        };
+        let configured = managed_agent_root(&config).unwrap();
+        assert_eq!(configured, root);
+        assert!(!root.exists());
+        let ensured = ensure_managed_agent_root(&configured).unwrap();
+        assert_eq!(ensured, root.canonicalize().unwrap());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let workspace = provision_managed_workspace(&root, "worker-1").unwrap();
+        for path in ["research/notes.md", "artifacts/report.md"] {
+            std::fs::write(workspace.join(path), "keep").unwrap();
+        }
+        assert_eq!(ensure_managed_agent_root(&configured).unwrap(), ensured);
+        for path in ["research/notes.md", "artifacts/report.md"] {
+            assert_eq!(
+                std::fs::read_to_string(workspace.join(path)).unwrap(),
+                "keep"
+            );
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn managed_root_startup_provisioning_reports_invalid_and_file_paths() {
+        use std::path::PathBuf;
+        use tachyon_util::daemon::{ensure_managed_agent_root, managed_agent_root};
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, "keep").unwrap();
+        for root in [
+            PathBuf::from("relative"),
+            PathBuf::from("/"),
+            file.clone(),
+            file.join("nested"),
+        ] {
+            let config = tachyon_util::config::Config {
+                managed_agent_root: Some(root.clone()),
+                ..Default::default()
+            };
+            let error = managed_agent_root(&config)
+                .and_then(|root| ensure_managed_agent_root(&root))
+                .unwrap_err();
+            if root.is_absolute() && root.parent().is_some() {
+                assert!(
+                    error.contains("managed root provisioning failed"),
+                    "{error}"
+                );
+            } else {
+                assert!(error.contains("absolute non-root directory"), "{error}");
+                assert!(ensure_managed_agent_root(&root).is_err());
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn workspace_validation_and_managed_provisioning_are_scoped_and_distinct() {
+        use tachyon_util::daemon::{
+            managed_agent_root, provision_managed_workspace, selected_workspace,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("Agents");
+        let config = tachyon_util::config::Config {
+            managed_agent_root: Some(root.clone()),
+            ..Default::default()
+        };
+        assert_eq!(managed_agent_root(&config).unwrap(), root);
+        assert!(!root.exists());
+        let local = selected_workspace(directory.path().to_str().unwrap()).unwrap();
+        assert!(!local.join("research").exists());
+        assert!(!root.exists());
+        let workspace = provision_managed_workspace(&root, "worker-1").unwrap();
+        assert_eq!(
+            workspace.parent(),
+            Some(root.canonicalize().unwrap().as_path())
+        );
+        assert!(workspace.join("research").is_dir());
+        assert!(workspace.join("artifacts").is_dir());
+        std::fs::write(workspace.join("artifacts/keep.txt"), "keep").unwrap();
+        assert!(provision_managed_workspace(&root, "worker-1")
+            .unwrap_err()
+            .contains("managed workspace provisioning failed"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("artifacts/keep.txt")).unwrap(),
+            "keep"
+        );
+        assert!(provision_managed_workspace(&root, "../escape")
+            .unwrap_err()
+            .contains("invalid managed workspace id"));
+        assert!(selected_workspace("relative")
+            .unwrap_err()
+            .contains("absolute path"));
+        assert!(selected_workspace("/")
+            .unwrap_err()
+            .contains("filesystem root"));
+        assert!(selected_workspace(root.join("missing").to_str().unwrap())
+            .unwrap_err()
+            .contains("workspace unavailable"));
+        assert!(
+            selected_workspace(workspace.join("artifacts/keep.txt").to_str().unwrap())
+                .unwrap_err()
+                .contains("not a directory")
+        );
+        let file = directory.path().join("file");
+        std::fs::write(&file, "file").unwrap();
+        assert!(provision_managed_workspace(&file, "worker-2")
+            .unwrap_err()
+            .contains("managed root provisioning failed"));
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("alias");
+            std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+            assert_eq!(
+                selected_workspace(alias.to_str().unwrap()).unwrap(),
+                workspace
+            );
+            std::os::unix::fs::symlink(&workspace, root.join("worker-3")).unwrap();
+            assert!(provision_managed_workspace(&root, "worker-3").is_err());
+        }
+    }
+
+    #[test]
+    fn foreground_workspace_errors_are_not_delivery_errors() {
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let directory = tempfile::tempdir().unwrap();
+        for (cwd, expected) in [
+            (
+                Some("relative".into()),
+                "workspace selection must be an absolute path",
+            ),
+            (
+                Some(directory.path().to_string_lossy().into_owned()),
+                "no such agent",
+            ),
+            (None, "no such agent"),
+        ] {
+            let response = dispatch(
+                &ApiRequest::ForegroundChat {
+                    text: "hello".into(),
+                    cwd,
+                },
+                &registry,
+            );
+            let ApiResponse::Error { message, .. } = response else {
+                panic!("expected error");
+            };
+            assert!(message.contains(expected), "{message}");
+        }
+        assert!(registry.lock().unwrap().tasks.is_empty());
     }
 
     #[test]
@@ -4860,6 +5591,9 @@ mod tests {
         worker.info.logical_task_id = Some("work-1".into());
         let info = worker.info.clone();
         let request = WorkRequest {
+            context_refs: vec![],
+            constraints: None,
+            attempt: None,
             work_id: "work-1".into(),
             objective: "inspect".into(),
             generation: 0,
@@ -4886,7 +5620,13 @@ mod tests {
         let result = WorkResult {
             work_id: request.work_id.clone(),
             objective: request.objective.clone(),
+            attempt_id: None,
+            candidate_refs: None,
+            final_context: None,
             generation: 0,
+            instruction_revision: None,
+            evidence: Default::default(),
+            timing: None,
             assignment: 0,
             outcome: WorkOutcome::Completed {
                 result: "first".into(),
@@ -4921,6 +5661,96 @@ mod tests {
         let replayed = replay.recv().unwrap();
         assert!(replayed.data.contains("first"));
         assert!(!replayed.data.contains("second"));
+    }
+
+    #[test]
+    fn review_timing_is_separate_from_execution_for_accept_rework_and_no_provider() {
+        for recommendation in [
+            WorkReviewRecommendation::Accept {
+                lifecycle: LifecycleRecommendation::KeepCurrent,
+            },
+            WorkReviewRecommendation::Rework {
+                revised_objective: None,
+            },
+            WorkReviewRecommendation::Inconclusive {
+                failure: WorkReviewFailure::ModelUnavailable,
+            },
+        ] {
+            let (registry, _review_rx) = review_registry(LifetimeClass::Long);
+            let rx = registry.lock().unwrap().subscribe_work("work-1").unwrap();
+            let mut candidate = completed_candidate();
+            let StructuredAgentEvent::WorkCandidate { candidate: result } = &mut candidate.kind
+            else {
+                unreachable!()
+            };
+            result.timing = Some(tachyon_api::WorkTiming {
+                execution_ms: Some(1000),
+                inference_ms: Some(600),
+                tool_ms: Some(300),
+                review_ms: Some(99999),
+            });
+            handle_work_candidate(&registry, "worker", candidate);
+            let review = registry.lock().unwrap().works["work-1"]
+                .review
+                .clone()
+                .unwrap();
+            assert_eq!(
+                review.request.candidate.timing.as_ref().unwrap().review_ms,
+                None
+            );
+            let request = review.request;
+            apply_work_review_at(
+                &registry,
+                WorkReviewDecision {
+                    review_id: request.review_id,
+                    coordinator_generation: request.coordinator_generation,
+                    work_id: request.candidate.work_id,
+                    generation: request.candidate.generation,
+                    assignment: request.candidate.assignment,
+                    recommendation: recommendation.clone(),
+                    rationale: "fixture".into(),
+                },
+                request.deadline_ms - 1,
+                review.started + std::time::Duration::from_millis(250),
+            );
+            let envelope: EventEnvelope = serde_json::from_str(&rx.recv().unwrap().data).unwrap();
+            assert_eq!(envelope.task_id.as_deref(), Some("work-1"));
+            let StructuredAgentEvent::WorkResult { result } = envelope.kind else {
+                unreachable!()
+            };
+            assert_eq!((result.generation, result.assignment), (0, 0));
+            assert_eq!(
+                matches!(result.outcome, WorkOutcome::Completed { .. }),
+                matches!(recommendation, WorkReviewRecommendation::Accept { .. })
+            );
+            assert_eq!(
+                result.timing,
+                Some(tachyon_api::WorkTiming {
+                    execution_ms: Some(1000),
+                    inference_ms: Some(600),
+                    tool_ms: Some(300),
+                    review_ms: Some(250),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_coordinator_records_only_observed_review_wait() {
+        let (registry, _review_rx) = review_registry(LifetimeClass::Long);
+        registry.lock().unwrap().coordinator_tx = None;
+        let rx = registry.lock().unwrap().subscribe_work("work-1").unwrap();
+        handle_work_candidate(&registry, "worker", completed_candidate());
+        let envelope: EventEnvelope = serde_json::from_str(&rx.recv().unwrap().data).unwrap();
+        let StructuredAgentEvent::WorkResult { result } = envelope.kind else {
+            unreachable!()
+        };
+        assert!(matches!(result.outcome, WorkOutcome::Failed { .. }));
+        let timing = result.timing.unwrap();
+        assert!(timing.review_ms.is_some());
+        assert_eq!(timing.execution_ms, None);
+        assert_eq!(timing.inference_ms, None);
+        assert_eq!(timing.tool_ms, None);
     }
 
     #[test]
@@ -5025,12 +5855,22 @@ mod tests {
             },
             rationale: "sufficient evidence".into(),
         };
-        apply_work_review_at(&registry, decision.clone(), started_ms + 10_001);
+        apply_work_review_at(
+            &registry,
+            decision.clone(),
+            started_ms + 10_001,
+            std::time::Instant::now(),
+        );
         assert!(rx.try_recv().is_err());
         assert!(registry.lock().unwrap().works["work-1"].review.is_some());
 
         decision.assignment = request.candidate.assignment;
-        apply_work_review_at(&registry, decision, started_ms + 10_001);
+        apply_work_review_at(
+            &registry,
+            decision,
+            started_ms + 10_001,
+            std::time::Instant::now(),
+        );
         let event = rx.recv().unwrap();
         let envelope: EventEnvelope = serde_json::from_str(&event.data).unwrap();
         assert!(matches!(
@@ -5104,6 +5944,9 @@ mod tests {
         worker.info.logical_task_id = Some("work-timeout".into());
         let info = worker.info.clone();
         let request = WorkRequest {
+            context_refs: vec![],
+            constraints: None,
+            attempt: None,
             work_id: "work-timeout".into(),
             objective: "inspect".into(),
             generation: 0,
@@ -5129,6 +5972,12 @@ mod tests {
         }
         let timeout = serde_json::to_string(&StructuredAgentEvent::WorkResult {
             result: WorkResult {
+                attempt_id: None,
+                evidence: Default::default(),
+                candidate_refs: None,
+                final_context: None,
+                instruction_revision: None,
+                timing: None,
                 work_id: request.work_id,
                 objective: request.objective,
                 generation: request.generation,
@@ -5171,6 +6020,7 @@ mod tests {
         let metadata = InteractionMetadata {
             protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
             message_id: "message-1".into(),
+            cwd: None,
             correlation_id: "command-1".into(),
             causation_id: None,
             conversation_id: "conversation-1".into(),
@@ -5213,6 +6063,7 @@ mod tests {
             metadata: InteractionMetadata {
                 protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
                 message_id: "message-1".into(),
+                cwd: None,
                 correlation_id: "command-1".into(),
                 causation_id: None,
                 conversation_id: "conversation-1".into(),
@@ -5566,6 +6417,140 @@ mod tests {
     }
 
     #[test]
+    fn artifact_queue_is_bounded_retains_source_and_preserves_causal_identity() {
+        use tachyon_api::types::{ArtifactPublication, ArtifactRegistration};
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            storage.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(workspace.path().join("report.txt"), "abc").unwrap();
+        let store = artifact_store::ArtifactStore::open(storage.path()).unwrap();
+        let mut worker = task("worker", AgentState::Running);
+        worker.info.workspace = workspace.path().to_string_lossy().into_owned();
+        worker.info.logical_task_id = Some("original-work".into());
+        worker.info.origin_turn_id = Some("original-turn".into());
+        worker.generation = 1;
+        worker.assignment = 1;
+        let info = worker.info.clone();
+        let mut reg = Registry::default();
+        reg.tasks.insert("worker".into(), worker);
+        let events = reg.subscribe("worker").unwrap();
+        let registry = Arc::new(Mutex::new(reg));
+        let envelope = EventEnvelope {
+            event_id: 100,
+            sequence: 100,
+            session_id: "worker".into(),
+            conversation_id: None,
+            turn_id: None,
+            task_id: None,
+            parent_task_id: None,
+            tool_call_id: None,
+            actor: tachyon_api::Actor::Worker {
+                id: "worker".into(),
+            },
+            occurred_at_ms: 1,
+            kind: StructuredAgentEvent::ArtifactRegistered {
+                artifact: ArtifactRegistration {
+                    id: "first".into(),
+                    path: "report.txt".into(),
+                    kind: "report".into(),
+                    description: "test".into(),
+                    size_bytes: 3,
+                    sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                        .into(),
+                    task_id: Some("forged".into()),
+                    work_id: Some("forged".into()),
+                    generation: Some(1),
+                    assignment: Some(1),
+                    attempt_id: None,
+                    publication: ArtifactPublication::Ready {
+                        version: "forged".into(),
+                    },
+                },
+            },
+        };
+        // No consumer is running: neither admission nor overflow may wait on it.
+        let (tx, rx) = mpsc::sync_channel(1);
+        queue_artifact(&registry, "worker", envelope.clone(), 1024, &tx);
+        queue_artifact(&registry, "worker", envelope.clone(), 1024, &tx);
+        let next = || {
+            serde_json::from_str::<EventEnvelope>(
+                &events
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .data,
+            )
+            .unwrap()
+        };
+        for _ in 0..2 {
+            assert!(
+                matches!(next().kind, StructuredAgentEvent::ArtifactRegistered { artifact }
+                if artifact.publication == ArtifactPublication::Pending)
+            );
+        }
+        assert!(
+            matches!(next().kind, StructuredAgentEvent::ArtifactRegistered { artifact }
+            if matches!(artifact.publication, ArtifactPublication::Failed { .. }))
+        );
+        cleanup_workspace(&info);
+        assert!(artifact_retention()
+            .lock()
+            .unwrap()
+            .get(&info.workspace)
+            .unwrap()
+            .1
+            .is_some());
+        assert!(workspace.path().join("report.txt").exists());
+        {
+            let mut reg = registry.lock().unwrap();
+            let worker = reg.tasks.get_mut("worker").unwrap();
+            worker.assignment = 2;
+            worker.info.logical_task_id = Some("replacement-work".into());
+            worker.info.origin_turn_id = Some("replacement-turn".into());
+        }
+        queue_artifact(&registry, "worker", envelope.clone(), 1024, &tx);
+        let mut unfenced = envelope;
+        if let StructuredAgentEvent::ArtifactRegistered { artifact } = &mut unfenced.kind {
+            artifact.generation = None;
+            artifact.assignment = None;
+        }
+        queue_artifact(&registry, "worker", unfenced, 1024, &tx);
+        assert!(events.try_recv().is_err());
+        let job = rx.recv().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut completed = job.envelope.clone();
+            if let StructuredAgentEvent::ArtifactRegistered { artifact } = &mut completed.kind {
+                *artifact = store
+                    .register(
+                        "original-work",
+                        std::path::Path::new(&job.info.workspace),
+                        artifact.clone(),
+                    )
+                    .unwrap();
+            }
+            job.finish(completed);
+        });
+        let ready = next();
+        assert_eq!(ready.session_id, "worker:artifact-publication");
+        assert_eq!(ready.task_id.as_deref(), Some("original-work"));
+        assert_eq!(ready.turn_id.as_deref(), Some("original-turn"));
+        assert!(matches!(ready.actor, tachyon_api::Actor::System));
+        assert!(
+            matches!(ready.kind, StructuredAgentEvent::ArtifactRegistered { artifact }
+            if artifact.work_id.as_deref() == Some("original-work")
+                && matches!(artifact.publication, ArtifactPublication::Ready { .. }))
+        );
+        handle.join().unwrap();
+        assert!(!artifact_retention()
+            .lock()
+            .unwrap()
+            .contains_key(&info.workspace));
+    }
+
+    #[test]
     fn artifact_registration_uses_daemon_owned_task_identity() {
         let mut worker = task("research", AgentState::Running);
         worker.info.logical_task_id = Some("task-7".into());
@@ -5585,6 +6570,7 @@ mod tests {
             kind: StructuredAgentEvent::ArtifactRegistered {
                 artifact: tachyon_api::types::ArtifactRegistration {
                     id: "artifact-1".into(),
+                    publication: Default::default(),
                     path: "report.txt".into(),
                     kind: "report".into(),
                     description: "Report".into(),

@@ -8,6 +8,7 @@ pub struct Manifest {
     pub name: &'static str,
     pub version: &'static str,
     pub description: &'static str,
+    pub interface: &'static str,
     pub usage: &'static str,
     pub operations: &'static [&'static str],
 }

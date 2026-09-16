@@ -92,10 +92,12 @@ impl AgentRole {
     }
 }
 
-fn from_agent_config(agent: &tachyon_util::config::AgentConfig) -> Result<Model, String> {
-    let cfg = tachyon_util::config::Config::load();
+fn from_agent_config(
+    cfg: &tachyon_util::config::Config,
+    agent: &tachyon_util::config::AgentConfig,
+) -> Result<Model, String> {
     let api_key = cfg.resolve_key("openrouter").ok_or_else(|| {
-        "api key not configured (set OPENROUTER_API_KEY and restart the daemon)".to_string()
+        "no usable OpenRouter API key is available to the conversation runtime (environment or credential store)".to_string()
     })?;
     let configured = agent.model(&cfg.model);
     let model_name = configured
@@ -238,18 +240,20 @@ async fn run_chat(
     new_session: bool,
     agent_id: Option<String>,
 ) -> ExitCode {
-    let cfg = tachyon_util::config::Config::load();
-    let model_config = role.config(&cfg);
-    let model = match from_agent_config(&model_config) {
-        Ok(m) => Some(m),
+    let loaded =
+        tachyon_util::config::Config::try_load_from(&tachyon_util::config::Config::default_path());
+    let model = loaded
+        .as_ref()
+        .map_err(|error| error.to_string())
+        .and_then(|cfg| from_agent_config(cfg, &role.config(cfg)));
+    let cfg = loaded.unwrap_or_default();
+    let (model, model_error) = match model {
+        Ok(m) => (Some(Arc::new(m)), None),
         Err(e) => {
             println!("[foreground:error] model not ready: {e}");
-            println!("[foreground] ready");
-            None
+            (None, Some(e))
         }
     };
-    let model = model.map(Arc::new);
-    let cfg = tachyon_util::config::Config::load();
     let checkpoint_path = chat_checkpoint_path(workspace, role);
     if new_session {
         let _ = std::fs::remove_file(&checkpoint_path);
@@ -331,6 +335,7 @@ async fn run_chat(
                 routing_usage,
                 accepted_at,
                 processor_model.clone(),
+                model_error.clone(),
                 Arc::clone(&processor_conversation),
                 Arc::clone(&processor_active_turns),
                 Arc::clone(&processor_state_changed),
@@ -532,6 +537,7 @@ async fn process_turn(
         TokenUsage,
         std::time::Instant,
         Option<Arc<Model>>,
+        Option<String>,
         Arc<Mutex<ConversationState>>,
         Arc<Mutex<BTreeMap<u64, String>>>,
         Arc<tokio::sync::Notify>,
@@ -550,6 +556,7 @@ async fn process_turn(
         mut auxiliary_usage,
         accepted_at,
         model,
+        model_error,
         conversation,
         active_turns,
         state_changed,
@@ -561,17 +568,15 @@ async fn process_turn(
         if publication_requires_dependency(queued, decision) {
             wait_for_prior_turn(&conversation, &state_changed, turn).await;
         }
-        let answer =
-            "I couldn't complete that request because no conversation model is configured.";
-        emit_turn(
-            Some(turn),
-            "[foreground:error] model is not configured (set OPENROUTER_API_KEY and restart the daemon)"
-                .into(),
-        );
+        let reason = model_error
+            .as_deref()
+            .unwrap_or("the conversation model is unavailable");
+        let answer = format!("I couldn't complete that request because {reason}. Correct the runtime configuration or credential availability, then restart the daemon.");
+        emit_turn(Some(turn), format!("[foreground:error] {reason}"));
         emit_interaction_event(
             &metadata,
             InteractionEvent::ConversationFinished {
-                text: answer.into(),
+                text: answer.clone(),
             },
         );
         let mut current = conversation.lock().unwrap();
@@ -1909,6 +1914,7 @@ async fn loop_until_done(
                     memory_context.clone(),
                     schedule_batch_valid,
                     schedule_context.clone(),
+                    interaction_metadata.and_then(|metadata| metadata.cwd.clone()),
                 )
             }))
             .await
@@ -2312,6 +2318,7 @@ async fn run_tool(
     memory_context: Option<MemoryToolContext>,
     schedule_batch_valid: bool,
     schedule_context: Option<ScheduleToolContext>,
+    cwd: Option<String>,
 ) -> ToolOutput {
     if !role.allows_tool(&tc.name) {
         return ToolOutput::failure(format!("{} is not available to the {role:?} role", tc.name));
@@ -2342,71 +2349,26 @@ async fn run_tool(
             };
             run_schedule_tool(&tc.arguments, context).await
         }
-        "spawn_agent" => {
-            let task = arg(&tc.arguments, "task");
+        "spawn_agent" | "spawn_agents" => {
             if !delegation_allowed {
                 return ToolOutput::failure("Delegation has already been used for this turn. Synthesize an answer from the worker results already received; do not spawn another worker.".into());
             }
-            let cwd_arg = arg(&tc.arguments, "cwd");
-            let cwd = (!cwd_arg.is_empty()).then_some(cwd_arg);
-            let value =
-                serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or_default();
-            let lifetime_class = value
-                .get("lifetime_class")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok())
-                .unwrap_or(LifetimeClass::Short);
-            let purpose = value
-                .get("purpose")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let correlation = delegation_correlation(tc, turn, None);
-            match tokio::task::spawn_blocking(move || {
-                spawn_via_daemon(&task, cwd, lifetime_class, purpose, correlation)
-            })
-            .await
-            {
-                Ok(Ok(result)) => ToolOutput::success(result),
-                Ok(Err(error)) => ToolOutput::failure(format!("worker spawn failed: {error}")),
-                Err(error) => ToolOutput::failure(format!("worker spawn task failed: {error}")),
-            }
-        }
-        "spawn_agents" => {
-            if !delegation_allowed {
-                return ToolOutput::failure("Delegation has already been used for this turn. Synthesize an answer from the worker results already received; do not spawn another worker.".into());
-            }
-            let tasks = match serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                .ok()
-                .and_then(|value| value.get("tasks").cloned())
-                .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
-            {
-                Some(tasks) if !tasks.is_empty() => tasks,
-                _ => {
-                    return ToolOutput::failure(
-                        "spawn_agents requires a non-empty tasks array".into(),
-                    );
-                }
+            let requests = match delegation_requests(tc, turn, cwd) {
+                Ok(requests) => requests,
+                Err(error) => return ToolOutput::failure(error),
             };
-            if tasks.len() > 8 {
-                return ToolOutput::failure(
-                    "spawn_agents accepts at most 8 tasks; group related objectives".into(),
-                );
-            }
-            let lifetime_class = serde_json::from_str::<serde_json::Value>(&tc.arguments)
-                .ok()
-                .and_then(|value| value.get("lifetime_class").cloned())
-                .and_then(|value| serde_json::from_value(value).ok())
-                .unwrap_or(LifetimeClass::Short);
-            let jobs = tasks.iter().cloned().enumerate().map(|(index, task)| {
-                let lifetime_class = lifetime_class;
-                let correlation = delegation_correlation(tc, turn, Some(index));
-                tokio::task::spawn_blocking(move || {
-                    spawn_via_daemon(&task, None, lifetime_class, String::new(), correlation)
+            let tasks = requests
+                .iter()
+                .filter_map(|request| match request {
+                    ApiRequest::BackgroundDelegate { task, .. } => Some(task.clone()),
+                    _ => None,
                 })
-            });
+                .collect::<Vec<_>>();
+            let jobs = requests
+                .into_iter()
+                .map(|request| tokio::task::spawn_blocking(move || spawn_via_daemon(request)));
             let results = join_all(jobs).await;
-            let outcomes = results
+            let mut outcomes: Vec<_> = results
                 .into_iter()
                 .map(|result| match result {
                     Ok(Ok(answer)) => ToolOutput::success(answer),
@@ -2414,7 +2376,11 @@ async fn run_tool(
                     Err(error) => ToolOutput::failure(format!("worker task failed: {error}")),
                 })
                 .collect();
-            compose_fanout_output(&tasks, outcomes)
+            if tc.name == "spawn_agent" {
+                outcomes.remove(0)
+            } else {
+                compose_fanout_output(&tasks, outcomes)
+            }
         }
         other => ToolOutput::failure(format!("unknown tool: {other}")),
     }
@@ -2971,36 +2937,80 @@ fn delegation_correlation(
     }
 }
 
-/// Ask Tachyond to create an ephemeral worker and wait for its terminal result.
-/// The worker's live output remains available to TUI subscribers by its ID.
-fn spawn_via_daemon(
-    task: &str,
+/// Prepare both delegation forms from host-owned turn context, not model cwd arguments.
+fn delegation_requests(
+    tc: &ToolCall,
+    turn: Option<u64>,
     cwd: Option<String>,
-    lifetime_class: LifetimeClass,
-    purpose: String,
-    correlation: DelegationCorrelation,
-) -> Result<String, String> {
-    let work_id = correlation.logical_task_id.clone();
-    let origin_turn = correlation
-        .origin_turn_id
+) -> Result<Vec<ApiRequest>, String> {
+    let value = serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or_default();
+    let fanout = tc.name == "spawn_agents";
+    let tasks = if fanout {
+        let tasks = value
+            .get("tasks")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+            .filter(|tasks| !tasks.is_empty())
+            .ok_or("spawn_agents requires a non-empty tasks array")?;
+        if tasks.len() > 8 {
+            return Err("spawn_agents accepts at most 8 tasks; group related objectives".into());
+        }
+        tasks
+    } else {
+        vec![arg(&tc.arguments, "task")]
+    };
+    let lifetime_class = value
+        .get("lifetime_class")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or(LifetimeClass::Short);
+    let purpose = if fanout {
+        ""
+    } else {
+        value
+            .get("purpose")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+    };
+    Ok(tasks
+        .into_iter()
+        .enumerate()
+        .map(|(index, task)| {
+            let correlation = delegation_correlation(tc, turn, fanout.then_some(index));
+            ApiRequest::BackgroundDelegate {
+                task,
+                cwd: cwd.clone(),
+                depends_on: Vec::new(),
+                lifetime_class,
+                purpose: purpose.to_string(),
+                logical_task_id: Some(correlation.logical_task_id),
+                origin_turn_id: correlation.origin_turn_id,
+                parent_task_id: correlation.parent_task_id,
+                tool_call_id: correlation.tool_call_id,
+                deadline_ms: None,
+            }
+        })
+        .collect())
+}
+
+/// Ask Tachyond to create a worker and wait for its terminal result.
+/// The worker's live output remains available to TUI subscribers by its ID.
+fn spawn_via_daemon(request: ApiRequest) -> Result<String, String> {
+    let ApiRequest::BackgroundDelegate {
+        task,
+        logical_task_id: Some(work_id),
+        origin_turn_id,
+        ..
+    } = &request
+    else {
+        return Err("invalid worker delegation request".into());
+    };
+    let origin_turn = origin_turn_id
         .as_deref()
         .and_then(|turn| turn.parse::<u64>().ok());
     let socket = tachyon_util::daemon::socket_path();
     let mut client = Connection::connect(&socket).map_err(|e| e.to_string())?;
-    let response = client
-        .exchange(&ApiRequest::BackgroundDelegate {
-            task: task.to_string(),
-            cwd,
-            depends_on: Vec::new(),
-            lifetime_class,
-            purpose,
-            logical_task_id: Some(work_id.clone()),
-            origin_turn_id: correlation.origin_turn_id,
-            parent_task_id: correlation.parent_task_id,
-            tool_call_id: correlation.tool_call_id,
-            deadline_ms: None,
-        })
-        .map_err(|e| e.to_string())?;
+    let response = client.exchange(&request).map_err(|e| e.to_string())?;
     let id = match response {
         ApiResponse::Agent { info } => info.id,
         ApiResponse::Error { message, .. } => return Err(message),
@@ -3288,6 +3298,72 @@ mod tests {
 
     fn interaction_metadata() -> tachyon_api::InteractionMetadata {
         tachyon_api::InteractionMetadata::new("command-1", "turn-1", FOREGROUND_ID, 1)
+    }
+
+    #[tokio::test]
+    async fn concurrent_turns_propagate_host_workspace_to_single_and_fanout() {
+        let mut jobs = Vec::new();
+        for (turn, cwd) in [(1, Some("/project/a")), (2, None), (3, Some("/project/b"))] {
+            let mut metadata = interaction_metadata();
+            metadata.cwd = cwd.map(str::to_string);
+            let wire = serde_json::to_string(&InteractionCommandEnvelope {
+                metadata,
+                command: InteractionCommand::AcceptUserTurn {
+                    text: "Use /model/prose as cwd".into(),
+                },
+            })
+            .unwrap();
+            let ChatInput::User { metadata, .. } =
+                decode_chat_input(&wire, AgentRole::Conversation)
+            else {
+                panic!("expected user turn");
+            };
+            jobs.push(tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                for (name, count) in [("spawn_agent", 1), ("spawn_agents", 2)] {
+                    let call = ToolCall {
+                        id: format!("call-{turn}"),
+                        name: name.into(),
+                        arguments: r#"{"task":"one","tasks":["one","two"],"cwd":"/model/argument"}"#.into(),
+                    };
+                    let requests = delegation_requests(&call, Some(turn), metadata.cwd.clone()).unwrap();
+                    assert_eq!(requests.len(), count);
+                    let mut ids = BTreeSet::new();
+                    for request in requests {
+                        let wire = serde_json::to_string(&request).unwrap();
+                        let ApiRequest::BackgroundDelegate { cwd: selected, origin_turn_id, logical_task_id, .. } = serde_json::from_str(&wire).unwrap() else {
+                            panic!("expected delegation");
+                        };
+                        assert_eq!(selected.as_deref(), cwd);
+                        assert_eq!(origin_turn_id, Some(turn.to_string()));
+                        assert!(ids.insert(logical_task_id));
+                    }
+                }
+            }));
+        }
+        for job in jobs {
+            job.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_turns_default_to_managed_without_prose_authority() {
+        let ChatInput::User { metadata, .. } =
+            decode_chat_input("work in /some/path", AgentRole::Conversation)
+        else {
+            panic!("expected legacy user turn");
+        };
+        assert!(metadata.cwd.is_none());
+        let mut wire = serde_json::to_value(InteractionCommandEnvelope {
+            metadata: interaction_metadata(),
+            command: InteractionCommand::AcceptUserTurn {
+                text: "hello".into(),
+            },
+        })
+        .unwrap();
+        wire.as_object_mut().unwrap().remove("cwd");
+        let decoded: InteractionCommandEnvelope = serde_json::from_value(wire).unwrap();
+        assert!(decoded.metadata.cwd.is_none());
     }
 
     #[test]
@@ -4001,7 +4077,13 @@ mod tests {
     fn only_completed_work_results_are_reusable_evidence() {
         let completed = AgentEvent::WorkResult {
             result: tachyon_api::WorkResult {
+                attempt_id: None,
+                instruction_revision: None,
                 work_id: "work-1".into(),
+                candidate_refs: None,
+                final_context: None,
+                evidence: Default::default(),
+                timing: None,
                 objective: "inspect".into(),
                 generation: 0,
                 assignment: 0,
@@ -4015,7 +4097,13 @@ mod tests {
         };
         let timeout = AgentEvent::WorkResult {
             result: tachyon_api::WorkResult {
+                attempt_id: None,
+                instruction_revision: None,
                 work_id: "work-2".into(),
+                candidate_refs: None,
+                final_context: None,
+                evidence: Default::default(),
+                timing: None,
                 objective: "inspect".into(),
                 generation: 0,
                 assignment: 0,

@@ -3,7 +3,7 @@
 //! Protocol version and message types for the Tachyon daemon IPC.
 //!
 //! Messages are newline-delimited JSON (`Ndjson`) over a Unix domain socket.
-//! Each `ApiRequest` maps 1:1 to a `tachyon` CLI command (or TUI action).
+//! Requests include user-facing actions and daemon-owned record operations.
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,14 @@ impl std::fmt::Display for LifetimeClass {
 /// One daemon-owned assignment delivered to a worker harness.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkRequest {
+    /// Explicit host-validated handles, not automatic prompt capture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_refs: Vec<crate::context::ResourceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<WorkConstraints>,
+    /// Host attempt identity and bounded repair feedback; absent for ordinary work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<WorkAttempt>,
     /// Stable idempotency key for this logical assignment.
     pub work_id: String,
     pub objective: String,
@@ -50,6 +58,36 @@ pub struct WorkRequest {
     /// Absolute Unix deadline in milliseconds.
     pub deadline_ms: u64,
     pub lifetime_class: LifetimeClass,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkConstraints {
+    pub permissions: WorkPermissions,
+    pub input_context: Vec<crate::context::Resource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPermissions {
+    pub task_type: WorkTaskType,
+    pub allow_exec: bool,
+    pub allow_python: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkTaskType {
+    CodingReadOnly,
+    Coding,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkAttempt {
+    pub id: String,
+    pub feedback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<crate::continuation::ContinuationBootstrap>,
 }
 
 /// Non-terminal progress associated with a [`WorkRequest`].
@@ -72,12 +110,60 @@ pub enum WorkEventKind {
 /// Exactly one terminal outcome for a logical work assignment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkResult {
+    /// Final worker observations before cleanup, never permissions or installed-version authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_context: Option<crate::context::WorkerContextMetadata>,
+    /// Attempt fence copied from the assignment, not worker-selected authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    /// Host-resolved immutable artifact IDs; worker claims are discarded on collection.
+    /// `WorkOutcome` artifact strings remain workspace paths for history/legacy workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_refs: Option<Vec<String>>,
+    /// Host-canonical model-boundary revision; absent for legacy/non-broker workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_revision: Option<u64>,
     pub work_id: String,
     pub objective: String,
     pub generation: u64,
     pub assignment: u64,
+    /// Assignment-scoped observed tool results, not worker-authored citations.
+    #[serde(default)]
+    pub evidence: WorkEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<WorkTiming>,
     #[serde(flatten)]
     pub outcome: WorkOutcome,
+}
+
+/// Measured wall-clock stages, not additive CPU time. Missing values are unknown.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkTiming {
+    /// Ghost execution including setup/cleanup, excluding daemon review.
+    pub execution_ms: Option<u64>,
+    /// Sequential model request waits within execution, including provider retries.
+    pub inference_ms: Option<u64>,
+    /// Sequential parallel-tool batch waits within execution (not summed call durations).
+    pub tool_ms: Option<u64>,
+    /// Daemon candidate-to-decision wait, including coordinator queue/IPC, not model time.
+    pub review_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkEvidence {
+    pub tools: Vec<WorkToolEvidence>,
+    /// Results excluded by the evidence budget; absence is not proof of success.
+    pub omitted: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkToolEvidence {
+    pub call_id: Option<String>,
+    pub parent_call_id: Option<String>,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+    /// Bounded native ToolResult envelope, including error and truncation status.
+    pub output: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -316,15 +402,206 @@ pub struct PendingWorkReviewInfo {
     pub deadline_ms: u64,
 }
 
-/// All requests the daemon accepts. Mirrors the CLI subcommands 1:1.
+/// Immutable, top-level research metadata. Creation does not start work.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Research {
+    /// Server-generated `research-` followed by 32 lowercase UUID hex digits.
+    pub id: String,
+    pub title: String,
+    pub objective: String,
+    /// Server creation time, Unix milliseconds; unchanged on replay.
+    pub created_at_ms: u64,
+}
+
+/// Draft is explicitly inert: no execution, budget, permissions, or inference.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CampaignStatus {
+    Draft,
+    Running,
+    Cancelling,
+    Cancelled,
+    Accepted,
+    AwaitingAcceptance,
+    AcceptedHuman,
+    Rejected,
+    Unverified,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Campaign {
+    /// Server-generated `campaign-` followed by 32 lowercase UUID hex digits.
+    pub id: String,
+    pub research_id: String,
+    pub title: String,
+    pub objective: String,
+    /// Server creation time, Unix milliseconds; unchanged on replay.
+    pub created_at_ms: u64,
+    pub status: CampaignStatus,
+}
+
+/// Bounded launch observations; persisted active leases are not proof of a live process.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CampaignActivity {
+    /// Process-local admission queues, not durable active leases or money holds.
+    #[serde(default)]
+    pub host_resident_waiting: usize,
+    #[serde(default)]
+    pub host_execution_waiting: usize,
+    #[serde(default)]
+    pub host_model_waiting: usize,
+    pub owned: bool,
+    pub admitted: usize,
+    pub queued: usize,
+    pub active: usize,
+    pub waiting: usize,
+    pub terminal: usize,
+}
+
+/// Creation limits are UTF-8 byte counts; blank text is rejected, not normalized.
+pub const RESEARCH_TITLE_MAX_BYTES: usize = 256;
+pub const RESEARCH_OBJECTIVE_MAX_BYTES: usize = 16_384;
+pub const RESEARCH_COMMAND_ID_MAX_BYTES: usize = 128;
+pub const RESEARCH_LIST_MAX_LIMIT: u32 = 100;
+
+fn default_research_limit() -> u32 {
+    50
+}
+
+/// All requests the daemon accepts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ApiRequest {
+    /// Same-user host retention control; accepts a Research or Campaign ID.
+    LocalRetentionSet {
+        id: String,
+        archived: bool,
+    },
+    LocalRetentionGet {
+        id: String,
+    },
+    CampaignAcceptanceGet(crate::campaign::AcceptanceQuery),
+    CampaignAcceptanceDecide(crate::campaign::AcceptanceDecision),
+    /// Privileged same-user host input, never a worker tool or cross-campaign grant.
+    CampaignAttentionList {
+        id: String,
+        after: Option<String>,
+        limit: usize,
+    },
+    CampaignAttentionAnswer {
+        id: String,
+        work_id: String,
+        request_id: String,
+        generation: u64,
+        instruction_revision: u64,
+        answer: String,
+    },
+    /// Same-user local host control only. Never exposed as a model tool.
+    CampaignRun {
+        manifest: crate::campaign::CampaignManifest,
+        unisolated_development: bool,
+    },
+    CampaignCancel {
+        id: String,
+    },
+    CampaignProgress {
+        id: String,
+    },
+    CampaignResume {
+        id: String,
+        unisolated_development: bool,
+    },
+    CampaignContinue {
+        id: String,
+        request: crate::continuation::ContinuationRequest,
+        #[serde(default)]
+        unisolated_development: bool,
+    },
+    CampaignInspect {
+        id: String,
+    },
+    CampaignIntegrationSnapshot {
+        id: String,
+        paths: Vec<String>,
+    },
+    CampaignIntegrate {
+        id: String,
+        plan: crate::integration::IntegrationPlan,
+        expected_state: String,
+        #[serde(default)]
+        confirm: bool,
+    },
+    CampaignRecover {
+        id: String,
+        unisolated_development: bool,
+    },
+    CampaignReconcile {
+        id: String,
+        receipt: crate::campaign::ReconciliationReceipt,
+        #[serde(default)]
+        unisolated_development: bool,
+        #[serde(default)]
+        confirm_authoritative: bool,
+    },
+    /// Host control API only; does not grant workers filesystem or database access.
+    ArtifactGet {
+        scope: String,
+        id: String,
+    },
+    ArtifactRead {
+        scope: String,
+        id: String,
+        offset: u64,
+        limit: u32,
+    },
+    /// Cursor is the last returned registration ID (ordered by its opaque hash).
+    ArtifactList {
+        scope: String,
+        after: Option<String>,
+        limit: u32,
+    },
+    /// Command IDs share a namespace across both creation operations. Exact
+    /// payload retries replay the original record; reuse otherwise conflicts.
+    ResearchCreate {
+        command_id: String,
+        title: String,
+        objective: String,
+    },
+    ResearchGet {
+        id: String,
+    },
+    /// Ascending ID order, strictly after the cursor (not a snapshot).
+    ResearchList {
+        after: Option<String>,
+        #[serde(default = "default_research_limit")]
+        limit: u32,
+    },
+    /// Creates only inert Draft metadata under an existing Research.
+    CampaignCreate {
+        command_id: String,
+        research_id: String,
+        title: String,
+        objective: String,
+    },
+    CampaignGet {
+        id: String,
+    },
+    /// Same exclusive ID ordering as ResearchList. Keep the filter unchanged
+    /// between pages. None lists all campaigns; a nonexistent Research ID
+    /// yields an empty page.
+    CampaignList {
+        research_id: Option<String>,
+        after: Option<String>,
+        #[serde(default = "default_research_limit")]
+        limit: u32,
+    },
     /// `tachyon daemon status`
     DaemonStatus,
     /// `tachyon start <task>`
     AgentStart {
         task: String,
+        /// Existing absolute host directory; absent/empty selects a new managed workspace.
         cwd: Option<String>,
         #[serde(default)]
         depends_on: Vec<String>,
@@ -347,6 +624,7 @@ pub enum ApiRequest {
     /// owns worker creation and returns the same authoritative agent stream.
     BackgroundDelegate {
         task: String,
+        /// Host-selected directory, not model prose. Absent/empty selects managed work.
         cwd: Option<String>,
         #[serde(default)]
         depends_on: Vec<String>,
@@ -368,9 +646,13 @@ pub enum ApiRequest {
     /// `tachyon list` (aliases: ps, ls)
     AgentList,
     /// `tachyon status [<id>]` — if `Some`, single agent.
-    AgentStatus { id: Option<String> },
+    AgentStatus {
+        id: Option<String>,
+    },
     /// `tachyon cat <id>` (alias: inspect)
-    AgentCat { id: String },
+    AgentCat {
+        id: String,
+    },
     /// `tachyon logs <id> [-f]`
     AgentLogs {
         id: String,
@@ -378,13 +660,22 @@ pub enum ApiRequest {
         lines: u32,
     },
     /// `tachyon stop <id>`
-    AgentStop { id: String },
+    AgentStop {
+        id: String,
+    },
     /// Return the daemon-authoritative state without waiting on the worker.
-    AgentAwait { id: String },
+    AgentAwait {
+        id: String,
+    },
     /// Explicitly terminate, persist, and clean up a worker.
-    AgentRelease { id: String },
+    AgentRelease {
+        id: String,
+    },
     /// Stage a worker for delayed termination.
-    AgentStage { id: String, ttl_secs: u64 },
+    AgentStage {
+        id: String,
+        ttl_secs: u64,
+    },
     /// Retain a worker session, optionally until a Unix timestamp.
     AgentRetain {
         id: String,
@@ -393,35 +684,63 @@ pub enum ApiRequest {
         lifetime_class: Option<LifetimeClass>,
     },
     /// Replace a worker while retaining its id and dependencies.
-    AgentReplan { id: String, task: String },
+    AgentReplan {
+        id: String,
+        task: String,
+    },
     /// `tachyon interrupt <id>`
-    AgentInterrupt { id: String },
+    AgentInterrupt {
+        id: String,
+    },
     /// `tachyon kill <id>`
-    AgentKill { id: String },
+    AgentKill {
+        id: String,
+    },
     /// `tachyon resume <id>`
-    AgentResume { id: String },
+    AgentResume {
+        id: String,
+    },
     /// `tachyon restart <id>`
-    AgentRestart { id: String },
+    AgentRestart {
+        id: String,
+    },
     /// `tachyon exec <id> -- <cmd>`
-    AgentExec { id: String, command: Vec<String> },
+    AgentExec {
+        id: String,
+        command: Vec<String>,
+    },
     /// `tachyon attach <id>`
-    AgentAttach { id: String },
+    AgentAttach {
+        id: String,
+    },
     /// `tachyon top`
     Top,
     /// Subscribe to an agent's live output stream. Unlike other requests, the
     /// connection stays open and the daemon writes a sequence of `Event`
     /// responses until the agent finishes.
-    AgentSubscribe { id: String },
+    AgentSubscribe {
+        id: String,
+    },
     /// Subscribe to one logical work assignment. Terminal results are replayed
     /// even if its warm worker has since accepted another assignment.
-    WorkSubscribe { work_id: String },
+    WorkSubscribe {
+        work_id: String,
+    },
     /// Send a chat message to a running harness (ghost in `--chat` mode).
-    AgentChat { id: String, text: String },
+    AgentChat {
+        id: String,
+        text: String,
+    },
     /// Send a user chat message to the foreground. The foreground replies
     /// asynchronously; subscribe via `ForegroundSubscribe` to receive its
     /// stream (text tokens + agent spawns).
     #[serde(alias = "orchestrator_chat")]
-    ForegroundChat { text: String },
+    ForegroundChat {
+        text: String,
+        /// Host-selected absolute directory. Omitted means an isolated managed workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
     /// Subscribe to the foreground conversation stream.
     #[serde(alias = "orchestrator_subscribe")]
     ForegroundSubscribe,
@@ -792,6 +1111,61 @@ pub struct ArtifactRegistration {
     pub generation: Option<u64>,
     pub assignment: Option<u64>,
     pub attempt_id: Option<String>,
+    /// Missing on legacy hash-only registrations; never implies durable publication.
+    #[serde(default)]
+    pub publication: ArtifactPublication,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ArtifactPublication {
+    #[default]
+    Pending,
+    Ready {
+        version: String,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+#[cfg(test)]
+mod artifact_wire_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_hash_only_registration_is_pending_and_ready_ack_round_trips() {
+        let legacy = serde_json::json!({
+            "id":"a", "path":"report.txt", "kind":"report", "description":"report",
+            "size_bytes":3, "sha256":"abc"
+        });
+        let mut artifact: ArtifactRegistration = serde_json::from_value(legacy).unwrap();
+        assert_eq!(artifact.publication, ArtifactPublication::Pending);
+        artifact.publication = ArtifactPublication::Ready {
+            version: "abc".into(),
+        };
+        let ack = ApiResponse::Artifact {
+            artifact: Some(artifact),
+        };
+        let decoded: ApiResponse =
+            serde_json::from_str(&serde_json::to_string(&ack).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(ack).unwrap(),
+            serde_json::to_value(decoded).unwrap()
+        );
+        for json in [
+            r#"{"cmd":"artifact_get","scope":"work","id":"a"}"#,
+            r#"{"cmd":"artifact_list","scope":"work","after":null,"limit":10}"#,
+            r#"{"cmd":"artifact_read","scope":"work","id":"a","offset":0,"limit":10}"#,
+        ] {
+            let request: ApiRequest = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ApiRequest>(&serde_json::to_string(&request).unwrap())
+                    .unwrap(),
+                request
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -973,6 +1347,55 @@ pub struct EventEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApiResponse {
+    LocalRetention {
+        id: String,
+        archived: bool,
+    },
+    CampaignAcceptance {
+        request: Option<crate::campaign::AcceptanceRequest>,
+        receipt: Option<crate::campaign::AcceptanceReceipt>,
+    },
+    CampaignAttentionList {
+        questions: Vec<crate::work::Attention>,
+        next_cursor: Option<String>,
+    },
+    CampaignAttentionAnswered {
+        attention: crate::work::Attention,
+    },
+    CampaignInspection {
+        campaign: Campaign,
+        diagnostics: Vec<String>,
+    },
+    CampaignIntegration {
+        report: serde_json::Value,
+    },
+    CampaignProgress {
+        campaign: Campaign,
+        activity: CampaignActivity,
+    },
+    Artifact {
+        artifact: Option<ArtifactRegistration>,
+    },
+    ArtifactList {
+        artifacts: Vec<ArtifactRegistration>,
+    },
+    ArtifactBytes {
+        bytes: Vec<u8>,
+    },
+    Research {
+        research: Research,
+    },
+    ResearchList {
+        records: Vec<Research>,
+        next_after: Option<String>,
+    },
+    Campaign {
+        campaign: Campaign,
+    },
+    CampaignList {
+        campaigns: Vec<Campaign>,
+        next_after: Option<String>,
+    },
     /// A generic success with an optional message.
     Ok {
         message: Option<String>,
@@ -1073,6 +1496,113 @@ impl ApiResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn research_campaign_wire_round_trips() {
+        let requests = [
+            ApiRequest::ResearchCreate {
+                command_id: "r".into(),
+                title: "Title".into(),
+                objective: "Objective".into(),
+            },
+            ApiRequest::ResearchGet {
+                id: "research-id".into(),
+            },
+            ApiRequest::ResearchList {
+                after: Some("research-id".into()),
+                limit: 2,
+            },
+            ApiRequest::CampaignCreate {
+                command_id: "c".into(),
+                research_id: "research-id".into(),
+                title: "Draft".into(),
+                objective: "Not executed".into(),
+            },
+            ApiRequest::CampaignGet {
+                id: "campaign-id".into(),
+            },
+            ApiRequest::CampaignList {
+                research_id: Some("research-id".into()),
+                after: None,
+                limit: 2,
+            },
+        ];
+        let names = [
+            "research_create",
+            "research_get",
+            "research_list",
+            "campaign_create",
+            "campaign_get",
+            "campaign_list",
+        ];
+        for (request, name) in requests.into_iter().zip(names) {
+            let wire = serde_json::to_value(&request).unwrap();
+            assert_eq!(wire["cmd"], name);
+            assert_eq!(serde_json::from_value::<ApiRequest>(wire).unwrap(), request);
+        }
+        assert_eq!(
+            serde_json::from_str::<ApiRequest>(r#"{"cmd":"research_list"}"#).unwrap(),
+            ApiRequest::ResearchList {
+                after: None,
+                limit: 50
+            }
+        );
+        let research = Research {
+            id: "research-id".into(),
+            title: "Title".into(),
+            objective: "Objective".into(),
+            created_at_ms: 123,
+        };
+        let campaign = Campaign {
+            id: "campaign-id".into(),
+            research_id: research.id.clone(),
+            title: "Draft".into(),
+            objective: "Not executed".into(),
+            created_at_ms: 124,
+            status: CampaignStatus::Draft,
+        };
+        for response in [
+            ApiResponse::Research {
+                research: research.clone(),
+            },
+            ApiResponse::ResearchList {
+                records: vec![research],
+                next_after: Some("research-id".into()),
+            },
+            ApiResponse::Campaign {
+                campaign: campaign.clone(),
+            },
+            ApiResponse::CampaignList {
+                campaigns: vec![campaign],
+                next_after: None,
+            },
+        ] {
+            let wire = serde_json::to_value(&response).unwrap();
+            let decoded: ApiResponse = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+        }
+        assert_eq!(
+            serde_json::to_string(&CampaignStatus::Draft).unwrap(),
+            "\"draft\""
+        );
+        for (status, name) in [
+            (CampaignStatus::Running, "running"),
+            (CampaignStatus::Cancelling, "cancelling"),
+            (CampaignStatus::Cancelled, "cancelled"),
+            (CampaignStatus::Accepted, "accepted"),
+            (CampaignStatus::Rejected, "rejected"),
+            (CampaignStatus::Unverified, "unverified"),
+            (CampaignStatus::Interrupted, "interrupted"),
+        ] {
+            let wire = serde_json::to_string(&status).unwrap();
+            assert_eq!(wire, format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<CampaignStatus>(&wire).unwrap(),
+                status
+            );
+        }
+        assert!(serde_json::from_str::<CampaignStatus>("\"unknown-status\"").is_err());
+    }
 
     #[test]
     fn lifecycle_requests_use_stable_wire_names_and_fields() {
@@ -1199,6 +1729,9 @@ mod tests {
     #[test]
     fn work_protocol_preserves_identity_and_separates_failure_from_evidence() {
         let request = WorkRequest {
+            context_refs: vec![],
+            constraints: None,
+            attempt: None,
             work_id: "work-1".into(),
             objective: "verify the latest release".into(),
             generation: 4,
@@ -1210,6 +1743,12 @@ mod tests {
         assert_eq!(serde_json::from_str::<WorkRequest>(&wire).unwrap(), request);
 
         let result = WorkResult {
+            final_context: None,
+            attempt_id: None,
+            candidate_refs: None,
+            instruction_revision: None,
+            evidence: Default::default(),
+            timing: None,
             work_id: request.work_id,
             objective: request.objective,
             generation: request.generation,
@@ -1225,6 +1764,43 @@ mod tests {
         assert!(wire.contains(r#""outcome":"timed_out""#));
         assert!(!wire.contains(r#""result":""#));
         assert!(result.outcome.completed_result().is_none());
+        assert!(!wire.contains("timing"));
+        assert!(!wire.contains("final_context"));
+        let mut timed = result.clone();
+        timed.final_context = Some(crate::context::WorkerContextMetadata {
+            activated_packages: [("artifact".into(), "observed".into())].into(),
+            known_output_handles: vec!["output:local".into()],
+        });
+        timed.timing = Some(WorkTiming {
+            execution_ms: Some(100),
+            inference_ms: Some(60),
+            tool_ms: Some(20),
+            review_ms: Some(10),
+        });
+        assert_eq!(
+            serde_json::from_value::<WorkResult>(serde_json::to_value(&timed).unwrap()).unwrap(),
+            timed
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkTiming>("{}").unwrap(),
+            WorkTiming::default()
+        );
+        let mut legacy = serde_json::to_value(&result).unwrap();
+        legacy.as_object_mut().unwrap().remove("evidence");
+        assert!(serde_json::from_value::<WorkResult>(legacy.clone())
+            .unwrap()
+            .final_context
+            .is_none());
+        assert!(serde_json::from_value::<WorkResult>(legacy.clone())
+            .unwrap()
+            .timing
+            .is_none());
+        assert_eq!(
+            serde_json::from_value::<WorkResult>(legacy)
+                .unwrap()
+                .evidence,
+            WorkEvidence::default()
+        );
     }
 
     #[test]
@@ -1328,7 +1904,8 @@ mod tests {
             serde_json::from_str::<ApiRequest>(r#"{"cmd":"orchestrator_chat","text":"hello"}"#)
                 .unwrap(),
             ApiRequest::ForegroundChat {
-                text: "hello".into()
+                text: "hello".into(),
+                cwd: None,
             }
         );
         assert_eq!(
@@ -1341,11 +1918,18 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&ApiRequest::ForegroundChat {
-                text: "hello".into()
+                text: "hello".into(),
+                cwd: None,
             })
             .unwrap(),
             r#"{"cmd":"foreground_chat","text":"hello"}"#
         );
+        let selected = ApiRequest::ForegroundChat {
+            text: "hello".into(),
+            cwd: Some("/project/selected".into()),
+        };
+        let wire = serde_json::to_string(&selected).unwrap();
+        assert_eq!(serde_json::from_str::<ApiRequest>(&wire).unwrap(), selected);
     }
 
     #[test]

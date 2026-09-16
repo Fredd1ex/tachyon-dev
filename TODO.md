@@ -1,5 +1,14 @@
 # Tachyon TODO
 
+## Local Ghost Status
+
+The **bounded local Ghost feature milestone implemented and locally validated** verdict is scoped
+in [COMPLETION](docs/ghost/COMPLETION.md). It does not complete the original security,
+scalability, interaction or cross-Research roadmap. Default workspace tests and all
+29 opt-in daemon tests pass, including parallel and serial runs; see the recorded
+commands/results and deferred release gates before promotion. Campaign execution remains
+explicit opt-in; no default configuration or model/budget authority changes.
+
 ## North Star
 
 Make Tachyon feel like talking to a capable person: responsive, concurrent,
@@ -99,13 +108,19 @@ Do not implement until the interaction milestone is working end to end.
 
 ## Deferred: Resources And MicroVMs
 
-Do not implement until the interaction milestone is working end to end.
+Complete the feature interface and deterministic local fixtures first, then enter
+the isolation and release phase. Local research is not safe for untrusted code.
+Firecracker is the target backend; this plan adds no implementation or dependencies.
 
 - [ ] Add resource profiles for CPU, memory, disk, GPU, and runtime versions.
 - [ ] Add resource allocation, queuing, and release events.
 - [ ] Add Tachyond-owned lifecycle leases and idle timeouts.
 - [ ] Add SIGTERM, grace period, and SIGKILL escalation in Tachyond.
 - [ ] Add Firecracker-backed execution behind the existing backend abstraction.
+- [ ] Export validated artifacts to authorized destinations under `~/Agents` through
+  host-owned staging/publication, never a whole-home mount or arbitrary guest writes.
+- [ ] Enforce the [security contract](docs/ghost/SECURITY.md) and independent audit
+  release gate before claiming untrusted-research isolation.
 - [ ] Support reproducible environments such as Python 3.10 plus ML dependencies.
 - [ ] Recover and clean up environments after daemon or Orchestrator failure.
 

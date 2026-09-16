@@ -245,14 +245,7 @@ async fn review(
             "background model unavailable",
         );
     };
-    let prompt = tachyon_orchestrator::background::prompt::review_system_prompt(
-        tachyon_orchestrator::background::prompt::PromptContext { persona },
-    );
-    let input = serde_json::to_string(request).unwrap_or_default();
-    let messages = vec![
-        ChatMessage::new(Role::System, prompt),
-        ChatMessage::new(Role::User, input),
-    ];
+    let messages = review_messages(request, persona);
     let tool = review_tool();
     let timeout = review_execution_timeout(request.deadline_ms, unix_now_ms(), review_timeout());
     let mut relay = |_delta: &str| {};
@@ -331,6 +324,19 @@ async fn review(
         },
     };
     decision(request, recommendation, parsed.rationale)
+}
+
+fn review_messages(request: &WorkReviewRequest, persona: Option<&str>) -> Vec<ChatMessage> {
+    let prompt = tachyon_orchestrator::background::prompt::review_system_prompt(
+        tachyon_orchestrator::background::prompt::PromptContext { persona },
+    );
+    vec![
+        ChatMessage::new(Role::System, prompt),
+        ChatMessage::new(
+            Role::User,
+            serde_json::to_string(request).unwrap_or_default(),
+        ),
+    ]
 }
 
 fn model_from_config(
@@ -465,7 +471,13 @@ mod tests {
             review_id: "review-1".into(),
             coordinator_generation: 2,
             candidate: WorkResult {
+                attempt_id: None,
+                candidate_refs: None,
+                final_context: None,
+                instruction_revision: None,
                 work_id: "work-1".into(),
+                evidence: Default::default(),
+                timing: None,
                 objective: "verify release".into(),
                 generation: 3,
                 assignment: 4,
@@ -483,6 +495,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_model_preserves_review_identity_without_fabricating_inference() {
+        let request = request(WorkOutcome::Completed {
+            result: "fixture evidence".into(),
+            artifacts: Vec::new(),
+            context: String::new(),
+            suggested_reuse: false,
+        });
+        let decision = review(&request, None, None).await;
+        assert_eq!(decision.review_id, request.review_id);
+        assert_eq!(
+            decision.coordinator_generation,
+            request.coordinator_generation
+        );
+        assert_eq!(decision.work_id, request.candidate.work_id);
+        assert_eq!(decision.generation, request.candidate.generation);
+        assert_eq!(decision.assignment, request.candidate.assignment);
+        assert!(matches!(
+            decision.recommendation,
+            WorkReviewRecommendation::Inconclusive {
+                failure: WorkReviewFailure::ModelUnavailable,
+            }
+        ));
+        assert!(request.candidate.timing.is_none());
+    }
+
+    #[tokio::test]
     async fn invalid_non_completed_candidate_fails_closed_without_a_model() {
         let decision = review(
             &request(WorkOutcome::TimedOut { deadline_ms: 1 }),
@@ -496,6 +534,46 @@ mod tests {
                 failure: WorkReviewFailure::InvalidRequest
             }
         ));
+    }
+
+    #[test]
+    fn review_message_preserves_structured_hostcall_results_as_untrusted_data() {
+        let mut request = request(WorkOutcome::Completed {
+            result: "fixture.lua:2".into(),
+            artifacts: Vec::new(),
+            context: String::new(),
+            suggested_reuse: false,
+        });
+        let tools = &mut request.candidate.evidence.tools;
+        tools.push(tachyon_api::types::WorkToolEvidence {
+            call_id: Some("python-1-2".into()),
+            parent_call_id: Some("cell-0".into()),
+            tool_name: "read".into(),
+            arguments: json!({"path":"fixture.lua","offset":2,"limit":1}),
+            output: json!({"content":"return 'fixture'", "is_error":false, "truncated":false, "metadata":{"path":"fixture.lua"}}),
+        });
+        tools.push(tachyon_api::types::WorkToolEvidence {
+            call_id: Some("cell-1".into()),
+            parent_call_id: None,
+            tool_name: "ipython".into(),
+            arguments: json!({"code":"raise ValueError('fixture')"}),
+            output: json!({"content":"ValueError: fixture", "is_error":true, "truncated":false, "metadata":{"exit_code":1}}),
+        });
+        request.candidate.evidence.omitted = 2;
+        let messages = review_messages(&request, None);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[1].role, Role::User);
+        let tachyon_model::Content::Text(input) = &messages[1].content[0] else {
+            panic!("expected review input");
+        };
+        let received: WorkReviewRequest = serde_json::from_str(input).unwrap();
+        assert_eq!(received, request);
+        assert_eq!(
+            received.candidate.evidence.tools[1].output["is_error"],
+            true
+        );
+        assert!(input.len() < MAX_REVIEW_INPUT_CHARS);
     }
 
     #[tokio::test]

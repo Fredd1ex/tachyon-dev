@@ -8,8 +8,15 @@ use serde_json::json;
 use std::path::PathBuf;
 use thiserror::Error;
 
+pub mod accounting;
+#[cfg(unix)]
+pub mod broker;
+use accounting::{AccountingContext, RequestUsage};
+
 #[derive(Debug, Error)]
 pub enum ModelError {
+    #[error("model accounting: {0}")]
+    Accounting(String),
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("io error: {0}")]
@@ -265,6 +272,7 @@ fn to_wire(m: &ChatMessage) -> WireMessage {
 }
 
 /// A completed assistant message distilled from the stream.
+#[derive(Serialize, Deserialize)]
 pub struct Completion {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
@@ -274,7 +282,7 @@ pub struct Completion {
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     #[serde(default)]
     pub prompt_tokens: u32,
@@ -598,6 +606,30 @@ pub struct Model {
 }
 
 impl Model {
+    /// Redact literal provider credentials and bearer text, not encoded secrets or
+    /// arbitrary credentials in user-authored code and inputs.
+    pub fn redact_trace(&self, text: &str) -> String {
+        let text = if self.api_key.is_empty() {
+            text.to_owned()
+        } else {
+            text.replace(&self.api_key, "[REDACTED]")
+        };
+        let lower = text.to_ascii_lowercase();
+        let mut redacted = String::with_capacity(text.len());
+        let mut offset = 0;
+        while let Some(index) = lower[offset..].find("bearer ") {
+            let start = offset + index + 7;
+            let end = text[start..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'))
+                .map_or(text.len(), |n| start + n);
+            redacted.push_str(&text[offset..start]);
+            redacted.push_str("[REDACTED]");
+            offset = end;
+        }
+        redacted.push_str(&text[offset..]);
+        redacted
+    }
+
     pub fn new(config: ModelConfig) -> Self {
         Self {
             base_url: config.base_url,
@@ -623,7 +655,7 @@ impl Model {
         tools: Option<&[ToolSpec]>,
         on_delta: &mut (dyn FnMut(&str) + Send),
     ) -> Result<Completion> {
-        self.chat_with_tool_choice(messages, tools, None, on_delta)
+        self.chat_with_tool_choice(messages, tools, None, on_delta, None)
             .await
     }
 
@@ -636,8 +668,34 @@ impl Model {
         streamed_argument: (&str, &str),
         on_delta: &mut (dyn FnMut(&str) + Send),
     ) -> Result<Completion> {
-        self.chat_with_tool_choice(messages, Some(tools), Some(streamed_argument), on_delta)
-            .await
+        self.chat_with_tool_choice(
+            messages,
+            Some(tools),
+            Some(streamed_argument),
+            on_delta,
+            None,
+        )
+        .await
+    }
+
+    /// One billed provider attempt. Call again for a retry, with the same work
+    /// identity; the accountant must issue a fresh reservation each time.
+    pub async fn chat_accounted(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[ToolSpec]>,
+        streamed_argument: Option<(&str, &str)>,
+        on_delta: &mut (dyn FnMut(&str) + Send),
+        accounting: &AccountingContext<'_>,
+    ) -> Result<Completion> {
+        self.chat_with_tool_choice(
+            messages,
+            tools,
+            streamed_argument,
+            on_delta,
+            Some(accounting),
+        )
+        .await
     }
 
     async fn chat_with_tool_choice(
@@ -646,6 +704,7 @@ impl Model {
         tools: Option<&[ToolSpec]>,
         streamed_argument: Option<(&str, &str)>,
         on_delta: &mut (dyn FnMut(&str) + Send),
+        accounting: Option<&AccountingContext<'_>>,
     ) -> Result<Completion> {
         let context = fit_context(messages, self.context_length);
         let wire: Vec<WireMessage> = context.iter().map(to_wire).collect();
@@ -675,6 +734,19 @@ impl Model {
             }
         }
 
+        if let Some(context) = accounting {
+            // OpenRouter's output limit is max_tokens (including reasoning).
+            body.as_object_mut()
+                .unwrap()
+                .remove("max_completion_tokens");
+            body["max_tokens"] = json!(context.request.estimate.output_tokens);
+            body["provider"] = json!({
+                "only": [context.request.estimate.provider],
+                "allow_fallbacks": false,
+                "require_parameters": true,
+            });
+        }
+
         if self.debug {
             if let Some(log_path) = &self.debug_log {
                 if let Some(dir) = log_path.parent() {
@@ -697,83 +769,152 @@ impl Model {
             }
         }
 
-        let resp = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        // Accounted requests pin routing and prohibit invisible redirect/retry
+        // dispatch. Host bounds cover this exact serialized body, not fit_context's
+        // heuristic. No accounting state is added to the provider wire payload.
+        let accounted_http;
+        let http = if let Some(context) = accounting {
+            let estimate = &context.request.estimate;
+            estimate.upper_bound()?;
+            if estimate.base_url != self.base_url
+                || estimate.model != self.model
+                || self.max_completion_tokens != Some(estimate.output_tokens)
+            {
+                return Err(ModelError::Accounting(
+                    "request does not match host bounds".into(),
+                ));
+            }
+            if serde_json::to_vec(&body)
+                .map_err(|e| ModelError::Accounting(e.to_string()))?
+                .len() as u64
+                > estimate.max_request_bytes
+            {
+                return Err(ModelError::Accounting(
+                    "wire request exceeds host byte bound".into(),
+                ));
+            }
+            accounted_http = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .build()?;
+            &accounted_http
+        } else {
+            &self.http
+        };
+        let mut billed_usage = RequestUsage::Unknown;
+        let mut billing_done = false;
+        accounting::dispatch(accounting, || async {
+            let resp = http
+                .post(format!("{}/chat/completions", self.base_url))
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ModelError::Api(format!("status {status}: {text}")));
-        }
-
-        let mut text = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut finish_reason: Option<String> = None;
-        let mut usage = TokenUsage::default();
-        let mut argument_stream = streamed_argument
-            .map(|(tool_name, argument_name)| ToolArgumentStream::new(tool_name, argument_name));
-
-        let mut stream = resp.bytes_stream();
-        let mut buf = Vec::new();
-        'stream: while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            buf.extend_from_slice(&chunk);
-            while let Some(event) = take_sse_event(&mut buf) {
-                let data = sse_data(&event);
-                if data == b"[DONE]" {
-                    break 'stream;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                if accounting.is_some() {
+                    return Err(ModelError::Api(format!("status {status}")));
                 }
-                if let Ok(chunk) = serde_json::from_slice::<SseChunk>(&data) {
-                    if let Some(chunk_usage) = chunk.usage {
-                        usage = chunk_usage;
+                let text = resp.text().await.unwrap_or_default();
+                return Err(ModelError::Api(format!("status {status}: {text}")));
+            }
+
+            let mut text = String::new();
+            let mut tool_calls: Vec<ToolCall> = Vec::new();
+            let mut finish_reason: Option<String> = None;
+            let mut usage = TokenUsage::default();
+            let mut argument_stream = streamed_argument.map(|(tool_name, argument_name)| {
+                ToolArgumentStream::new(tool_name, argument_name)
+            });
+
+            let mut stream = resp.bytes_stream();
+            let mut buf = Vec::new();
+            let mut response_bytes = 0usize;
+            'stream: while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                if accounting.is_some() {
+                    response_bytes = response_bytes.saturating_add(chunk.len());
+                    if response_bytes > 1024 * 1024 {
+                        return Err(ModelError::Api("accounted response byte limit".into()));
                     }
-                    for choice in chunk.choices {
-                        if let Some(fr) = &choice.finish_reason {
-                            if !fr.is_empty() {
-                                finish_reason = Some(fr.clone());
-                            }
+                }
+                buf.extend_from_slice(&chunk);
+                while let Some(event) = take_sse_event(&mut buf) {
+                    let data = sse_data(&event);
+                    if data == b"[DONE]" {
+                        billing_done = true;
+                        break 'stream;
+                    }
+                    if accounting.is_some() && !data.is_empty() {
+                        let raw: serde_json::Value =
+                            serde_json::from_slice(&data).map_err(|e| {
+                                ModelError::Api(format!("malformed billing stream: {e}"))
+                            })?;
+                        if raw.get("error").is_some() {
+                            return Err(ModelError::Api("provider stream error".into()));
                         }
-                        if let Some(content) = choice.delta.content {
-                            if streamed_argument.is_none() {
-                                on_delta(&content);
+                        if let Some(value) = raw.get("usage").filter(|v| !v.is_null()) {
+                            let parsed = accounting::openrouter_usage(value)
+                                .ok_or_else(|| ModelError::Api("malformed billing usage".into()))?;
+                            if billed_usage != RequestUsage::Unknown && billed_usage != parsed {
+                                return Err(ModelError::Api("conflicting billing usage".into()));
                             }
-                            text.push_str(&content);
+                            billed_usage = parsed;
                         }
-                        if let Some(tcs) = choice.delta.tool_calls {
-                            for tc in tcs {
-                                // Pad the vec by index so partial args append.
-                                while tool_calls.len() <= tc.index {
-                                    tool_calls.push(ToolCall {
-                                        id: String::new(),
-                                        name: String::new(),
-                                        arguments: String::new(),
-                                    });
+                    }
+                    if let Ok(chunk) = serde_json::from_slice::<SseChunk>(&data) {
+                        if let Some(chunk_usage) = chunk.usage {
+                            usage = chunk_usage;
+                        }
+                        for choice in chunk.choices {
+                            if let Some(fr) = &choice.finish_reason {
+                                if !fr.is_empty() {
+                                    finish_reason = Some(fr.clone());
                                 }
-                                let idx = tc.index;
-                                if let Some(id) = tc.id {
-                                    tool_calls[idx].id = id;
+                            }
+                            if let Some(content) = choice.delta.content {
+                                if streamed_argument.is_none() {
+                                    on_delta(&content);
                                 }
-                                if let Some(f) = tc.function {
-                                    if idx == 0 {
-                                        if let Some(stream) = argument_stream.as_mut() {
-                                            if let Some(delta) = stream
-                                                .push(f.name.as_deref(), f.arguments.as_deref())
-                                            {
-                                                on_delta(&delta);
+                                text.push_str(&content);
+                            }
+                            if let Some(tcs) = choice.delta.tool_calls {
+                                for tc in tcs {
+                                    if accounting.is_some() && tc.index >= 64 {
+                                        return Err(ModelError::Api(
+                                            "accounted tool call limit".into(),
+                                        ));
+                                    }
+                                    // Pad the vec by index so partial args append.
+                                    while tool_calls.len() <= tc.index {
+                                        tool_calls.push(ToolCall {
+                                            id: String::new(),
+                                            name: String::new(),
+                                            arguments: String::new(),
+                                        });
+                                    }
+                                    let idx = tc.index;
+                                    if let Some(id) = tc.id {
+                                        tool_calls[idx].id = id;
+                                    }
+                                    if let Some(f) = tc.function {
+                                        if idx == 0 {
+                                            if let Some(stream) = argument_stream.as_mut() {
+                                                if let Some(delta) = stream
+                                                    .push(f.name.as_deref(), f.arguments.as_deref())
+                                                {
+                                                    on_delta(&delta);
+                                                }
                                             }
                                         }
-                                    }
-                                    if let Some(name) = f.name {
-                                        tool_calls[idx].name.push_str(&name);
-                                    }
-                                    if let Some(args) = f.arguments {
-                                        tool_calls[idx].arguments.push_str(&args);
+                                        if let Some(name) = f.name {
+                                            tool_calls[idx].name.push_str(&name);
+                                        }
+                                        if let Some(args) = f.arguments {
+                                            tool_calls[idx].arguments.push_str(&args);
+                                        }
                                     }
                                 }
                             }
@@ -781,21 +922,29 @@ impl Model {
                     }
                 }
             }
-        }
-        if let Some(stream) = argument_stream.as_mut() {
-            if let Some(delta) = stream.finish() {
-                on_delta(&delta);
+            if let Some(stream) = argument_stream.as_mut() {
+                if let Some(delta) = stream.finish() {
+                    on_delta(&delta);
+                }
             }
-        }
 
-        usage.context_tokens = usage.prompt_tokens;
-        usage.context_window = self.context_length;
-        Ok(Completion {
-            text,
-            tool_calls,
-            usage,
-            finish_reason,
+            usage.context_tokens = usage.prompt_tokens;
+            usage.context_window = self.context_length;
+            Ok((
+                Completion {
+                    text,
+                    tool_calls,
+                    usage,
+                    finish_reason,
+                },
+                if billing_done {
+                    billed_usage
+                } else {
+                    RequestUsage::Unknown
+                },
+            ))
         })
+        .await
     }
 }
 
@@ -863,7 +1012,7 @@ fn fit_context(messages: &[ChatMessage], limit: Option<u32>) -> Vec<ChatMessage>
 }
 
 /// A tool definition sent to the model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,

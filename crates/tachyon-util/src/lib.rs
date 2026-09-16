@@ -6,3 +6,4 @@ pub mod config;
 pub mod credentials;
 pub mod daemon;
 pub mod guard;
+pub mod process;

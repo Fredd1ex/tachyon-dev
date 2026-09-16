@@ -36,6 +36,7 @@ pub(crate) fn walk(
         .standard_filters(true)
         .follow_links(false)
         .hidden(!options.hidden)
+        .filter_entry(|entry| entry.file_name() != super::path::NATIVE_WRITE_LOCK_DIRECTORY)
         .require_git(false)
         .sort_by_file_name(|left, right| left.cmp(right));
 

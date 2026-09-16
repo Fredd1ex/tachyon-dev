@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub const USAGE: &str = include_str!("usage.md");
+pub const INTERFACE: &str = "`artifact` requests durable publication of an existing workspace file by path, kind, and description; its result is pending until daemon ready metadata confirms publication.";
 
 use std::fmt::Write as _;
 
@@ -34,7 +35,7 @@ impl ArtifactTool {
         Self {
             schema: ToolSpec::new(
                 "artifact",
-                "Register an existing workspace file as a typed, SHA-256-hashed artifact without copying its bytes.",
+                "Request durable publication of a workspace file. Returns pending, not a host publication acknowledgement.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -73,6 +74,27 @@ impl Tool for ArtifactTool {
                 return Err(ToolError::invalid(
                     "description must contain between 1 and 4096 bytes",
                 ));
+            }
+            let requested = context.cwd.join(&input.path);
+            let relative = requested
+                .strip_prefix(&context.workspace_root)
+                .map_err(|_| ToolError::invalid("artifact must be inside the workspace"))?;
+            let mut checked = context.workspace_root.clone();
+            for component in relative.components() {
+                if !matches!(component, std::path::Component::Normal(_)) {
+                    return Err(ToolError::invalid(
+                        "artifact path may not contain traversal",
+                    ));
+                }
+                checked.push(component);
+                if tokio::fs::symlink_metadata(&checked)
+                    .await
+                    .map_err(io_error)?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return Err(ToolError::invalid("artifact path may not contain symlinks"));
+                }
             }
             let path = resolve_existing(context, &input.path).await?;
             let before = tokio::fs::metadata(&path).await.map_err(io_error)?;
@@ -133,7 +155,7 @@ impl Tool for ArtifactTool {
             }
             let registration = ArtifactRegistration {
                 id: Uuid::new_v4().to_string(),
-                path: input.path.clone(),
+                path: relative.to_string_lossy().into_owned(),
                 kind: input.kind.as_str().into(),
                 description: input.description,
                 size_bytes: total,
@@ -143,6 +165,7 @@ impl Tool for ArtifactTool {
                 generation: context.identity.generation,
                 assignment: context.identity.assignment,
                 attempt_id: context.identity.attempt_id.clone(),
+                publication: Default::default(),
             };
             context
                 .event_sink
@@ -156,7 +179,10 @@ impl Tool for ArtifactTool {
                 })?;
 
             Ok(ToolResult::success(
-                format!("registered artifact {}", input.path),
+                format!(
+                    "artifact publication pending for {}; await daemon ready metadata",
+                    input.path
+                ),
                 json!({
                     "artifact": registration,
                     "bytes_copied": 0,
@@ -252,6 +278,7 @@ mod tests {
             cwd: root.clone(),
             identity: ToolIdentity {
                 call_id: None,
+                parent_call_id: None,
                 task_id: Some("task-1".into()),
                 work_id: Some("work-1".into()),
                 generation: Some(2),
@@ -263,6 +290,7 @@ mod tests {
             policy: Arc::new(ToolPolicy::worker_default(root)),
             event_sink: sink,
             output_store: Arc::new(NoopOutputStore),
+            host_service: None,
         }
     }
 
@@ -283,6 +311,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.metadata["artifact"]["size_bytes"], 3);
+        assert_eq!(
+            result.metadata["artifact"]["publication"]["state"],
+            "pending"
+        );
+        assert!(result.content.contains("pending"));
         assert_eq!(
             result.metadata["artifact"]["sha256"],
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"

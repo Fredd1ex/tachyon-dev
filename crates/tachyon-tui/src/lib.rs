@@ -11,13 +11,15 @@
 //!   Tab          toggle floating agent pane
 //!   Up / Down    select adjacent turns and expand traces
 //!   PageUp/Down  page within or select trace turns
+//!   Ctrl+L       hide/show previous visits without deleting history
 //!   End          return to the latest turn
 //!   Ctrl+O       toggle inline traces for the current turn
-//!   y             copy the selected chat cell
-//!   Ctrl+Shift+C  copy the selected or latest chat cell
+//!   y             copy the selected or latest chat cell (empty input)
+//!   Drag          native terminal text selection (default)
+//!   Ctrl+Shift+C  terminal Copy (cell copy only in /mouse capture mode)
 //!   Ctrl+C / Esc / /exit  quit
 //!
-//! Slash commands: /exit, /await, /stop, /release, /replan, /kill
+//! Slash commands: /mouse, /exit, /await, /stop, /release, /replan, /kill
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -53,6 +55,42 @@ use tachyon_api::{
 };
 
 use tachyon_client::{Client, Subscription};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MouseCapture(bool);
+
+impl MouseCapture {
+    fn apply(self, writer: &mut impl io::Write) -> io::Result<()> {
+        if self.0 {
+            writer.execute(EnableMouseCapture)?;
+        } else {
+            // Clear stale reporting modes too, not just our own opt-in state.
+            writer.execute(DisableMouseCapture)?;
+        }
+        Ok(())
+    }
+
+    fn toggle(&mut self, apply: impl FnOnce(Self) -> io::Result<()>) -> String {
+        let next = Self(!self.0);
+        match apply(next) {
+            Ok(()) => {
+                *self = next;
+                self.label().into()
+            }
+            Err(error) => {
+                format!("Mouse toggle failed: {error}; terminal mode may be partial; retry /mouse")
+            }
+        }
+    }
+
+    fn label(self) -> &'static str {
+        if self.0 {
+            "Mouse: capture ON (click/wheel); /mouse for native selection"
+        } else {
+            "Mouse: native selection (drag + terminal Copy); /mouse for clicks"
+        }
+    }
+}
 
 // Restrained semantic vocabulary for diagnostic UI. Keep conversation chrome
 // separate so the resting Freddie/Jarvis visual contract does not drift.
@@ -151,6 +189,7 @@ enum ItemKind {
 
 /// One line in a thread.
 struct Item {
+    work: Option<WorkDetail>,
     kind: ItemKind,
     text: String,
     /// When true, the item's body is hidden (collapsed); a click/hotkey on its
@@ -164,6 +203,24 @@ struct Item {
     turn: Option<String>,
     timestamp: u64,
     revision: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AssignmentKey {
+    work_id: String,
+    generation: u64,
+    assignment: u64,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct WorkDetail {
+    #[serde(skip)]
+    raw_open: bool,
+    key: AssignmentKey,
+    slot: Option<usize>,
+    tool: Option<tachyon_api::types::WorkToolEvidence>,
+    timing: Option<tachyon_api::types::WorkTiming>,
+    omitted: u64,
 }
 
 fn sanitize_reply_text(text: &str) -> String {
@@ -185,6 +242,9 @@ fn sanitize_reply_text(text: &str) -> String {
     } else {
         text
     };
+    if !text.contains('\u{fffd}') {
+        return text.to_owned();
+    }
     let cleaned = text
         .lines()
         .filter(|line| {
@@ -206,7 +266,7 @@ fn ready_earlier_turn(threads: &[Thread]) -> Option<u64> {
     thread
         .unread_turns
         .iter()
-        .filter_map(|turn| turn.parse::<u64>().ok())
+        .filter_map(|turn| live_turn_number(turn))
         .min()
 }
 
@@ -216,8 +276,25 @@ fn ready_notice(turn: u64) -> String {
 
 fn mark_ready_turn_seen(threads: &mut [Thread], turn: u64) {
     if let Some(thread) = threads.iter_mut().find(|thread| thread.is_foreground) {
-        thread.unread_turns.remove(&turn.to_string());
+        thread
+            .unread_turns
+            .retain(|id| live_turn_number(id) != Some(turn));
     }
+}
+
+fn live_turn_number(turn: &str) -> Option<u64> {
+    if turn.starts_with("visit:") || turn.starts_with("archived:") {
+        return None;
+    }
+    session_archive::display_turn(turn).parse().ok()
+}
+
+fn later_turn(candidate: &str, turn: &str) -> bool {
+    let namespace = |id: &str| id.rsplit_once(':').map(|(prefix, _)| prefix.to_owned());
+    namespace(candidate) == namespace(turn)
+        && live_turn_number(candidate)
+            .zip(live_turn_number(turn))
+            .is_some_and(|(a, b)| a > b)
 }
 
 fn mark_visible_ready_turns_seen(
@@ -249,6 +326,10 @@ fn mark_visible_ready_turns_seen(
 /// A single agent thread. The foreground thread is root; workers nest under
 /// their parent (or the foreground).
 struct Thread {
+    history_len: usize,
+    history_label: Option<String>,
+    session_started: u64,
+    hide_history: bool,
     id: String,
     parent: Option<String>,
     task: Option<String>,
@@ -308,6 +389,10 @@ struct ScheduleTurnMetrics {
 impl Thread {
     fn new_foreground() -> Self {
         Thread {
+            history_len: 0,
+            history_label: None,
+            session_started: now_seconds(),
+            hide_history: false,
             id: FOREGROUND_ID.into(),
             parent: None,
             task: Some("foreground".into()),
@@ -333,6 +418,7 @@ impl Thread {
     fn reserve_reply(&mut self) {
         self.touch_structure();
         self.items.push(Item {
+            work: None,
             kind: ItemKind::PendingReply,
             text: String::new(),
             hidden: false,
@@ -350,8 +436,7 @@ impl Thread {
         self.last_activity = Instant::now();
         let timestamp = now_seconds();
         if kind == ItemKind::ToolResult {
-            if let Some(last) = self
-                .items
+            if let Some(last) = self.items[self.history_len..]
                 .iter_mut()
                 .rev()
                 .find(|item| item.kind == ItemKind::Tool && item.output.is_none())
@@ -403,6 +488,7 @@ impl Thread {
                     // Start long tool output collapsed (a clickable header);
                     // keep short output visible.
                     self.items.push(Item {
+                        work: None,
                         kind,
                         text,
                         hidden: true,
@@ -414,6 +500,7 @@ impl Thread {
                     });
                 }
                 _ => self.items.push(Item {
+                    work: None,
                     kind,
                     text,
                     hidden: false,
@@ -428,6 +515,12 @@ impl Thread {
     }
 
     fn add_reply_fragment(&mut self, text: String, turn: Option<String>, line_break: bool) {
+        if turn
+            .as_ref()
+            .is_some_and(|turn| self.completed_turns.contains(turn))
+        {
+            return;
+        }
         self.touch();
         self.streaming = true;
         self.last_activity = Instant::now();
@@ -457,6 +550,7 @@ impl Thread {
             return;
         }
         let item = Item {
+            work: None,
             kind: ItemKind::Reply,
             text,
             hidden: false,
@@ -468,13 +562,11 @@ impl Thread {
         };
         let index = turn
             .as_deref()
-            .and_then(|turn| turn.parse::<u64>().ok())
             .and_then(|turn| {
                 self.items.iter().position(|item| {
                     item.turn
                         .as_deref()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .is_some_and(|item_turn| item_turn > turn)
+                        .is_some_and(|item_turn| later_turn(item_turn, turn))
                 })
             })
             .unwrap_or(self.items.len());
@@ -487,16 +579,12 @@ impl Thread {
         self.streaming = false;
         if let Some(completed_turn) = turn.as_deref() {
             let newly_completed = self.completed_turns.insert(completed_turn.to_string());
-            let completed_number = completed_turn.parse::<u64>().ok();
-            let has_later_turn = completed_number.is_some_and(|completed_number| {
-                self.items.iter().any(|item| {
-                    item.kind == ItemKind::User
-                        && item
-                            .turn
-                            .as_deref()
-                            .and_then(|turn| turn.parse::<u64>().ok())
-                            .is_some_and(|turn| turn > completed_number)
-                })
+            let has_later_turn = self.items.iter().any(|item| {
+                item.kind == ItemKind::User
+                    && item
+                        .turn
+                        .as_deref()
+                        .is_some_and(|turn| later_turn(turn, completed_turn))
             });
             if newly_completed && has_later_turn {
                 self.unread_turns.insert(completed_turn.to_string());
@@ -515,7 +603,14 @@ impl Thread {
             self.last_activity = Instant::now();
             return;
         }
-        self.add_reply_fragment(text, turn, false);
+        // A recovered final reply can arrive without a local reservation.
+        let completed = turn
+            .as_ref()
+            .is_some_and(|turn| self.completed_turns.remove(turn));
+        self.add_reply_fragment(text, turn.clone(), false);
+        if completed {
+            self.completed_turns.insert(turn.unwrap());
+        }
         self.streaming = false;
     }
 
@@ -543,6 +638,7 @@ impl Thread {
         self.streaming = false;
         self.items.push(Item {
             kind: ItemKind::Tool,
+            work: None,
             text,
             hidden: true,
             output: None,
@@ -556,16 +652,16 @@ impl Thread {
     fn add_tool_result(&mut self, id: String, text: String, turn: Option<String>) {
         self.touch();
         if let Some(tool) = self.items.iter_mut().rev().find(|item| {
-            item.kind == ItemKind::Tool && item.tool_id.as_deref() == Some(id.as_str())
+            item.kind == ItemKind::Tool
+                && item.tool_id.as_deref() == Some(id.as_str())
+                && item.turn == turn
         }) {
-            tool.output = Some(match tool.output.take() {
-                Some(mut output) => {
-                    output.push('\n');
-                    output.push_str(&text);
-                    output
-                }
-                None => text,
-            });
+            // A terminal snapshot supersedes live output; ToolFinished is a full
+            // result, so replay must replace rather than append its payload.
+            if tool.work.is_some() {
+                return;
+            }
+            tool.output = Some(text);
             tool.hidden = true;
             tool.revision = self.revision;
             return;
@@ -589,6 +685,8 @@ impl Thread {
 
 /// Events from background subscription threads.
 enum TuiEvent {
+    Clipboard(CopyOutcome),
+    Recovered(tachyon_api::types::HistoryEntry),
     Line {
         agent_id: String,
         stream: EventStream,
@@ -630,6 +728,7 @@ enum ClickTarget {
     TraceSummary(usize),
     Worker(usize, String),
     Item(usize, usize),
+    RawEvidence(usize, usize),
 }
 
 /// Per-render-row click target. Rows without a target are `None`.
@@ -897,6 +996,9 @@ fn build_turn_cells(thread: &Thread) -> Vec<TurnCell> {
             cells[cell].items.push(index);
         }
     }
+    if thread.hide_history {
+        cells.retain(|cell| cell.prompt >= thread.history_len);
+    }
     cells
 }
 
@@ -1073,9 +1175,7 @@ fn session_file() -> std::path::PathBuf {
     tachyon_util::daemon::data_dir().join("tui-session.json")
 }
 
-fn daemon_session_file() -> std::path::PathBuf {
-    tachyon_util::daemon::data_dir().join("tui-daemon.pid")
-}
+mod session_archive;
 
 fn now_seconds() -> u64 {
     std::time::SystemTime::now()
@@ -1327,6 +1427,8 @@ struct SessionThread {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SessionItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work: Option<WorkDetail>,
     kind: String,
     text: String,
     #[serde(default)]
@@ -1369,21 +1471,34 @@ fn kind_from_str(s: &str) -> ItemKind {
     }
 }
 
-fn save_session(threads: &[Thread]) {
-    let s: Vec<SessionThread> = threads
+fn session_snapshot(threads: &[Thread]) -> Vec<SessionThread> {
+    threads
         .iter()
+        .filter(|t| !t.id.starts_with("visit:"))
         .map(|t| SessionThread {
             id: t.id.clone(),
             parent: t.parent.clone(),
             task: t.task.clone(),
             is_foreground: t.is_foreground,
-            completed_turns: t.completed_turns.clone(),
+            completed_turns: t
+                .completed_turns
+                .iter()
+                .filter(|id| !id.starts_with("visit:"))
+                .cloned()
+                .collect(),
             unread_turns: t.unread_turns.clone(),
-            metrics: t.metrics.clone(),
+            metrics: t
+                .metrics
+                .iter()
+                .filter(|(id, _)| !id.starts_with("visit:"))
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
             items: t
                 .items
                 .iter()
+                .skip(t.history_len)
                 .map(|i| SessionItem {
+                    work: i.work.clone(),
                     kind: kind_str(&i.kind).to_string(),
                     text: if i.kind == ItemKind::Reply {
                         sanitize_reply_text(&i.text)
@@ -1398,19 +1513,10 @@ fn save_session(threads: &[Thread]) {
                 })
                 .collect(),
         })
-        .collect();
-    if let Ok(json) = serde_json::to_string_pretty(&s) {
-        let _ = std::fs::write(session_file(), json);
-    }
+        .collect()
 }
 
-fn load_session() -> Vec<Thread> {
-    let Ok(data) = std::fs::read_to_string(session_file()) else {
-        return vec![Thread::new_foreground()];
-    };
-    let Ok(list) = serde_json::from_str::<Vec<SessionThread>>(&data) else {
-        return vec![Thread::new_foreground()];
-    };
+fn restore_session(list: Vec<SessionThread>) -> Vec<Thread> {
     let threads: Vec<Thread> = list
         .into_iter()
         .map(|t| {
@@ -1420,6 +1526,10 @@ fn load_session() -> Vec<Thread> {
                 metrics.completed_ms.is_some().then(|| turn.clone())
             }));
             Thread {
+                history_len: 0,
+                history_label: None,
+                session_started: now_seconds(),
+                hide_history: false,
                 id: t.id,
                 parent: t.parent,
                 task: t.task,
@@ -1443,6 +1553,7 @@ fn load_session() -> Vec<Thread> {
                             i.text
                         };
                         Item {
+                            work: i.work,
                             kind,
                             text,
                             hidden,
@@ -1469,52 +1580,12 @@ fn load_session() -> Vec<Thread> {
     }
 }
 
-fn archive_session_turns(threads: &mut [Thread], daemon_pid: Option<u32>) {
-    let prefix = format!("archived:{}:", daemon_pid.unwrap_or_default());
-    let archive = |turn: String| {
-        if turn.starts_with("archived:") {
-            turn
-        } else {
-            format!("{prefix}{turn}")
-        }
-    };
-    for thread in threads {
-        for item in &mut thread.items {
-            item.turn = item.turn.take().map(&archive);
-        }
-        thread.completed_turns = std::mem::take(&mut thread.completed_turns)
-            .into_iter()
-            .map(&archive)
-            .collect();
-        thread.unread_turns.clear();
-        thread.metrics = std::mem::take(&mut thread.metrics)
-            .into_iter()
-            .map(|(turn, metrics)| (archive(turn), metrics))
-            .collect();
-        thread.metric_revisions = std::mem::take(&mut thread.metric_revisions)
-            .into_iter()
-            .map(|(turn, revision)| (archive(turn), revision))
-            .collect();
-    }
-}
-
 // ---- main loop -----------------------------------------------------------
 
 pub fn run() -> io::Result<()> {
-    let current_daemon_pid = Client::connect()
-        .ok()
-        .and_then(|mut client| client.daemon_status().ok().map(|info| info.pid));
-    let previous_daemon_pid = std::fs::read_to_string(daemon_session_file())
-        .ok()
-        .and_then(|pid| pid.trim().parse::<u32>().ok());
-    let daemon_changed = current_daemon_pid.is_some() && current_daemon_pid != previous_daemon_pid;
-    let mut threads = load_session();
-    if daemon_changed {
-        archive_session_turns(&mut threads, previous_daemon_pid);
-    }
-    if let Some(pid) = current_daemon_pid {
-        let _ = std::fs::write(daemon_session_file(), pid.to_string());
-    }
+    let mut visits = session_archive::Visits::open(&tachyon_util::daemon::data_dir())?;
+    let mut threads = vec![Thread::new_foreground()];
+    visits.latest(&mut threads)?;
     // Ensure the foreground thread exists.
     if !threads.iter().any(|t| t.is_foreground) {
         threads.insert(0, Thread::new_foreground());
@@ -1554,11 +1625,14 @@ pub fn run() -> io::Result<()> {
 
     let mut last_poll = Instant::now() - Duration::from_secs(1);
     let mut last_save = Instant::now();
+    let clipboard = clipboard_worker(copy_to_clipboard, sub_out.clone())?;
+    let mut clipboard_notice: Option<(String, Instant)> = None;
+    let mut mouse_capture = MouseCapture::default();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
-    stdout.execute(EnableMouseCapture)?;
+    mouse_capture.apply(&mut stdout)?;
     stdout.execute(crossterm::event::EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -1587,13 +1661,17 @@ pub fn run() -> io::Result<()> {
                                 agent_infos.insert(a.id.clone(), a.clone());
                                 if a.id != MEMORY_ID && !subscribed.contains_key(&a.id) {
                                     subscribed.insert(a.id.clone(), ());
-                                    spawn_stream_thread(a.id.clone(), sub_out.clone());
+                                    spawn_stream_thread(a.id.clone(), sub_out.clone(), Vec::new());
                                 }
                             }
                             // The foreground stream is separate from the worker list.
                             if !subscribed.contains_key(FOREGROUND_ID) {
                                 subscribed.insert(FOREGROUND_ID.into(), ());
-                                spawn_stream_thread(FOREGROUND_ID.into(), sub_out.clone());
+                                spawn_stream_thread(
+                                    FOREGROUND_ID.into(),
+                                    sub_out.clone(),
+                                    visits.recovery(),
+                                );
                             }
                         }
                         Err(_) => {
@@ -1620,10 +1698,28 @@ pub fn run() -> io::Result<()> {
         }
 
         // Drain subscription events into threads.
+        let mut checkpoint = false;
         while let Ok(ev) = sub_rx.try_recv() {
             redraw = true;
             match ev {
-                TuiEvent::Interaction { agent_id, envelope } => {
+                TuiEvent::Clipboard(outcome) => {
+                    clipboard_notice = Some((outcome.notice(), Instant::now()));
+                }
+                TuiEvent::Recovered(entry) => {
+                    checkpoint = true;
+                    let idx = find_or_create_thread(&mut threads, FOREGROUND_ID, true, None);
+                    let turn = entry.turn_id.as_deref().map(|turn| {
+                        session_archive::conversation_turn(&entry.conversation_id, turn)
+                    });
+                    if let Some(turn) = &turn {
+                        visits.recovered(turn);
+                    }
+                    threads[idx].finish_reply(entry.text, turn);
+                }
+                TuiEvent::Interaction {
+                    agent_id,
+                    mut envelope,
+                } => {
                     let identity = (
                         envelope.metadata.conversation_id.clone(),
                         envelope.metadata.message_id.clone(),
@@ -1632,8 +1728,17 @@ pub fn run() -> io::Result<()> {
                     if !seen_interactions.insert(identity) {
                         continue;
                     }
+                    visits.observe(&envelope);
+                    checkpoint |= matches!(
+                        envelope.event,
+                        InteractionEvent::UserTurnAccepted { .. }
+                            | InteractionEvent::ConversationFinished { .. }
+                    );
                     let is_foreground = agent_id == FOREGROUND_ID;
                     let idx = find_or_create_thread(&mut threads, &agent_id, is_foreground, None);
+                    envelope.metadata.turn_id = envelope.metadata.turn_id.as_deref().map(|turn| {
+                        session_archive::conversation_turn(&envelope.metadata.conversation_id, turn)
+                    });
                     match &envelope.event {
                         InteractionEvent::UserTurnAccepted { .. }
                         | InteractionEvent::ConversationDelta { .. }
@@ -1650,9 +1755,18 @@ pub fn run() -> io::Result<()> {
                     }
                     apply_interaction_event(&mut threads[idx], envelope);
                 }
-                TuiEvent::Structured { agent_id, envelope } => {
+                TuiEvent::Structured {
+                    agent_id,
+                    mut envelope,
+                } => {
                     if !accept_event(&mut seen_events, &envelope) {
                         continue;
+                    }
+                    if let (Some(conversation), Some(turn)) =
+                        (&envelope.conversation_id, &envelope.turn_id)
+                    {
+                        envelope.turn_id =
+                            Some(session_archive::conversation_turn(conversation, turn));
                     }
                     record_correlated_metrics(&mut threads, &envelope);
                     let actor = envelope.actor.clone();
@@ -1719,6 +1833,7 @@ pub fn run() -> io::Result<()> {
                     classify_line(thread, &text);
                 }
                 TuiEvent::Ended { agent_id, summary } => {
+                    subscribed.remove(&agent_id);
                     let is_foreground = agent_id == FOREGROUND_ID;
                     let idx = find_or_create_thread(&mut threads, &agent_id, is_foreground, None);
                     threads[idx].add(ItemKind::System, format!("∎ {summary}"));
@@ -1732,9 +1847,19 @@ pub fn run() -> io::Result<()> {
         }
 
         // Periodic session save.
-        if last_save.elapsed() > Duration::from_secs(5) {
+        if checkpoint || last_save.elapsed() > Duration::from_secs(5) {
             last_save = Instant::now();
-            save_session(&threads);
+            if let Err(error) = visits.save(&threads) {
+                threads[0].add(ItemKind::Error, format!("History save failed: {error}"));
+            }
+        }
+
+        if clipboard_notice
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(8))
+        {
+            clipboard_notice = None;
+            redraw = true;
         }
 
         // Streaming agents can emit hundreds of trace events per second. Batch
@@ -1797,7 +1922,7 @@ pub fn run() -> io::Result<()> {
                         &agent_infos,
                         &threads,
                         &config,
-                        if daemon_changed { "fresh" } else { "active" },
+                        "new TUI visit",
                     );
                 }
                 draw_input(
@@ -1817,9 +1942,12 @@ pub fn run() -> io::Result<()> {
                     open_trace,
                     transcript_scroll.follow,
                 );
+                if let Some((notice, _)) = &clipboard_notice {
+                    f.render_widget(Paragraph::new(notice.as_str()), chunks[2]);
+                }
 
                 if commands_open {
-                    draw_command_palette(f, area);
+                    draw_command_palette(f, area, mouse_capture);
                 }
             })?;
             redraw = false;
@@ -1835,20 +1963,33 @@ pub fn run() -> io::Result<()> {
             input_redraw = true;
             match input_event {
                 Event::Key(key) => match key.code {
-                    KeyCode::Char('c')
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && key.modifiers.contains(KeyModifiers::SHIFT) =>
-                    {
-                        yank_chat_cell(&threads, open_trace);
-                    }
-                    KeyCode::Char('y')
-                        if !pane_open && input.is_empty() && open_trace.is_some() =>
-                    {
-                        yank_chat_cell(&threads, open_trace);
-                    }
+                    _ if handle_copy_key(
+                        key,
+                        mouse_capture,
+                        pane_open,
+                        &input,
+                        &threads,
+                        open_trace,
+                        |text| {
+                            let accepted = clipboard.try_send(text.to_owned()).is_ok();
+                            clipboard_notice = Some((
+                                if accepted {
+                                    "Copy queued..."
+                                } else {
+                                    "Copy not queued: clipboard busy or unavailable; retry shortly."
+                                }
+                                .into(),
+                                Instant::now(),
+                            ));
+                            accepted
+                        },
+                    ) => {}
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        clear_history(&mut threads);
+                        if let Err(error) = visits.toggle(&mut threads) {
+                            threads[0]
+                                .add(ItemKind::Error, format!("History load failed: {error}"));
+                        }
                         focus = foreground_focus(&threads);
                         reset_transcript(
                             &mut transcript_scroll,
@@ -1908,13 +2049,19 @@ pub fn run() -> io::Result<()> {
                             focus = focus.saturating_sub(1);
                         } else if input.is_empty() {
                             let previous = open_trace;
-                            select_trace_turn(
+                            if let Err(error) = visits.select(
+                                &mut threads,
                                 &mut open_trace,
-                                &transcript_view,
+                                &mut transcript_view,
                                 &mut transcript_scroll,
+                                &mut transcript_cache,
+                                &mut turn_projection,
                                 -1,
-                            );
-                            if open_trace != previous {
+                            ) {
+                                threads[0]
+                                    .add(ItemKind::Error, format!("History load failed: {error}"));
+                            }
+                            if open_trace != previous || transcript_view.starts.is_empty() {
                                 open_worker = None;
                             }
                         }
@@ -1933,18 +2080,27 @@ pub fn run() -> io::Result<()> {
                     }
                     KeyCode::Down => {
                         if pane_open {
-                            if focus + 1 <= threads.len() {
+                            if focus
+                                < pane_agent_ids(&agent_infos).len()
+                                    + usize::from(agent_infos.contains_key(FOREGROUND_ID))
+                            {
                                 focus += 1;
                             }
                         } else if input.is_empty() {
                             let previous = open_trace;
-                            select_trace_turn(
+                            if let Err(error) = visits.select(
+                                &mut threads,
                                 &mut open_trace,
-                                &transcript_view,
+                                &mut transcript_view,
                                 &mut transcript_scroll,
+                                &mut transcript_cache,
+                                &mut turn_projection,
                                 1,
-                            );
-                            if open_trace != previous {
+                            ) {
+                                threads[0]
+                                    .add(ItemKind::Error, format!("History load failed: {error}"));
+                            }
+                            if open_trace != previous || transcript_view.starts.is_empty() {
                                 open_worker = None;
                             }
                         }
@@ -2023,7 +2179,14 @@ pub fn run() -> io::Result<()> {
                         if cmd.is_empty() {
                             // No text: toggle collapse on the focused thread.
                             if focus > 0 {
-                                if let Some(t) = threads.get_mut(focus - 1) {
+                                let id = if focus == 1 {
+                                    Some(FOREGROUND_ID.to_owned())
+                                } else {
+                                    pane_agent_ids(&agent_infos).get(focus - 2).cloned()
+                                };
+                                if let Some(t) =
+                                    threads.iter_mut().find(|t| Some(&t.id) == id.as_ref())
+                                {
                                     t.collapsed = !t.collapsed;
                                 }
                             }
@@ -2031,11 +2194,24 @@ pub fn run() -> io::Result<()> {
                             input_cursor = 0;
                             continue;
                         }
-                        if let Some(rest) = cmd.strip_prefix('/') {
+                        if let Some(rest) = cmd
+                            .strip_prefix('/')
+                            .filter(|_| !cmd.starts_with("/managed "))
+                        {
                             match rest {
                                 "exit" | "quit" | "q" => break,
+                                "mouse" => {
+                                    let notice = mouse_capture
+                                        .toggle(|mode| mode.apply(terminal.backend_mut()));
+                                    clipboard_notice = Some((notice, Instant::now()));
+                                }
                                 "clear" | "reset" => {
-                                    clear_history(&mut threads);
+                                    if let Err(error) = visits.toggle(&mut threads) {
+                                        threads[0].add(
+                                            ItemKind::Error,
+                                            format!("History load failed: {error}"),
+                                        );
+                                    }
                                     focus = foreground_focus(&threads);
                                     reset_transcript(
                                         &mut transcript_scroll,
@@ -2054,8 +2230,18 @@ pub fn run() -> io::Result<()> {
                         }
                         // User message -> foreground thread.
                         let idx = find_or_create_thread(&mut threads, FOREGROUND_ID, true, None);
-                        threads[idx].add(ItemKind::User, cmd.clone());
+                        threads[idx].add(
+                            ItemKind::User,
+                            cmd.strip_prefix("/managed ")
+                                .unwrap_or(&cmd)
+                                .trim()
+                                .to_string(),
+                        );
                         threads[idx].reserve_reply();
+                        if let Err(error) = visits.save(&threads) {
+                            threads[idx]
+                                .add(ItemKind::Error, format!("History save failed: {error}"));
+                        }
                         open_trace = None;
                         open_worker = None;
                         transcript_scroll.end();
@@ -2063,11 +2249,15 @@ pub fn run() -> io::Result<()> {
                         input_cursor = 0;
                         foreground_busy = true;
                         let chat_out = sub_out.clone();
+                        let selection = foreground_workspace_request(cmd, std::env::current_dir());
                         std::thread::spawn(move || {
-                            let error = Client::connect()
-                                .and_then(|mut c| c.foreground_chat(cmd))
-                                .err()
-                                .map(|e| e.to_string());
+                            let error = selection
+                                .and_then(|(text, cwd)| {
+                                    Client::connect()
+                                        .and_then(|mut c| c.foreground_chat_with_cwd(text, cwd))
+                                        .map_err(|error| error.to_string())
+                                })
+                                .err();
                             let _ = chat_out.send(TuiEvent::ChatResult { error });
                         });
                     }
@@ -2130,7 +2320,7 @@ pub fn run() -> io::Result<()> {
                 Event::Paste(text) => {
                     paste_text(&mut input, &mut input_cursor, &text);
                 }
-                Event::Mouse(m) => {
+                Event::Mouse(m) if mouse_capture.0 => {
                     use crossterm::event::{MouseButton, MouseEventKind};
                     match m.kind {
                         MouseEventKind::ScrollUp => {
@@ -2232,7 +2422,7 @@ pub fn run() -> io::Result<()> {
                                             .and_then(|cell| {
                                                 thread.items[cell.prompt].turn.as_deref()
                                             })
-                                            .and_then(|turn| turn.parse::<u64>().ok())
+                                            .and_then(live_turn_number)
                                         {
                                             mark_ready_turn_seen(&mut threads, turn_id);
                                         }
@@ -2243,6 +2433,18 @@ pub fn run() -> io::Result<()> {
                                 }
                                 if let Some(ClickTarget::Worker(turn, worker)) = hit {
                                     toggle_worker(&mut open_worker, turn, worker);
+                                    continue;
+                                }
+                                if let Some(ClickTarget::RawEvidence(ti, ii)) = hit {
+                                    if let Some(thread) = threads.get_mut(ti) {
+                                        thread.touch();
+                                        if let Some(item) = thread.items.get_mut(ii) {
+                                            if let Some(work) = item.work.as_mut() {
+                                                work.raw_open = !work.raw_open;
+                                                item.revision = thread.revision;
+                                            }
+                                        }
+                                    }
                                     continue;
                                 }
                                 if let Some(ClickTarget::Item(ti, ii)) = hit {
@@ -2271,7 +2473,7 @@ pub fn run() -> io::Result<()> {
         }
     }
 
-    save_session(&threads);
+    let saved = visits.save(&threads);
     disable_raw_mode()?;
     terminal.show_cursor()?;
     terminal
@@ -2279,7 +2481,7 @@ pub fn run() -> io::Result<()> {
         .execute(crossterm::event::DisableBracketedPaste)?;
     terminal.backend_mut().execute(DisableMouseCapture)?;
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
-    Ok(())
+    saved
 }
 
 fn record_correlated_metrics(threads: &mut Vec<Thread>, envelope: &EventEnvelope) {
@@ -2491,6 +2693,10 @@ fn find_or_create_thread(
         return idx;
     }
     threads.push(Thread {
+        history_len: 0,
+        history_label: None,
+        session_started: now_seconds(),
+        hide_history: false,
         id: id.to_string(),
         parent: if is_foreground {
             None
@@ -2607,9 +2813,19 @@ fn classify_line(t: &mut Thread, text: &str) {
 }
 
 fn accept_user_turn(thread: &mut Thread, text: &str, turn: Option<String>) {
-    if let Some(index) = thread.items.iter().rposition(|item| {
+    if turn.is_some()
+        && thread
+            .items
+            .iter()
+            .any(|item| item.kind == ItemKind::User && item.turn == turn)
+    {
+        return;
+    }
+    // Accept identical queued prompts in submission order, never from an archive.
+    if let Some(index) = thread.items[thread.history_len..].iter().position(|item| {
         item.kind == ItemKind::User && item.turn.is_none() && item.text.trim() == text.trim()
     }) {
+        let index = thread.history_len + index;
         thread.touch_structure();
         thread.items[index].turn = turn.clone();
         thread.items[index].revision = thread.revision;
@@ -2621,6 +2837,12 @@ fn accept_user_turn(thread: &mut Thread, text: &str, turn: Option<String>) {
             pending.turn = turn;
             pending.revision = thread.revision;
         }
+    } else if !thread
+        .items
+        .iter()
+        .any(|item| item.kind == ItemKind::User && item.turn == turn && item.text == text)
+    {
+        thread.add_turn(ItemKind::User, text.to_owned(), turn);
     }
 }
 
@@ -2667,6 +2889,9 @@ fn apply_agent_event(thread: &mut Thread, event: AgentEvent) {
 }
 
 fn projected_turn(turn: Option<u64>, envelope_turn: Option<&str>) -> Option<String> {
+    if envelope_turn.is_some_and(|turn| turn.starts_with("conversation:")) {
+        return envelope_turn.map(str::to_owned);
+    }
     turn.map(|turn| turn.to_string())
         .or_else(|| envelope_turn.map(str::to_owned))
 }
@@ -2703,7 +2928,7 @@ fn apply_correlated_agent_event(
         } => thread.add_turn(
             ItemKind::System,
             format!("[timing] {stage} {elapsed_ms}ms"),
-            Some(turn.to_string()),
+            projected_turn(Some(turn), envelope_turn),
         ),
         AgentEvent::WorkerStarted {
             turn,
@@ -2761,6 +2986,65 @@ fn apply_correlated_agent_event(
             None,
         ),
         AgentEvent::WorkResult { result } => {
+            let key = AssignmentKey {
+                work_id: result.work_id.clone(),
+                generation: result.generation,
+                assignment: result.assignment,
+            };
+            let turn = envelope_turn.map(str::to_owned);
+            for (slot, tool) in result.evidence.tools.into_iter().enumerate() {
+                let existing = thread.items.iter().position(|item| {
+                    item.work
+                        .as_ref()
+                        .is_some_and(|work| work.key == key && work.slot == Some(slot))
+                        && item.turn == turn
+                });
+                // Legacy live events have no assignment key. Only claim a unique call
+                // in the same turn, never a call already claimed by another assignment.
+                let live = if existing.is_none()
+                    && turn.is_some()
+                    && tool.parent_call_id.is_none()
+                    && tool.call_id.is_some()
+                {
+                    let candidates = thread
+                        .items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| {
+                            item.kind == ItemKind::Tool
+                                && item.work.is_none()
+                                && item.turn == turn
+                                && item.tool_id == tool.call_id
+                                && tool_parts(&item.text).0 == tool.tool_name
+                        })
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>();
+                    (candidates.len() == 1).then(|| candidates[0])
+                } else {
+                    None
+                };
+                let index = existing.or(live).unwrap_or_else(|| {
+                    thread.add_tool(
+                        tool.tool_name.clone(),
+                        tool.call_id.clone().unwrap_or_default(),
+                        turn.clone(),
+                    );
+                    thread.items.len() - 1
+                });
+                thread.touch_structure();
+                let item = &mut thread.items[index];
+                item.text = tool.tool_name.clone();
+                item.output = None;
+                item.revision = thread.revision;
+                item.work = Some(WorkDetail {
+                    raw_open: item.work.as_ref().is_some_and(|work| work.raw_open),
+                    key: key.clone(),
+                    slot: Some(slot),
+                    tool: Some(tool),
+                    timing: None,
+                    omitted: 0,
+                });
+            }
             let (kind, text) = match result.outcome {
                 WorkOutcome::Completed { result: text, .. } => (ItemKind::SpawnResult, text),
                 WorkOutcome::Blocked { reason } => (ItemKind::Error, format!("blocked: {reason}")),
@@ -2770,11 +3054,30 @@ fn apply_correlated_agent_event(
                 }
                 WorkOutcome::TimedOut { .. } => (ItemKind::Error, "timed out".into()),
             };
-            thread.add_turn(
-                kind,
-                format!("work {}: {}\n{text}", result.work_id, result.objective),
-                envelope_turn.map(str::to_owned),
-            );
+            let text = format!("work {}: {}\n{text}", result.work_id, result.objective);
+            let existing = thread.items.iter().position(|item| {
+                item.work
+                    .as_ref()
+                    .is_some_and(|work| work.key == key && work.slot.is_none())
+                    && item.turn == turn
+            });
+            let index = existing.unwrap_or_else(|| {
+                thread.add_turn(kind.clone(), text.clone(), turn);
+                thread.items.len() - 1
+            });
+            thread.touch_structure();
+            let item = &mut thread.items[index];
+            item.kind = kind;
+            item.text = text;
+            item.revision = thread.revision;
+            item.work = Some(WorkDetail {
+                raw_open: false,
+                key,
+                slot: None,
+                tool: None,
+                timing: result.timing,
+                omitted: result.evidence.omitted,
+            });
         }
         AgentEvent::WorkerReleaseRequested { reason } => thread.add_turn(
             ItemKind::System,
@@ -2788,6 +3091,15 @@ fn apply_correlated_agent_event(
             arguments,
         } => {
             let turn = projected_turn(turn, envelope_turn);
+            let mut matches = thread.items.iter().filter(|item| {
+                item.kind == ItemKind::Tool
+                    && item.tool_id.as_deref() == Some(id.as_str())
+                    && item.turn == turn
+                    && tool_parts(&item.text).0 == name
+            });
+            if matches.next().is_some() && matches.next().is_none() {
+                return;
+            }
             thread.add_tool(format!("{name} {arguments}"), id, turn);
         }
         AgentEvent::ToolFinished { turn, id, output } => {
@@ -2862,6 +3174,21 @@ fn apply_actor_event(
     apply_correlated_agent_event(thread, event, envelope_turn);
 }
 
+fn foreground_workspace_request(
+    text: String,
+    cwd: std::io::Result<std::path::PathBuf>,
+) -> Result<(String, Option<String>), String> {
+    if let Some(text) = text.strip_prefix("/managed ") {
+        return Ok((text.trim().to_string(), None));
+    }
+    let cwd = cwd.map_err(|error| format!("cannot select current workspace: {error}"))?;
+    let cwd = cwd
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "current workspace path is not UTF-8".to_string())?;
+    Ok((text, Some(cwd)))
+}
+
 fn handle_slash(cmd: &str, threads: &mut Vec<Thread>) {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     let foreground_idx = find_or_create_thread(threads, FOREGROUND_ID, true, None);
@@ -2903,7 +3230,14 @@ fn handle_slash(cmd: &str, threads: &mut Vec<Thread>) {
             }
         }
         ["help"] | [] => {
-            foreground.add(ItemKind::System, "/clear       clear chat history".into());
+            foreground.add(
+                ItemKind::System,
+                "/clear       toggle previous visits (keeps history)".into(),
+            );
+            foreground.add(
+                ItemKind::System,
+                "/managed TEXT  run this turn in managed agent workspaces".into(),
+            );
             foreground.add(ItemKind::System, "/stop <id>  stop an agent".into());
             foreground.add(
                 ItemKind::System,
@@ -3040,13 +3374,44 @@ fn tachyon_cli_command() -> std::process::Command {
     std::process::Command::new("tachyon")
 }
 
-/// Copy the highlighted conversation cell, or the latest cell when none is selected.
-fn yank_chat_cell(threads: &[Thread], selected: Option<usize>) {
+/// Copy the selected conversation cell, or the latest cell when none is selected.
+fn handle_copy_key(
+    key: event::KeyEvent,
+    mouse_capture: MouseCapture,
+    pane_open: bool,
+    input: &str,
+    threads: &[Thread],
+    selected: Option<usize>,
+    copy: impl FnOnce(&str) -> bool,
+) -> bool {
+    let shortcut = matches!(key.code, KeyCode::Char('c' | 'C'))
+        && key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    if shortcut && !mouse_capture.0 {
+        // Native selection is invisible to us. Consume forwarded Copy without
+        // copying a cell, inserting text, or falling through to Ctrl+C (quit).
+        return true;
+    }
+    let yank = key.code == KeyCode::Char('y')
+        && key.modifiers.is_empty()
+        && !pane_open
+        && input.is_empty();
+    if !shortcut && !yank {
+        return false;
+    }
+    if key.kind != event::KeyEventKind::Release {
+        yank_chat_cell(threads, selected, copy);
+    }
+    true
+}
+
+fn yank_chat_cell(threads: &[Thread], selected: Option<usize>, copy: impl FnOnce(&str) -> bool) {
     let Some(text) = selected_chat_cell_text(threads, selected) else {
         return;
     };
     // Never write status text to stderr while the alternate-screen TUI is active.
-    let _ = copy_to_clipboard(&text);
+    let _ = copy(&text);
 }
 
 fn selected_chat_cell_text(threads: &[Thread], selected: Option<usize>) -> Option<String> {
@@ -3060,46 +3425,149 @@ fn selected_chat_cell_text(threads: &[Thread], selected: Option<usize>) -> Optio
             ItemKind::Reply => names().conversation.as_str(),
             _ => continue,
         };
-        sections.push(format!("{label}:\n{}", item.text.trim()));
+        let text = if item.kind == ItemKind::Reply {
+            sanitize_reply_text(&item.text)
+        } else {
+            item.text.clone()
+        };
+        if !text.is_empty() {
+            sections.push(format!("{label}:\n{text}"));
+        }
     }
     (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
 
-fn copy_to_clipboard(text: &str) -> bool {
-    // Try common clipboard tools (no extra deps).
+#[derive(Debug, PartialEq, Eq)]
+enum CopyOutcome {
+    SystemClipboard,
+    Saved(std::path::PathBuf),
+    Failed,
+}
+
+impl CopyOutcome {
+    fn notice(&self) -> String {
+        match self {
+            Self::SystemClipboard => "System clipboard copied".into(),
+            Self::Saved(path) => {
+                format!("Saved to {} (system clipboard unavailable)", path.display())
+            }
+            Self::Failed => "Copy failed: clipboard helpers and file fallback unavailable".into(),
+        }
+    }
+}
+
+fn clipboard_worker(
+    mut deliver: impl FnMut(&str) -> CopyOutcome + Send + 'static,
+    notifications: mpsc::Sender<TuiEvent>,
+) -> io::Result<mpsc::SyncSender<String>> {
+    // One in-flight payload and one waiting; reject new requests when full.
+    let (sender, receiver) = mpsc::sync_channel::<String>(1);
+    std::thread::Builder::new()
+        .name("tui-clipboard".into())
+        .spawn(move || {
+            while let Ok(text) = receiver.recv() {
+                let _ = notifications.send(TuiEvent::Clipboard(deliver(&text)));
+            }
+        })?;
+    // Detached: dropping the session sender closes the queue, never waits for I/O.
+    Ok(sender)
+}
+
+fn copy_to_clipboard(text: &str) -> CopyOutcome {
+    copy_to_clipboard_with(text, clipboard_command, |text| {
+        let path = session_file().parent()?.join("clipboard.txt");
+        std::fs::write(&path, text).ok()?;
+        Some(path)
+    })
+}
+
+fn clipboard_command(cmd: &[&str], text: &str) -> bool {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let Ok(mut child) = std::process::Command::new(cmd[0])
+        .args(&cmd[1..])
+        .process_group(0)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let result = (|| {
+        let mut stdin = child.stdin.take()?;
+        // A clipboard helper may stop reading while its display server is hung.
+        fcntl(stdin.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).ok()?;
+        let mut remaining = text.as_bytes();
+        while !remaining.is_empty() {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            match stdin.write(remaining) {
+                Ok(0) => return None,
+                Ok(n) => remaining = &remaining[n..],
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => return None,
+            }
+        }
+        drop(stdin);
+        loop {
+            if let Some(status) = child.try_wait().ok()? {
+                return Some(status.success());
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    })();
+    // Successful helpers may fork a clipboard owner. Only failed/timed-out
+    // helpers should lose their process group; never kill a successful owner.
+    if result != Some(true) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = child.kill();
+        // Reaping must not keep the UI blocked, even for an uninterruptible child.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+    result.unwrap_or(false)
+}
+
+fn copy_to_clipboard_with(
+    text: &str,
+    mut command: impl FnMut(&[&str], &str) -> bool,
+    fallback: impl FnOnce(&str) -> Option<std::path::PathBuf>,
+) -> CopyOutcome {
+    // Try common clipboard tools.
     let cmds: [&[&str]; 3] = [
         &["wl-copy"],
         &["xclip", "-selection", "clipboard"],
         &["xsel", "-b"],
     ];
     for cmd in cmds {
-        if let Ok(mut child) = std::process::Command::new(cmd[0])
-            .args(&cmd[1..])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            use std::io::Write;
-            let _ = child.stdin.as_mut().map(|stdin| {
-                let _ = stdin.write_all(text.as_bytes());
-            });
-            if child.wait().map(|s| s.success()).unwrap_or(false) {
-                return true;
-            }
+        if command(cmd, text) {
+            return CopyOutcome::SystemClipboard;
         }
     }
     // Fallback: write to a file next to the session.
-    if let Some(p) = session_file().parent().map(|d| d.join("clipboard.txt")) {
-        if std::fs::write(&p, text).is_ok() {
-            return true;
-        }
-    }
-    false
+    fallback(text).map_or(CopyOutcome::Failed, CopyOutcome::Saved)
 }
 
-fn clear_history(threads: &mut Vec<Thread>) {
-    threads.clear();
-    threads.push(Thread::new_foreground());
-    save_session(threads);
+fn toggle_history(threads: &mut [Thread]) {
+    if let Some(thread) = threads.iter_mut().find(|thread| thread.is_foreground) {
+        thread.hide_history = !thread.hide_history;
+        thread.touch_structure();
+    }
 }
 
 fn reset_transcript(
@@ -3228,26 +3696,36 @@ fn popup_title(label: &'static str) -> Title<'static> {
     .alignment(Alignment::Left)
 }
 
-fn draw_command_palette(f: &mut Frame, area: Rect) {
-    let popup = popup_rect(area, 68, 29);
+fn draw_command_palette(f: &mut Frame, area: Rect, mouse_capture: MouseCapture) {
+    let popup = popup_rect(area, 76, 35);
     let block = Block::default()
         .title(popup_title(" HELP "))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .style(Style::default().bg(Color::Rgb(12, 12, 15)));
     let commands = vec![
-        Line::from(""),
+        Line::from(mouse_capture.label()),
         help_section("KEYBINDS"),
         Line::from(""),
         help_key("? / Ctrl+P", "toggle help"),
         help_key("Tab", "agents pane"),
         help_key("Ctrl+O", "toggle inline traces for the current turn"),
-        help_key("y / Ctrl+Shift+C", "copy selected chat cell"),
+        help_key(
+            "y (empty input)",
+            "copy selected/latest cell (prompt + reply)",
+        ),
+        help_key("Drag", "native selection; capture: Shift+drag may bypass"),
+        help_key(
+            "Ctrl+Shift+C",
+            "terminal Copy; forwarded cell copy ONLY in capture",
+        ),
         help_key("Shift+Enter", "insert newline"),
         help_key("Up / Down", "select a turn and expand its traces"),
         help_key("PageUp / PageDown", "page through selected traces"),
+        help_key("Wheel", "terminal-owned by default; /mouse for TUI scroll"),
         help_key("End", "return to latest turn"),
-        help_key("Ctrl+L", "clear chat history"),
+        help_key("Ctrl+L", "hide/show previous visits"),
+        help_key("Up / Down", "select turns across session history"),
         help_key("Ctrl+C / Esc", "quit"),
         help_divider(popup.width.saturating_sub(2) as usize),
         help_section("AGENT ACTIONS"),
@@ -3261,7 +3739,9 @@ fn draw_command_palette(f: &mut Frame, area: Rect) {
         help_divider(popup.width.saturating_sub(2) as usize),
         help_section("COMMANDS"),
         Line::from(""),
-        help_key("/clear", "clear chat history"),
+        help_key("/clear", "hide/show previous visits"),
+        help_key("/mouse", "toggle native selection / clickable capture"),
+        help_key("/managed TEXT", "use managed worker workspaces"),
         help_key("/exit", "quit Tachyon"),
     ];
     f.render_widget(Clear, popup);
@@ -3458,6 +3938,7 @@ fn main_conversation_layout(
     let turn_suffix = prompt
         .turn
         .as_deref()
+        .map(session_archive::display_turn)
         .map(|turn| format!("  {} {turn}", icon::TURN))
         .unwrap_or_default();
     let trailing = format!("{turn_suffix}  [{}]", timestamp_label(prompt.timestamp));
@@ -3489,10 +3970,11 @@ fn main_conversation_layout(
 
     if let Some(response) = response {
         let response_complete = response.kind == ItemKind::Reply
-            && response
-                .turn
-                .as_deref()
-                .is_none_or(|turn| thread.completed_turns.contains(turn));
+            && (cell.prompt < thread.history_len
+                || response
+                    .turn
+                    .as_deref()
+                    .is_none_or(|turn| thread.completed_turns.contains(turn)));
         if !response_complete {
             push(
                 Line::from(Span::styled(
@@ -3505,7 +3987,9 @@ fn main_conversation_layout(
                 None,
             );
             push(Line::raw(""), None);
-            let pending = if response.text.trim().is_empty() && active {
+            let pending = if cell.prompt < thread.history_len {
+                "unfinished at this visit's last checkpoint".to_owned()
+            } else if response.text.trim().is_empty() && active {
                 pending_reply_activity(activity, response.turn.is_some())
             } else {
                 pending_reply_activity(&response.text, response.turn.is_some())
@@ -3536,6 +4020,7 @@ fn main_conversation_layout(
             let response_turn_suffix = response
                 .turn
                 .as_deref()
+                .map(session_archive::display_turn)
                 .map(|turn| format!("  {} {turn}", icon::TURN))
                 .unwrap_or_default();
             let mut header = vec![Span::styled(
@@ -3664,10 +4149,40 @@ fn turn_cell_layout(
     for hit in &mut layout.hits {
         *hit = Some(ClickTarget::TraceSummary(turn_index));
     }
-    if open {
-        for line in &mut layout.lines {
-            line.style = line.style.bg(Color::Rgb(30, 32, 36));
+    if !thread.hide_history && thread.history_len > 0 {
+        let start = if cell.prompt < thread.history_len {
+            0
+        } else {
+            thread.history_len
+        };
+        if !thread.items[start..cell.prompt]
+            .iter()
+            .any(|i| matches!(i.kind, ItemKind::User | ItemKind::Reply))
+        {
+            let label = if cell.prompt < thread.history_len {
+                thread
+                    .history_label
+                    .clone()
+                    .unwrap_or_else(|| "Previous session (date unknown)".into())
+            } else {
+                format!(
+                    "Current session {}",
+                    session_archive::date_label(thread.session_started)
+                )
+            };
+            layout.lines.splice(
+                0..0,
+                [
+                    Line::raw(""),
+                    session_archive::separator(&label, content_width),
+                    Line::raw(""),
+                ],
+            );
+            layout.hits.splice(0..0, [None, None, None]);
         }
+    }
+    if !open {
+        return layout;
     }
     let mut diagnostic_items = cell
         .items
@@ -3712,7 +4227,7 @@ fn turn_cell_layout(
     if !open {
         return layout;
     }
-    let mut worker_traces = Vec::<WorkerTrace>::new();
+    let mut worker_traces = std::collections::BTreeMap::<String, WorkerTrace>::new();
     let mut model_items = Vec::new();
     let mut orchestration_items = Vec::new();
     for &(source_thread, index) in &diagnostic_items {
@@ -3721,6 +4236,16 @@ fn turn_cell_layout(
         if source_thread != thread_index {
             let worker =
                 ensure_worker_trace(&mut worker_traces, &source.id, source.task.as_deref());
+            worker.items.push((source_thread, index));
+            continue;
+        }
+        if let Some(work) = &item.work {
+            let objective = if work.tool.is_none() {
+                worker_record(&item.text).and_then(|(_, objective)| objective)
+            } else {
+                None
+            };
+            let worker = ensure_worker_trace(&mut worker_traces, &work.key.work_id, objective);
             worker.items.push((source_thread, index));
             continue;
         }
@@ -3746,8 +4271,8 @@ fn turn_cell_layout(
                 worker.items.push((source_thread, index));
             }
             ItemKind::Error if item.text.starts_with("work ") => {
-                let worker = worker_record(&item.text)
-                    .and_then(|(id, _)| worker_traces.iter_mut().find(|worker| worker.id == id));
+                let worker =
+                    worker_record(&item.text).and_then(|(id, _)| worker_traces.get_mut(id));
                 if let Some(worker) = worker {
                     worker.items.push((source_thread, index));
                 } else {
@@ -3825,6 +4350,7 @@ fn turn_cell_layout(
             );
         }
     }
+    let mut rendered = 0;
     if !orchestration_items.is_empty() || !worker_traces.is_empty() {
         push_trace_heading(&mut layout, icon::AGENT, "Agents", "  ");
         for (source_thread, index) in orchestration_items {
@@ -3838,7 +4364,26 @@ fn turn_cell_layout(
                 None,
             );
         }
-        for worker in worker_traces {
+        const WORKER_ROW_LIMIT: usize = 20;
+        let selected_outside = open_worker.is_some_and(|id| {
+            worker_traces.contains_key(id)
+                && !worker_traces
+                    .keys()
+                    .take(WORKER_ROW_LIMIT)
+                    .any(|key| key == id)
+        });
+        let ordinary_limit = WORKER_ROW_LIMIT - usize::from(selected_outside);
+        let outside_worker = if selected_outside {
+            worker_traces.remove(open_worker.unwrap())
+        } else {
+            None
+        };
+        for worker in worker_traces
+            .values()
+            .take(ordinary_limit)
+            .chain(outside_worker.iter())
+        {
+            rendered += 1;
             let objective = worker.objective.as_deref().unwrap_or("Worker task");
             let expanded = open_worker == Some(worker.id.as_str());
             let (state, color) = worker_trace_state(&worker, threads);
@@ -3874,11 +4419,10 @@ fn turn_cell_layout(
                 .hits
                 .push(Some(ClickTarget::Worker(turn_index, worker.id.clone())));
             if expanded {
-                for (source_thread, index) in worker.items {
-                    if matches!(
-                        threads[source_thread].items[index].kind,
-                        ItemKind::SpawnResult
-                    ) {
+                for &(source_thread, index) in &worker.items {
+                    if threads[source_thread].items[index].kind == ItemKind::SpawnResult
+                        && threads[source_thread].items[index].work.is_none()
+                    {
                         continue;
                     }
                     push_trace_item(
@@ -3893,6 +4437,16 @@ fn turn_cell_layout(
                 }
             }
         }
+    }
+    if workers > rendered {
+        layout.lines.push(Line::from(Span::styled(
+            format!(
+                "    {} worker summaries omitted (showing {rendered} of {workers})",
+                workers - rendered
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+        layout.hits.push(None);
     }
     layout.lines.push(Line::raw(""));
     layout.hits.push(None);
@@ -4055,22 +4609,19 @@ fn elide_work_id(text: &str) -> String {
 }
 
 fn ensure_worker_trace<'a>(
-    workers: &'a mut Vec<WorkerTrace>,
+    workers: &'a mut std::collections::BTreeMap<String, WorkerTrace>,
     id: &str,
     objective: Option<&str>,
 ) -> &'a mut WorkerTrace {
-    if let Some(index) = workers.iter().position(|worker| worker.id == id) {
-        if workers[index].objective.is_none() {
-            workers[index].objective = objective.map(str::to_owned);
-        }
-        return &mut workers[index];
-    }
-    workers.push(WorkerTrace {
+    let worker = workers.entry(id.to_owned()).or_insert_with(|| WorkerTrace {
         id: id.to_owned(),
         objective: objective.map(str::to_owned),
         items: Vec::new(),
     });
-    workers.last_mut().expect("worker was just inserted")
+    if worker.objective.is_none() {
+        worker.objective = objective.map(str::to_owned);
+    }
+    worker
 }
 
 fn trace_count_summary(events: usize, tools: usize, agents: usize) -> String {
@@ -4123,6 +4674,87 @@ fn worker_trace_state(worker: &WorkerTrace, threads: &[Thread]) -> (&'static str
     }
 }
 
+fn work_tool_details(tool: &tachyon_api::types::WorkToolEvidence, raw: bool) -> String {
+    use std::io::Write;
+
+    // Stop serialization itself, not just the resulting string: legacy/session
+    // JSON has no enforced input budget. Each section gets a fair preview.
+    struct Preview(Vec<u8>);
+    impl Write for Preview {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let count = bytes.len().min(2048usize.saturating_sub(self.0.len()));
+            if count == 0 && !bytes.is_empty() {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            self.0.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[cfg(test)]
+    DETAIL_FORMATS.with(|count| count.set(count.get() + 1));
+    let mut details = String::new();
+    if raw {
+        for (label, id) in [
+            ("call", tool.call_id.as_deref()),
+            ("parent", tool.parent_call_id.as_deref()),
+        ] {
+            if let Some(id) = id {
+                details.push_str(&format!("{label} {}\n", truncate_text(id, 128)));
+            }
+        }
+    }
+    for (label, value) in [
+        (
+            "output_ref",
+            raw.then(|| tool.output.get("output_ref")).flatten(),
+        ),
+        (
+            "continuation",
+            raw.then(|| tool.output.get("continuation")).flatten(),
+        ),
+        ("error", tool.output.get("error")),
+        (
+            "metadata",
+            raw.then(|| tool.output.get("metadata")).flatten(),
+        ),
+        ("Code", tool.arguments.get("code")),
+        (
+            "Output",
+            tool.output
+                .get("content")
+                .or_else(|| tool.output.as_str().map(|_| &tool.output)),
+        ),
+        ("arguments", raw.then_some(&tool.arguments)),
+        ("output (native envelope)", raw.then_some(&tool.output)),
+    ] {
+        let Some(value) = value.filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let mut preview = Preview(Vec::new());
+        let result = if let Some(text) = value.as_str() {
+            preview.write_all(text.as_bytes())
+        } else {
+            serde_json::to_writer_pretty(&mut preview, value).map_err(std::io::Error::other)
+        };
+        details.push_str(label);
+        details.push('\n');
+        details.push_str(&String::from_utf8_lossy(&preview.0));
+        if result.is_err() {
+            details.push_str("\n[display truncated; stored evidence unchanged]");
+        }
+        details.push('\n');
+    }
+    details
+}
+
+#[cfg(test)]
+thread_local! {
+    static DETAIL_FORMATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn push_trace_item(
     layout: &mut CellLayout,
     threads: &[Thread],
@@ -4135,6 +4767,140 @@ fn push_trace_item(
     let source = &threads[source_thread];
     let item = &source.items[index];
     let hit = Some(ClickTarget::Item(source_thread, index));
+    if let Some(work) = &item.work {
+        let assignment = format!("assignment {}/{}", work.key.generation, work.key.assignment);
+        if let Some(tool) = &work.tool {
+            let error = tool
+                .output
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                || tool
+                    .output
+                    .get("error")
+                    .is_some_and(|value| !value.is_null())
+                || tool
+                    .output
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("error");
+            let truncated = tool
+                .output
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let exit = tool
+                .output
+                .get("exit_code")
+                .or_else(|| tool.output.get("metadata").and_then(|m| m.get("exit_code")))
+                .and_then(serde_json::Value::as_i64);
+            let timed_out = tool
+                .output
+                .get("timed_out")
+                .or_else(|| tool.output.get("metadata").and_then(|m| m.get("timed_out")))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let error = error || exit.is_some_and(|code| code != 0) || timed_out;
+            let status = exit
+                .map(|code| format!("exit{code}{}", if error { " / error" } else { "" }))
+                .unwrap_or_else(|| if error { "error" } else { "recorded" }.into());
+            layout.lines.push(Line::from(Span::styled(
+                format!(
+                    "{indent}{} {} · {}{}{} · click to {}",
+                    if item.hidden {
+                        icon::COLLAPSED
+                    } else {
+                        icon::EXPANDED
+                    },
+                    truncate_text(&tool.tool_name, 128),
+                    status,
+                    if truncated { " / truncated" } else { "" },
+                    if timed_out { " / timed out" } else { "" },
+                    if item.hidden { "expand" } else { "collapse" }
+                ),
+                Style::default().fg(if error { Color::Red } else { Color::Green }),
+            )));
+            layout.hits.push(hit.clone());
+            if !item.hidden {
+                layout.lines.push(Line::raw(format!(
+                    "{indent}  {} Raw diagnostics{}",
+                    if work.raw_open {
+                        icon::EXPANDED
+                    } else {
+                        icon::COLLAPSED
+                    },
+                    if work.raw_open {
+                        format!(" · {assignment}")
+                    } else {
+                        String::new()
+                    }
+                )));
+                layout
+                    .hits
+                    .push(Some(ClickTarget::RawEvidence(source_thread, index)));
+                let details = work_tool_details(tool, work.raw_open);
+                let mut rendered = 1;
+                let mut rendered_bytes = layout.lines.last().unwrap().to_string().len() + 5;
+                'detail: for source in details.lines() {
+                    // Hard wrap without splitting whitespace: Python indentation is evidence.
+                    let chars: Vec<char> = if source.is_empty() {
+                        vec![' ']
+                    } else {
+                        source.chars().collect()
+                    };
+                    let width = width.saturating_sub(indent.len() as u16 + 2).max(1) as usize;
+                    for chunk in chars.chunks(width) {
+                        let line: String = chunk.iter().collect();
+                        let text = format!("{indent}  {line}");
+                        // Include the selected rail and newline in the byte budget.
+                        let bytes = text.len() + 5;
+                        if rendered == 128 || rendered_bytes + bytes > 16 * 1024 {
+                            layout.lines.push(Line::raw(format!(
+                                "{indent}  [display truncated; stored evidence unchanged]"
+                            )));
+                            layout.hits.push(hit.clone());
+                            break 'detail;
+                        }
+                        rendered += 1;
+                        rendered_bytes += bytes;
+                        layout.lines.push(Line::from(Span::styled(
+                            text,
+                            Style::default().fg(Color::Gray),
+                        )));
+                        layout.hits.push(hit.clone());
+                    }
+                }
+            }
+            return;
+        }
+        let mut details = vec![format!(
+            "{assignment} · terminal evidence: producer budget 32 results / ~16 KiB; {} omitted; absence is not success",
+            work.omitted
+        )];
+        if let Some(timing) = &work.timing {
+            let measured =
+                |value: Option<u64>| value.map(human_millis).unwrap_or_else(|| "unknown".into());
+            details.push(format!(
+                "execution {} (includes inference {}, tools {}); review {} separate; not additive",
+                measured(timing.execution_ms),
+                measured(timing.inference_ms),
+                measured(timing.tool_ms),
+                measured(timing.review_ms)
+            ));
+        }
+        for detail in details {
+            for line in wrap_text(
+                &detail,
+                width.saturating_sub(indent.len() as u16).max(1) as usize,
+            ) {
+                layout.lines.push(Line::from(Span::styled(
+                    format!("{indent}{line}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                layout.hits.push(None);
+            }
+        }
+    }
     match item.kind {
         ItemKind::Tool => {
             let running = item.output.is_none();
@@ -4339,7 +5105,7 @@ fn draw_conversation(
     projection.update(thread);
     let cells = &projection.cells;
     cache.prepare(area.width, cells, thread.structure_revision);
-    if cells.is_empty() || area.height == 0 {
+    if area.height == 0 {
         if let Ok(mut guard) = HITS.lock() {
             guard.clear();
         }
@@ -4352,8 +5118,11 @@ fn draw_conversation(
         };
         return;
     }
-    let latest = cells.len() - 1;
-    let latest_timestamp = latest_conversation_timestamp(thread, &cells[latest]);
+    let latest = cells.len().saturating_sub(1);
+    let latest_timestamp = cells
+        .last()
+        .map(|cell| latest_conversation_timestamp(thread, cell))
+        .unwrap_or(0);
     let worker_revisions = worker_turn_revisions(threads);
     let mut heights = Vec::with_capacity(cells.len());
     let mut starts = Vec::with_capacity(cells.len());
@@ -4364,7 +5133,7 @@ fn draw_conversation(
         let selected_worker = open_worker
             .filter(|(turn, _)| *turn == index)
             .map(|(_, worker)| worker.as_str());
-        let is_latest = index == latest;
+        let is_latest = index == latest && cell.prompt >= thread.history_len;
         let mut revision = cell_revision(thread, cell);
         if open {
             revision.worker = thread.items[cell.prompt]
@@ -4390,8 +5159,12 @@ fn draw_conversation(
                     threads,
                     cell,
                     area.width,
-                    latest_timestamp,
-                    is_latest && foreground_busy,
+                    if cell.prompt < thread.history_len {
+                        0
+                    } else {
+                        latest_timestamp
+                    },
+                    is_latest && foreground_busy && cell.prompt >= thread.history_len,
                     foreground_activity,
                     open,
                     selected_worker,
@@ -4401,6 +5174,32 @@ fn draw_conversation(
             .len();
         heights.push(height);
         total_height = total_height.saturating_add(height);
+    }
+    // An empty current session needs a boundary only after visible history.
+    let empty_current = cells
+        .last()
+        .is_some_and(|cell| cell.prompt < thread.history_len);
+    let current_start = total_height;
+    let current_separator = empty_current.then(|| {
+        [
+            Line::raw(""),
+            session_archive::separator(
+                &format!(
+                    "Current session {}",
+                    session_archive::date_label(thread.session_started)
+                ),
+                area.width,
+            ),
+            Line::raw(""),
+        ]
+    });
+    if empty_current {
+        total_height += 3;
+    }
+    if view.starts.is_empty() && !scroll.follow {
+        if let Some(start) = open_trace.and_then(|index| starts.get(index)) {
+            scroll.top = *start;
+        }
     }
     scroll.sync(total_height, area.height as usize, thread.revision);
     let show_activity = should_show_activity(scroll, total_height, area.height as usize);
@@ -4420,7 +5219,7 @@ fn draw_conversation(
             let selected_worker = open_worker
                 .filter(|(turn, _)| *turn == index)
                 .map(|(_, worker)| worker.as_str());
-            let is_latest = index == latest;
+            let is_latest = index == latest && cell.prompt >= thread.history_len;
             let mut revision = cell_revision(thread, cell);
             if open {
                 revision.worker = thread.items[cell.prompt]
@@ -4448,6 +5247,15 @@ fn draw_conversation(
         }
         if end >= bottom {
             break;
+        }
+    }
+    if let Some(lines) = current_separator {
+        for (offset, line) in lines.into_iter().enumerate() {
+            let row = current_start + offset;
+            if row >= top && row < bottom {
+                visible_lines.push(line);
+                visible_hits.push(None);
+            }
         }
     }
     if show_activity {
@@ -5721,7 +6529,7 @@ fn turn_badges(thread: &Thread, turn: Option<&str>, timestamp: u64, show_traces:
         }
         badges.extend(memory_badges(&metrics.memory, show_traces));
         badges.extend(schedule_badges(&metrics.schedule, show_traces));
-    } else if let Some(turn) = turn.and_then(|value| value.parse::<u64>().ok()) {
+    } else if let Some(turn) = turn.and_then(live_turn_number) {
         if let Some((prompt, completion, total)) = thread.usage.get(&turn) {
             if show_traces {
                 badges.push(format!(
@@ -6094,7 +6902,7 @@ fn draw_input(
 fn footer_mode_text(open_trace: Option<usize>, follow: bool) -> Option<String> {
     if open_trace.is_some() {
         Some(format!(
-            "TRACE    ↑↓ select · {} Pg scroll · {} Esc close · {} help",
+            "TRACE    y copy · /mouse mode · ↑↓ select · {} Pg scroll · {} Esc close · {} help",
             icon::SCROLL,
             icon::CLOSE,
             icon::HELP
@@ -7060,7 +7868,11 @@ fn decode_interaction_event(data: &str) -> Option<InteractionEventEnvelope> {
     serde_json::from_str(data).ok()
 }
 
-fn spawn_stream_thread(agent_id: String, to_ui: mpsc::Sender<TuiEvent>) {
+fn spawn_stream_thread(
+    agent_id: String,
+    to_ui: mpsc::Sender<TuiEvent>,
+    pending: Vec<(String, u64)>,
+) {
     std::thread::spawn(move || {
         let mut sub = match Subscription::open(&agent_id) {
             Ok(s) => s,
@@ -7072,6 +7884,15 @@ fn spawn_stream_thread(agent_id: String, to_ui: mpsc::Sender<TuiEvent>) {
                 return;
             }
         };
+        // Subscribe first: events produced during the bounded history query are
+        // queued on this connection, and their final replies replace recovery.
+        if !pending.is_empty() {
+            if let Err(error) = session_archive::recover_continuations(&pending, &to_ui) {
+                let _ = to_ui.send(TuiEvent::ChatResult {
+                    error: Some(format!("History recovery: {error}")),
+                });
+            }
+        }
         while let Some(resp) = sub.next() {
             match resp {
                 ApiResponse::Event { stream, data } => {
@@ -7251,28 +8072,12 @@ mod tests {
     }
 
     #[test]
-    fn daemon_restart_archives_turn_ids_without_discarding_chat() {
-        let mut thread = Thread::new_foreground();
-        thread.add_turn(ItemKind::User, "question".into(), Some("2".into()));
-        thread.add_turn(ItemKind::Reply, "answer".into(), Some("2".into()));
-        thread.completed_turns.insert("2".into());
-        thread.unread_turns.insert("2".into());
-        let mut threads = vec![thread];
-
-        archive_session_turns(&mut threads, Some(42));
-
-        assert_eq!(threads[0].items.len(), 2);
-        assert!(threads[0]
-            .items
-            .iter()
-            .all(|item| item.turn.as_deref() == Some("archived:42:2")));
-        assert!(threads[0].completed_turns.contains("archived:42:2"));
-        assert!(threads[0].unread_turns.is_empty());
-        archive_session_turns(&mut threads, Some(43));
-        assert!(threads[0]
-            .items
-            .iter()
-            .all(|item| item.turn.as_deref() == Some("archived:42:2")));
+    fn legacy_pid_prefix_is_display_only_and_never_a_live_turn() {
+        let identity = "archived:42:2";
+        assert_eq!(session_archive::display_turn(identity), "2");
+        assert_eq!(live_turn_number(identity), None);
+        assert!(!later_turn(identity, "1"));
+        assert_eq!(identity, "archived:42:2");
     }
 
     #[test]
@@ -7411,6 +8216,600 @@ mod tests {
             assert!(text.contains(&names().conversation));
             assert!(!text.contains("> first question"));
             assert!(!text.contains("trace ·"));
+        }
+    }
+
+    #[test]
+    fn mouse_defaults_clear_reporting_and_toggle_roundtrips_without_a_terminal() {
+        let mut mode = MouseCapture::default();
+        let mut disabled = Vec::new();
+        disabled.execute(DisableMouseCapture).unwrap();
+        let mut enabled = Vec::new();
+        enabled.execute(EnableMouseCapture).unwrap();
+        let mut output = Vec::new();
+        mode.apply(&mut output).unwrap();
+        assert_eq!(output, disabled);
+        assert_ne!(output, enabled);
+        for (expected, bytes) in [(true, &enabled), (false, &disabled)] {
+            output.clear();
+            let notice = mode.toggle(|next| next.apply(&mut output));
+            assert_eq!(mode.0, expected);
+            assert_eq!(&output, bytes);
+            assert_eq!(notice, mode.label());
+        }
+        for initial in [false, true] {
+            mode = MouseCapture(initial);
+            let notice = mode.toggle(|next| {
+                assert_eq!(next.0, !initial);
+                Err(io::Error::other("injected terminal failure"))
+            });
+            assert_eq!(mode, MouseCapture(initial));
+            assert!(notice.contains("Mouse toggle failed: injected terminal failure"));
+            assert!(notice.contains("partial; retry /mouse"));
+        }
+    }
+
+    #[test]
+    fn mouse_help_shows_current_mode_and_toggle() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 45)).unwrap();
+        for mode in [MouseCapture::default(), MouseCapture(true)] {
+            terminal
+                .draw(|f| draw_command_palette(f, f.area(), mode))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(text.contains(mode.label()));
+            assert!(text.contains("toggle native selection / clickable capture"));
+            assert!(text.contains("terminal-owned by default"));
+            assert!(text.contains("quit Tachyon"));
+        }
+    }
+
+    #[test]
+    fn native_forwarded_copy_is_consumed_without_clipboard_or_quit() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(
+            ItemKind::Reply,
+            "do not copy this cell".into(),
+            Some("2".into()),
+        );
+        for code in ['c', 'C'] {
+            for kind in [
+                event::KeyEventKind::Press,
+                event::KeyEventKind::Repeat,
+                event::KeyEventKind::Release,
+            ] {
+                for pane in [false, true] {
+                    for input in ["", "draft"] {
+                        assert!(handle_copy_key(
+                            event::KeyEvent::new_with_kind(
+                                KeyCode::Char(code),
+                                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                                kind
+                            ),
+                            MouseCapture::default(),
+                            pane,
+                            input,
+                            std::slice::from_ref(&thread),
+                            Some(0),
+                            |_| panic!("native Copy must not enqueue cell text"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn copy_handler_preserves_payload_across_streaming_and_completion() {
+        let mut threads = vec![Thread::new_foreground()];
+        threads[0].add_turn(ItemKind::User, "  question\n".into(), Some("2".into()));
+        threads[0].add_turn(
+            ItemKind::PendingReply,
+            "private status".into(),
+            Some("2".into()),
+        );
+        let key = event::KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let check = |threads: &[Thread], reply: Option<&str>| {
+            let mut copied = None;
+            assert!(handle_copy_key(
+                key,
+                MouseCapture(true),
+                false,
+                "",
+                threads,
+                Some(0),
+                |text| {
+                    copied = Some(text.to_owned());
+                    true
+                }
+            ));
+            let mut expected = format!("{}:\n  question\n", names().user);
+            if let Some(reply) = reply {
+                expected.push_str(&format!("\n\n{}:\n{reply}", names().conversation));
+            }
+            assert_eq!(copied, Some(expected));
+        };
+        check(&threads, None);
+        let body = "  markdown **bold** α\n```rust\n    code();  \n```\n\n";
+        let mut seen = HashSet::new();
+        for (id, text) in [(1, body), (2, "<dsml tool_calls>private evidence")] {
+            let event = envelope(
+                id,
+                AgentEvent::ReplyDelta {
+                    turn: Some(2),
+                    text: text.into(),
+                },
+            );
+            for _ in 0..2 {
+                if accept_event(&mut seen, &event) {
+                    apply_agent_event(&mut threads[0], event.kind.clone());
+                }
+            }
+            check(&threads, Some(if id == 1 { body } else { body.trim_end() }));
+        }
+        for _ in 0..2 {
+            apply_interaction_event(
+                &mut threads[0],
+                interaction(InteractionEvent::ConversationFinished { text: body.into() }),
+            );
+            check(&threads, Some(body));
+        }
+        apply_agent_event(
+            &mut threads[0],
+            AgentEvent::ReplyDelta {
+                turn: Some(2),
+                text: "late duplicate".into(),
+            },
+        );
+        check(&threads, Some(body));
+    }
+
+    #[test]
+    fn copy_ignores_expanded_raw_evidence_and_unrelated_worker_focus() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        thread.finish_reply("```\r\n  α  \r\n```\r\n".into(), Some("2".into()));
+        apply_correlated_agent_event(
+            &mut thread,
+            AgentEvent::WorkResult {
+                result: evidence_result(1),
+            },
+            Some("2"),
+        );
+        let mut worker = Thread::new_foreground();
+        worker.is_foreground = false;
+        worker.id = "unrelated-worker".into();
+        worker.add_turn(
+            ItemKind::Reply,
+            "private worker answer".into(),
+            Some("2".into()),
+        );
+        let mut threads = vec![worker, thread];
+        for expanded in [false, true] {
+            for item in &mut threads[1].items {
+                item.hidden = !expanded;
+                if let Some(work) = &mut item.work {
+                    work.raw_open = expanded;
+                }
+            }
+            let cells = build_turn_cells(&threads[1]);
+            let _ = turn_cell_layout(
+                1,
+                0,
+                &threads,
+                &cells[0],
+                80,
+                0,
+                false,
+                "",
+                expanded,
+                Some("work-1"),
+            );
+            let mut copied = None;
+            assert!(handle_copy_key(
+                event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                MouseCapture::default(),
+                false,
+                "",
+                &threads,
+                Some(0),
+                |text| {
+                    copied = Some(text.to_owned());
+                    true
+                }
+            ));
+            assert_eq!(
+                copied,
+                Some(format!(
+                    "{}:\nquestion\n\n{}:\n```\r\n  α  \r\n```\r\n",
+                    names().user,
+                    names().conversation
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn copy_key_matrix_and_empty_selection_never_fall_back_to_other_text() {
+        let mut threads = vec![Thread::new_foreground()];
+        threads[0].add_turn(ItemKind::Reply, "standalone\n".into(), Some("2".into()));
+        threads[0].add_turn(ItemKind::User, String::new(), Some("3".into()));
+        threads[0].add_turn(ItemKind::PendingReply, "status".into(), Some("3".into()));
+        for (code, modifiers, pane, input, selected, handled, payload) in [
+            (
+                'c',
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                true,
+                "draft",
+                Some(0),
+                true,
+                true,
+            ),
+            (
+                'C',
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                false,
+                "",
+                Some(0),
+                true,
+                true,
+            ),
+            ('c', KeyModifiers::CONTROL, false, "", Some(0), false, false),
+            ('y', KeyModifiers::NONE, false, "", Some(0), true, true),
+            ('y', KeyModifiers::NONE, true, "", Some(0), false, false),
+            (
+                'y',
+                KeyModifiers::NONE,
+                false,
+                "draft",
+                Some(0),
+                false,
+                false,
+            ),
+            ('y', KeyModifiers::CONTROL, false, "", Some(0), false, false),
+            ('y', KeyModifiers::NONE, false, "", None, true, false),
+            (
+                'C',
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                false,
+                "",
+                None,
+                true,
+                false,
+            ),
+            ('y', KeyModifiers::NONE, false, "", Some(1), true, false),
+            ('y', KeyModifiers::NONE, false, "", Some(99), true, false),
+        ] {
+            let mut copied = None;
+            assert_eq!(
+                handle_copy_key(
+                    event::KeyEvent::new(KeyCode::Char(code), modifiers),
+                    MouseCapture(true),
+                    pane,
+                    input,
+                    &threads,
+                    selected,
+                    |text| {
+                        copied = Some(text.to_owned());
+                        false
+                    }
+                ),
+                handled
+            );
+            assert_eq!(
+                copied,
+                payload.then(|| format!("{}:\nstandalone\n", names().conversation))
+            );
+        }
+        let release = event::KeyEvent::new_with_kind(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            event::KeyEventKind::Release,
+        );
+        assert!(handle_copy_key(
+            release,
+            MouseCapture(true),
+            false,
+            "",
+            &threads,
+            Some(0),
+            |_| panic!("release copied")
+        ));
+        assert!(selected_chat_cell_text(&[], None).is_none());
+    }
+
+    #[test]
+    fn clipboard_queue_is_nonblocking_bounded_and_drains_snapshots_on_close() {
+        let (notifications, completed) = mpsc::channel();
+        let (delivered, deliveries) = mpsc::channel();
+        let (started, ready) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let clipboard = clipboard_worker(
+            move |text| {
+                delivered.send(text.to_owned()).unwrap();
+                let _ = started.send(());
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                // Failure must not prevent the next queued request from being handled.
+                CopyOutcome::Failed
+            },
+            notifications,
+        )
+        .unwrap();
+        let (returned, result) = mpsc::channel();
+        let ui = std::thread::spawn(move || {
+            let mut threads = vec![Thread::new_foreground()];
+            threads[0].add_turn(ItemKind::User, "question".into(), Some("2".into()));
+            threads[0].add_reply_fragment("  first α\r\n".into(), Some("2".into()), false);
+            let key = event::KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            let enqueue = |threads: &[Thread]| {
+                let mut accepted = false;
+                assert!(handle_copy_key(
+                    key,
+                    MouseCapture(true),
+                    false,
+                    "",
+                    threads,
+                    Some(0),
+                    |text| {
+                        accepted = clipboard.try_send(text.to_owned()).is_ok();
+                        accepted
+                    }
+                ));
+                accepted
+            };
+            assert!(enqueue(&threads));
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            threads[0].add_reply_fragment("second\n".into(), Some("2".into()), false);
+            assert!(enqueue(&threads));
+            threads[0].add_reply_fragment("not queued".into(), Some("2".into()), false);
+            for _ in 0..100 {
+                assert!(!enqueue(&threads));
+            }
+            // Session shutdown must return even while delivery is still blocked.
+            drop(clipboard);
+            returned.send(()).unwrap();
+        });
+        result
+            .recv_timeout(Duration::from_secs(2))
+            .expect("enqueue or session close blocked on delivery");
+        ui.join().unwrap();
+        let prefix = format!("{}:\nquestion\n\n{}:\n", names().user, names().conversation);
+        assert_eq!(
+            deliveries.recv_timeout(Duration::from_secs(2)).unwrap(),
+            format!("{prefix}  first α\r\n")
+        );
+        assert!(matches!(
+            deliveries.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        assert!(matches!(
+            completed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            TuiEvent::Clipboard(CopyOutcome::Failed)
+        ));
+        assert_eq!(
+            deliveries.recv_timeout(Duration::from_secs(2)).unwrap(),
+            format!("{prefix}  first α\r\nsecond\n")
+        );
+        release.send(()).unwrap();
+        assert!(matches!(
+            completed.recv_timeout(Duration::from_secs(2)).unwrap(),
+            TuiEvent::Clipboard(CopyOutcome::Failed)
+        ));
+        assert_eq!(
+            deliveries.recv_timeout(Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn clipboard_completion_reports_system_file_and_failure_distinctly() {
+        let (notifications, completed) = mpsc::channel();
+        let clipboard = clipboard_worker(
+            |text| {
+                copy_to_clipboard_with(
+                    text,
+                    |_, _| text == "system",
+                    |_| (text == "file").then(|| "/tmp/fake-clipboard.txt".into()),
+                )
+            },
+            notifications,
+        )
+        .unwrap();
+        for (payload, notice) in [
+            ("system", "System clipboard copied"),
+            (
+                "file",
+                "Saved to /tmp/fake-clipboard.txt (system clipboard unavailable)",
+            ),
+            (
+                "failure",
+                "Copy failed: clipboard helpers and file fallback unavailable",
+            ),
+        ] {
+            clipboard.try_send(payload.into()).unwrap();
+            let TuiEvent::Clipboard(outcome) =
+                completed.recv_timeout(Duration::from_secs(2)).unwrap()
+            else {
+                panic!("expected clipboard completion");
+            };
+            assert_eq!(outcome.notice(), notice);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clipboard_forked_owner_survives_success_but_not_failure_or_timeout() {
+        struct Owner(nix::unistd::Pid);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = nix::sys::signal::kill(self.0, nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+        for (ending, success) in [
+            ("exit 0", true),
+            ("exit 1", false),
+            ("exec sleep 60", false),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "tachyon-fake-copy-owner-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            // Mimic wl-copy's default fork-to-serve lifetime, without a display
+            // connection or any clipboard access. The owner stays in the group.
+            let script = format!("cat >/dev/null; sleep 60 & printf '%s' $! > \"$1\"; {ending}");
+            let result = clipboard_command(
+                &["sh", "-c", &script, "fake-copy", path.to_str().unwrap()],
+                "synthetic payload",
+            );
+            let pid = std::fs::read_to_string(&path)
+                .unwrap()
+                .parse::<i32>()
+                .unwrap();
+            std::fs::remove_file(path).unwrap();
+            let owner = Owner(nix::unistd::Pid::from_raw(pid));
+            assert_eq!(result, success);
+            let alive = || {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .is_some_and(|stat| !stat.split_once(") ").unwrap().1.starts_with(['Z', 'X']))
+            };
+            if success {
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(alive(), "successful helper's clipboard owner was killed");
+            } else {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while alive() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(!alive(), "failed helper leaked its owner");
+            }
+            drop(owner);
+        }
+    }
+
+    #[test]
+    fn yank_without_selection_copies_latest_cell() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::Reply, "latest answer".into(), Some("2".into()));
+        let mut copied = None;
+        assert!(handle_copy_key(
+            event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            MouseCapture::default(),
+            false,
+            "",
+            &[thread],
+            None,
+            |text| {
+                copied = Some(text.to_owned());
+                true
+            }
+        ));
+        assert_eq!(
+            copied,
+            Some(format!("{}:\nlatest answer", names().conversation))
+        );
+    }
+
+    #[test]
+    fn clipboard_fallback_order_and_exact_bytes_without_system_clipboard() {
+        let text = "  α\r\n```\n  code  \n```\n";
+        let commands = [
+            vec!["wl-copy"],
+            vec!["xclip", "-selection", "clipboard"],
+            vec!["xsel", "-b"],
+        ];
+        for success in 0..=4 {
+            let mut calls = Vec::new();
+            let mut fallback_called = false;
+            let result = copy_to_clipboard_with(
+                text,
+                |cmd, payload| {
+                    assert_eq!(payload, text);
+                    calls.push(cmd.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                    calls.len() - 1 == success
+                },
+                |payload| {
+                    assert_eq!(payload, text);
+                    fallback_called = true;
+                    (success == 3).then(|| "clipboard.txt".into())
+                },
+            );
+            assert_eq!(
+                result,
+                match success {
+                    0..=2 => CopyOutcome::SystemClipboard,
+                    3 => CopyOutcome::Saved("clipboard.txt".into()),
+                    _ => CopyOutcome::Failed,
+                }
+            );
+            assert_eq!(calls, commands[..(success + 1).min(3)]);
+            assert_eq!(fallback_called, success >= 3);
+        }
+        // Only harmless child processes: verify stdin bytes, EOF, spawn and exit failures.
+        assert!(clipboard_command(
+            &[
+                "sh",
+                "-c",
+                "test \"$(od -An -tx1 | tr -d ' \\n')\" = '2020610d0a620a'"
+            ],
+            "  a\r\nb\n"
+        ));
+        assert!(!clipboard_command(
+            &["/nonexistent/tachyon-copy-test"],
+            text
+        ));
+        assert!(!clipboard_command(&["sh", "-c", "exit 1"], text));
+        assert!(!clipboard_command(
+            &["sh", "-c", "exec 0<&-; exit 0"],
+            &"x".repeat(1024 * 1024)
+        ));
+    }
+
+    #[test]
+    fn clipboard_stalled_reader_and_exit_wait_reach_fallback() {
+        for (script, text) in [
+            ("exec sleep 60", "x".repeat(1024 * 1024)),
+            ("cat >/dev/null; exec sleep 60", "small".into()),
+        ] {
+            let started = std::time::Instant::now();
+            let mut attempts = 0;
+            let mut fallback_called = false;
+            assert_eq!(
+                copy_to_clipboard_with(
+                    &text,
+                    |_, payload| {
+                        attempts += 1;
+                        // Exercise one real blocked helper, not any installed clipboard.
+                        attempts == 1 && clipboard_command(&["sh", "-c", script], payload)
+                    },
+                    |payload| {
+                        assert_eq!(payload, text);
+                        fallback_called = true;
+                        Some("clipboard.txt".into())
+                    },
+                ),
+                CopyOutcome::Saved("clipboard.txt".into())
+            );
+            assert_eq!(attempts, 3);
+            assert!(fallback_called);
+            assert!(started.elapsed() < std::time::Duration::from_secs(3));
         }
     }
 
@@ -7703,7 +9102,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_cell_without_traces_is_clickable_and_highlighted() {
+    fn selected_conversation_has_no_header_or_body_selection_background() {
         let mut thread = Thread::new_foreground();
         thread.add_turn(ItemKind::User, "question".into(), Some("2".into()));
         thread.add_turn(ItemKind::Reply, "answer".into(), Some("2".into()));
@@ -7725,10 +9124,19 @@ mod tests {
             .hits
             .iter()
             .all(|hit| *hit == Some(ClickTarget::TraceSummary(0))));
+        assert_eq!(
+            layout
+                .lines
+                .iter()
+                .filter(|line| line.style.bg == Some(Color::Rgb(30, 32, 36)))
+                .count(),
+            0
+        );
         assert!(layout
             .lines
             .iter()
-            .all(|line| line.style.bg == Some(Color::Rgb(30, 32, 36))));
+            .flat_map(|line| &line.spans)
+            .all(|span| span.style.bg != Some(Color::Rgb(30, 32, 36))));
     }
 
     #[test]
@@ -8050,7 +9458,7 @@ mod tests {
         assert_eq!(
             footer_mode_text(Some(1), false),
             Some(format!(
-                "TRACE    ↑↓ select · {} Pg scroll · {} Esc close · {} help",
+                "TRACE    y copy · /mouse mode · ↑↓ select · {} Pg scroll · {} Esc close · {} help",
                 icon::SCROLL,
                 icon::CLOSE,
                 icon::HELP
@@ -8254,6 +9662,7 @@ mod tests {
             metadata: tachyon_api::InteractionMetadata {
                 protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
                 message_id: "event-1".into(),
+                cwd: None,
                 correlation_id: "turn-2".into(),
                 causation_id: Some("command-1".into()),
                 conversation_id: FOREGROUND_ID.into(),
@@ -8263,6 +9672,38 @@ mod tests {
             },
             event,
         }
+    }
+
+    #[test]
+    fn workspace_selection_is_explicit_and_per_message() {
+        let local = |path: &str| Ok(std::path::PathBuf::from(path));
+        assert_eq!(
+            foreground_workspace_request("research this".into(), local("/project/a")).unwrap(),
+            ("research this".into(), Some("/project/a".into()))
+        );
+        assert_eq!(
+            foreground_workspace_request("/managed research this".into(), local("/project/a"))
+                .unwrap(),
+            ("research this".into(), None)
+        );
+        assert_eq!(
+            foreground_workspace_request("next".into(), local("/project/b"))
+                .unwrap()
+                .1,
+            Some("/project/b".into())
+        );
+        assert!(
+            foreground_workspace_request("next".into(), Err(std::io::Error::other("gone")))
+                .unwrap_err()
+                .contains("cannot select current workspace")
+        );
+        assert!(foreground_workspace_request(
+            "/managed next".into(),
+            Err(std::io::Error::other("gone"))
+        )
+        .unwrap()
+        .1
+        .is_none());
     }
 
     #[test]
@@ -8787,7 +10228,13 @@ mod tests {
                 event_id,
                 AgentEvent::WorkResult {
                     result: tachyon_api::types::WorkResult {
+                        attempt_id: None,
+                        instruction_revision: None,
                         work_id: worker_id.into(),
+                        candidate_refs: None,
+                        final_context: None,
+                        evidence: Default::default(),
+                        timing: None,
                         objective: format!("work for turn {turn}"),
                         generation: 1,
                         assignment: 1,
@@ -8815,6 +10262,413 @@ mod tests {
             turn_badges(&thread, Some("3"), u64::MAX, false),
             "󰚩 1 agent · 󰄬 1 complete"
         );
+    }
+
+    fn evidence_result(assignment: u64) -> tachyon_api::types::WorkResult {
+        serde_json::from_value(serde_json::json!({
+            "work_id": "work-1", "objective": "Inspect Python", "generation": 1,
+            "assignment": assignment, "outcome": "completed", "result": "done",
+            "evidence": {"omitted": 7, "tools": [{
+                "call_id": "call-1", "parent_call_id": "python-parent", "tool_name": "python",
+                "arguments": {"code": "print('secret-code')"},
+                "output": {"content": "secret-output", "is_error": true, "truncated": true,
+                    "metadata": {"omitted_bytes": 400}, "error": {"message": "execution failed"}}
+            }]},
+            "timing": {"execution_ms": 1000, "inference_ms": null, "tool_ms": 0, "review_ms": 20}
+        }))
+        .unwrap()
+    }
+
+    fn evidence_layout(threads: &[Thread], open: bool, worker: Option<&str>) -> CellLayout {
+        let cell = build_turn_cells(&threads[0]).remove(0);
+        turn_cell_layout(0, 0, threads, &cell, 200, 0, false, "", open, worker)
+    }
+
+    fn layout_text(layout: &CellLayout) -> String {
+        layout
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn terminal_evidence_is_lazy_bounded_and_assignment_scoped() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        thread.add_tool("python {}".into(), "call-1".into(), Some("2".into()));
+        thread.add_tool_result("call-1".into(), "live-output".into(), Some("2".into()));
+        let mut result = evidence_result(1);
+        result.evidence.tools[0].parent_call_id = None;
+        for _ in 0..2 {
+            apply_correlated_agent_event(
+                &mut thread,
+                AgentEvent::WorkResult {
+                    result: result.clone(),
+                },
+                Some("2"),
+            );
+        }
+        assert_eq!(thread.items.len(), 3);
+        assert!(thread.items[1].output.is_none());
+        apply_correlated_agent_event(
+            &mut thread,
+            AgentEvent::ToolStarted {
+                turn: None,
+                id: "call-1".into(),
+                name: "python".into(),
+                arguments: "{}".into(),
+            },
+            Some("2"),
+        );
+        apply_correlated_agent_event(
+            &mut thread,
+            AgentEvent::ToolFinished {
+                turn: None,
+                id: "call-1".into(),
+                output: "replayed output".into(),
+            },
+            Some("2"),
+        );
+        assert_eq!(thread.items.len(), 3);
+        assert!(thread.items[1].output.is_none());
+        let saved = serde_json::to_value(thread.items[1].work.as_ref().unwrap()).unwrap();
+        let restored: WorkDetail = serde_json::from_value(saved).unwrap();
+        assert_eq!(
+            restored.tool.as_ref().unwrap().parent_call_id.as_deref(),
+            None
+        );
+        assert!(thread
+            .items
+            .iter()
+            .all(|item| item.turn.as_deref() == Some("2")));
+        let mut threads = vec![thread];
+        DETAIL_FORMATS.with(|count| count.set(0));
+        for (open, worker) in [(false, None), (false, Some("work-1")), (true, None)] {
+            let text = layout_text(&evidence_layout(&threads, open, worker));
+            assert!(!text.contains("secret-code"));
+            assert!(!text.contains("terminal evidence"));
+        }
+        let layout = evidence_layout(&threads, true, Some("work-1"));
+        let text = layout_text(&layout);
+        for expected in [
+            "python",
+            "error / truncated",
+            "7 omitted",
+            "inference unknown",
+            "tools 0ms",
+            "review 20ms separate",
+            "not additive",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(!text.contains("secret-code"));
+        assert!(!text.contains("secret-output"));
+        assert!(layout.hits.contains(&Some(ClickTarget::Item(0, 1))));
+        DETAIL_FORMATS.with(|count| assert_eq!(count.get(), 0));
+        threads[0].items[1].hidden = false;
+        let text = layout_text(&evidence_layout(&threads, true, Some("work-1")));
+        for expected in ["secret-code", "secret-output", "execution failed"] {
+            assert!(text.contains(expected));
+        }
+        DETAIL_FORMATS.with(|count| assert_eq!(count.get(), 1));
+        apply_correlated_agent_event(
+            &mut threads[0],
+            AgentEvent::WorkResult {
+                result: evidence_result(2),
+            },
+            Some("2"),
+        );
+        assert_eq!(threads[0].items.len(), 5);
+        assert_eq!(
+            threads[0]
+                .items
+                .iter()
+                .filter(|item| item.work.as_ref().is_some_and(|work| work.tool.is_some()))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn evidence_clean_view_preserves_code_and_raw_is_opt_in() {
+        let mut result = evidence_result(1);
+        let tool = &mut result.evidence.tools[0];
+        tool.arguments =
+            serde_json::json!({"code": "if True:\n    print('unique-code')\n\n    pass"});
+        tool.output = serde_json::json!({
+            "content": "unique-output", "is_error": false, "truncated": false,
+            "error": null, "output_ref": null, "continuation": null,
+            "metadata": {"exit_code": 0, "timed_out": false}
+        });
+        let mut thread = Thread::new_foreground();
+        apply_correlated_agent_event(&mut thread, AgentEvent::WorkResult { result }, Some("2"));
+        thread.items[0].hidden = false;
+        let render = |thread: &Thread| {
+            let mut layout = CellLayout {
+                lines: Vec::new(),
+                hits: Vec::new(),
+            };
+            push_trace_item(
+                &mut layout,
+                std::slice::from_ref(thread),
+                0,
+                0,
+                100,
+                "",
+                None,
+            );
+            layout
+        };
+        let layout = render(&thread);
+        let text = layout_text(&layout);
+        assert!(
+            text.contains("Code\n  if True:\n      print('unique-code')\n   \n      pass"),
+            "{text}"
+        );
+        assert!(text.contains("Output\n  unique-output"));
+        assert!(text.contains("exit0"));
+        assert_eq!(text.matches("unique-code").count(), 1);
+        assert_eq!(text.matches("unique-output").count(), 1);
+        for absent in [
+            "null",
+            "arguments",
+            "native envelope",
+            "call-1",
+            "python-parent",
+            "output_ref",
+            "metadata",
+            "error",
+            "truncated",
+        ] {
+            assert!(!text.contains(absent), "unexpected {absent}: {text}");
+        }
+        assert!(layout.hits.contains(&Some(ClickTarget::RawEvidence(0, 0))));
+        thread.items[0].work.as_mut().unwrap().raw_open = true;
+        let text = layout_text(&render(&thread));
+        for expected in [
+            "call call-1",
+            "parent python-parent",
+            "arguments",
+            "native envelope",
+            "metadata",
+            "assignment 1/1",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        thread.items[0].hidden = true;
+        DETAIL_FORMATS.with(|count| count.set(0));
+        assert!(!layout_text(&render(&thread)).contains("unique-code"));
+        DETAIL_FORMATS.with(|count| assert_eq!(count.get(), 0));
+    }
+
+    #[test]
+    fn evidence_preview_bounds_legacy_json_and_narrow_rendering() {
+        let mut result = evidence_result(1);
+        let tool = &mut result.evidence.tools[0];
+        tool.arguments = serde_json::json!({"code": "x\n".repeat(100_000)});
+        tool.output = serde_json::json!({
+            "content": "x".repeat(1_000_000), "truncated": true,
+            "error": "execution failed",
+            "output_ref": "stored-output-1", "metadata": {"omitted_bytes": 999999}
+        });
+        let details = work_tool_details(tool, true);
+        assert!(details.len() < 16 * 1024);
+        assert!(details.contains("stored-output-1"));
+        assert!(details.contains("omitted_bytes"));
+        assert!(details.contains("display truncated"));
+        let mut thread = Thread::new_foreground();
+        apply_correlated_agent_event(&mut thread, AgentEvent::WorkResult { result }, Some("2"));
+        thread.items[0].hidden = false;
+        for (width, raw) in [
+            (1, false),
+            (80, false),
+            (200, false),
+            (1, true),
+            (80, true),
+            (200, true),
+        ] {
+            thread.items[0].work.as_mut().unwrap().raw_open = raw;
+            let mut layout = CellLayout {
+                lines: Vec::new(),
+                hits: Vec::new(),
+            };
+            push_trace_item(
+                &mut layout,
+                std::slice::from_ref(&thread),
+                0,
+                0,
+                width,
+                "      ",
+                None,
+            );
+            assert!(layout.lines.len() <= 130);
+            assert_eq!(layout.lines.len(), layout.hits.len());
+            assert!(layout_text(&layout).len() < 17 * 1024);
+            assert!(layout_text(&layout).contains("display truncated"));
+            assert!(layout_text(&layout).contains("error / truncated"));
+            if width > 1 {
+                assert!(layout_text(&layout).contains("execution failed"));
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_does_not_claim_nested_or_uncorrelated_live_calls() {
+        for turn in [None, Some("2")] {
+            let mut thread = Thread::new_foreground();
+            thread.add_tool("python {}".into(), "call-1".into(), turn.map(str::to_owned));
+            let mut result = evidence_result(1);
+            if turn.is_none() {
+                result.evidence.tools[0].parent_call_id = None;
+            }
+            apply_correlated_agent_event(&mut thread, AgentEvent::WorkResult { result }, turn);
+            assert!(thread.items[0].work.is_none());
+            assert_eq!(thread.items.len(), 3);
+        }
+    }
+
+    #[test]
+    fn evidence_and_timing_replay_invalidate_cell_and_worker_revisions() {
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        let mut result = evidence_result(1);
+        apply_correlated_agent_event(
+            &mut thread,
+            AgentEvent::WorkResult {
+                result: result.clone(),
+            },
+            Some("2"),
+        );
+        let cell = build_turn_cells(&thread).remove(0);
+        let before = cell_revision(&thread, &cell);
+        thread.is_foreground = false;
+        let worker_before = worker_turn_revisions(std::slice::from_ref(&thread))["2"];
+        result.timing.as_mut().unwrap().review_ms = Some(123);
+        result.evidence.tools[0].output = serde_json::json!({"content": "updated"});
+        apply_correlated_agent_event(&mut thread, AgentEvent::WorkResult { result }, Some("2"));
+        assert_ne!(before, cell_revision(&thread, &cell));
+        assert_ne!(
+            worker_before,
+            worker_turn_revisions(std::slice::from_ref(&thread))["2"]
+        );
+        assert_eq!(thread.items.len(), 3);
+        assert_eq!(
+            thread.items[2]
+                .work
+                .as_ref()
+                .unwrap()
+                .timing
+                .as_ref()
+                .unwrap()
+                .review_ms,
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn evidence_does_not_merge_ambiguous_live_calls_and_replays_without_ids() {
+        let mut thread = Thread::new_foreground();
+        for _ in 0..2 {
+            thread.add_tool("python {}".into(), "call-1".into(), Some("2".into()));
+        }
+        let mut result = evidence_result(1);
+        apply_correlated_agent_event(
+            &mut thread,
+            AgentEvent::WorkResult {
+                result: result.clone(),
+            },
+            Some("2"),
+        );
+        assert!(thread.items[..2].iter().all(|item| item.work.is_none()));
+        result.assignment = 2;
+        result.evidence.tools[0].call_id = None;
+        for _ in 0..2 {
+            apply_correlated_agent_event(
+                &mut thread,
+                AgentEvent::WorkResult {
+                    result: result.clone(),
+                },
+                Some("2"),
+            );
+        }
+        assert_eq!(thread.items.len(), 6);
+    }
+
+    #[test]
+    fn legacy_work_result_has_no_invented_tools_or_timing() {
+        let old: SessionItem = serde_json::from_value(serde_json::json!({
+            "kind": "tool", "text": "python {}"
+        }))
+        .unwrap();
+        assert!(old.work.is_none());
+        let mut value = serde_json::to_value(evidence_result(1)).unwrap();
+        value.as_object_mut().unwrap().remove("evidence");
+        value.as_object_mut().unwrap().remove("timing");
+        let mut thread = Thread::new_foreground();
+        thread.add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        apply_correlated_agent_event(
+            &mut thread,
+            AgentEvent::WorkResult {
+                result: serde_json::from_value(value).unwrap(),
+            },
+            Some("2"),
+        );
+        assert_eq!(thread.items.len(), 2);
+        let text = layout_text(&evidence_layout(&[thread], true, Some("work-1")));
+        assert!(!text.contains("execution "));
+        assert!(!text.contains("python"));
+    }
+
+    #[test]
+    fn ten_thousand_workers_bound_rows_and_never_format_closed_worker_details() {
+        let mut root = Thread::new_foreground();
+        root.add_turn(ItemKind::User, "question".into(), Some("2".into()));
+        let mut threads = vec![root];
+        for index in 0..10_000 {
+            let mut worker = Thread::new_foreground();
+            worker.id = format!("worker-{index:05}");
+            worker.is_foreground = false;
+            apply_correlated_agent_event(
+                &mut worker,
+                AgentEvent::WorkResult {
+                    result: evidence_result(1),
+                },
+                Some("2"),
+            );
+            // Even previously opened cells must not format when their worker closes.
+            worker.items[0].hidden = false;
+            threads.push(worker);
+        }
+        DETAIL_FORMATS.with(|count| count.set(0));
+        let closed = evidence_layout(&threads, false, Some("worker-09999"));
+        assert!(closed.lines.len() < 20);
+        let open = evidence_layout(&threads, true, None);
+        assert!(open.lines.len() < 40);
+        assert_eq!(
+            open.hits
+                .iter()
+                .filter(|hit| matches!(hit, Some(ClickTarget::Worker(..))))
+                .count(),
+            20
+        );
+        assert!(layout_text(&open).contains("9980 worker summaries omitted"));
+        DETAIL_FORMATS.with(|count| assert_eq!(count.get(), 0));
+        let selected = evidence_layout(&threads, true, Some("worker-09999"));
+        assert!(selected.lines.len() < 100);
+        assert_eq!(
+            selected
+                .hits
+                .iter()
+                .filter(|hit| matches!(hit, Some(ClickTarget::Worker(..))))
+                .count(),
+            20
+        );
+        assert!(selected
+            .hits
+            .contains(&Some(ClickTarget::Worker(0, "worker-09999".into()))));
+        DETAIL_FORMATS.with(|count| assert_eq!(count.get(), 1));
     }
 
     #[test]
@@ -8871,6 +10725,7 @@ mod tests {
         let mut thread = Thread::new_foreground();
         thread.items.push(Item {
             kind: ItemKind::User,
+            work: None,
             text: "request".into(),
             hidden: false,
             output: None,
@@ -8881,6 +10736,7 @@ mod tests {
         });
         thread.items.push(Item {
             kind: ItemKind::Spawn,
+            work: None,
             text: "worker".into(),
             hidden: false,
             output: None,
@@ -9048,6 +10904,7 @@ mod tests {
         thread.items.push(Item {
             kind: ItemKind::User,
             text: "slow request".into(),
+            work: None,
             hidden: false,
             output: None,
             tool_id: None,
@@ -9058,6 +10915,7 @@ mod tests {
         thread.items.push(Item {
             kind: ItemKind::User,
             text: "foreground request".into(),
+            work: None,
             hidden: false,
             output: None,
             tool_id: None,
@@ -9068,6 +10926,7 @@ mod tests {
         thread.items.push(Item {
             kind: ItemKind::PendingReply,
             text: "Still checking that for you.".into(),
+            work: None,
             hidden: false,
             output: None,
             tool_id: None,
@@ -9078,6 +10937,7 @@ mod tests {
         thread.items.push(Item {
             kind: ItemKind::Reply,
             text: "late result".into(),
+            work: None,
             hidden: false,
             output: None,
             tool_id: None,

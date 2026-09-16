@@ -16,10 +16,10 @@ eventually expose both:
 
 ```text
 access_profile = workspace
-sandbox_backend = soft
+sandbox_backend = microvm
 ```
 
-This prevents a workspace-only process jail from being mistaken for a security
+This prevents a workspace starting directory from being mistaken for a security
 sandbox.
 
 ## Profiles
@@ -41,12 +41,33 @@ retention = persistent
 
 ## Current Boundary
 
-Ghost currently provides a soft boundary:
+Ghost currently provides local execution guardrails, not a sandbox:
 
 - The process starts in the agent workspace.
 - `HOME` is redirected into that workspace.
 - The environment is scrubbed.
-- Workspaces are private per agent.
+- Worker workspaces are selected per agent (standalone callers can select a cwd).
+
+Registry policy checks enabled operation names and declared capabilities at
+advertisement and execution. Package activation only selects instructions; it
+does not grant permissions or start an isolation backend. Partial packages can
+expose permitted direct schemas without exposing the package manual.
+
+Native file-tool path validation does not restrict arbitrary host access by
+authorized `exec` or IPython code. There is no separate network/egress capability
+or runtime approval broker in the current `ToolPolicy`. `TACHYON_JAILED` is an
+environment marker, not OS enforcement. The profiles above are proposed access
+profiles, distinct from `harness/profiles.rs` compiled-in package selection.
+See [HARNESS.md](HARNESS.md) for implemented dispatch and activation behavior.
+
+Python's workspace-only `require("workspace")` bridge revalidates authorization
+and dispatches native tools under the current policy, deadline, and cancellation.
+This restricts hostcalls, not Python's own filesystem/network access. Its private
+framed socket and bounded output are protocol guardrails, not isolation. Work-end
+cleanup kills scoped kernels; see [PYTHON.md](PYTHON.md) for shutdown/escape limits.
+The browser uses allowlisted CLI operations and fixed Lightpanda settings, with
+eager binary setup at startup. It is not a network/SSRF sandbox or a full web
+search engine; see [BROWSER.md](BROWSER.md).
 
 This does not prevent every host access path. It must not be advertised as a
 security boundary until filesystem, process, device, and network access are
@@ -60,11 +81,13 @@ minimal guest `/sbin/init` under its benchmark conditions. It also reports at
 most 5 MiB VMM overhead for a 1 CPU, 128 MiB guest, excluding workload-specific
 memory.
 
-These numbers make Firecracker plausible for long and persistent workers. A
-microVM for every short weather lookup would add latency and operational
-complexity, so the first implementation should keep `workspace` as the default
-soft profile and make Firecracker an explicit backend or a configurable default
-for trusted-risk environments.
+These numbers make Firecracker a candidate for long and persistent workers, not
+a selected or implemented backend. Native execution may remain an explicit,
+non-isolated development option. Proposed untrusted-research and isolated-ML
+profiles require a microVM; a requested or required VM must fail closed, with no
+silent native fallback. No automatic runtime selection is implemented here.
+See [SECURITY.md](SECURITY.md) for the deferred host/guest boundary, resource and
+recovery contract, GPU caveats, and independent security audit release gate.
 
 ## Required Future Enforcement
 
@@ -76,4 +99,4 @@ Before calling a profile secure, Tachyon must define and test:
 - Secret and credential exposure.
 - Resource limits and cleanup on release.
 - A visible profile/backend badge in the agent panel.
-- Fallback behavior when Firecracker is unavailable.
+- Fail-closed admission when a requested/required VM or its enforcement is unavailable.

@@ -30,6 +30,75 @@ pub fn workspaces_dir() -> PathBuf {
     data_dir().join("workspaces")
 }
 
+/// Validate host selection without creating directories or changing process cwd.
+pub fn selected_workspace(path: &str) -> Result<PathBuf, String> {
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() {
+        return Err("workspace selection must be an absolute path".into());
+    }
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("workspace unavailable: {error}"))?;
+    if !path.is_dir() {
+        return Err("workspace selection is not a directory".into());
+    }
+    if path.parent().is_none() {
+        return Err("filesystem root cannot be a worker workspace".into());
+    }
+    Ok(path)
+}
+
+/// Resolve configuration only, without creating the managed root.
+pub fn managed_agent_root(config: &crate::config::Config) -> Result<PathBuf, String> {
+    let root = config
+        .managed_agent_root
+        .clone()
+        .or_else(|| dirs::home_dir().map(|home| home.join("Agents")))
+        .ok_or("managed workspace requires a home directory or managed_agent_root")?;
+    if !root.is_absolute() || root.parent().is_none() {
+        return Err("managed_agent_root must be an absolute non-root directory".into());
+    }
+    Ok(root)
+}
+
+/// Ensure the managed root exists without modifying any existing contents.
+pub fn ensure_managed_agent_root(root: &std::path::Path) -> Result<PathBuf, String> {
+    if !root.is_absolute() || root.parent().is_none() {
+        return Err("managed_agent_root must be an absolute non-root directory".into());
+    }
+    fs::create_dir_all(root).map_err(|error| {
+        format!(
+            "managed root provisioning failed at {}: {error}",
+            root.display()
+        )
+    })?;
+    selected_workspace(&root.to_string_lossy())
+}
+
+pub fn provision_managed_workspace(root: &std::path::Path, id: &str) -> Result<PathBuf, String> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("invalid managed workspace id".into());
+    }
+    // Refuse collisions rather than adopting another assignment's data or symlinks.
+    let root = ensure_managed_agent_root(root)?;
+    let workspace = root.join(id);
+    fs::create_dir(&workspace)
+        .map_err(|error| format!("managed workspace provisioning failed: {error}"))?;
+    let workspace = selected_workspace(&workspace.to_string_lossy())?;
+    if workspace.parent() != Some(root.as_path()) {
+        return Err("managed workspace escaped configured root".into());
+    }
+    for directory in ["research", "artifacts"] {
+        fs::create_dir(workspace.join(directory))
+            .map_err(|error| format!("managed {directory} provisioning failed: {error}"))?;
+    }
+    Ok(workspace)
+}
+
 /// Authoritative databases. Portable imports and exports live outside this
 /// directory and must go through their versioned APIs.
 pub fn databases_dir() -> PathBuf {

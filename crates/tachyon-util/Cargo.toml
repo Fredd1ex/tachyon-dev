@@ -6,6 +6,7 @@ license.workspace = true
 description = "Shared utilities for the Tachyon runtime (root guard, common helpers)"
 
 [dependencies]
+tokio.workspace = true
 dirs = "6"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
@@ -17,3 +18,4 @@ tachyon-model.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring-core = "1"
 linux-keyutils-keyring-store = "1"
+secret-service = "5"

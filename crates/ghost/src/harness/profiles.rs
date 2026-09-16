@@ -7,6 +7,8 @@ use super::registry::{builtins, packages::Packages};
 use super::runtime::BrowserAvailability;
 use std::sync::Arc;
 
+pub const WORKER_EAGER: &[&str] = &["workspace", "exec", "ctx", "ipython", "work"];
+
 pub fn worker(backend: Arc<Local>, browser: BrowserAvailability) -> Packages {
     let mut packages = builtins::native();
     packages

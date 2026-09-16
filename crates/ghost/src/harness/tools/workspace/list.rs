@@ -75,6 +75,9 @@ impl Tool for LsTool {
             let mut smallest = BinaryHeap::with_capacity(limit.saturating_add(1));
             let mut total_entries = 0_u64;
             while let Some(entry) = directory.next_entry().await.map_err(io_error)? {
+                if entry.file_name() == crate::harness::runtime::path::NATIVE_WRITE_LOCK_DIRECTORY {
+                    continue;
+                }
                 total_entries += 1;
                 smallest.push(Candidate {
                     name: entry.file_name().to_string_lossy().into_owned(),
@@ -210,6 +213,7 @@ mod tests {
             policy: Arc::new(ToolPolicy::worker_default(root)),
             event_sink: Arc::new(NoopEventSink),
             output_store: Arc::new(NoopOutputStore),
+            host_service: None,
         };
         let result = LsTool::new()
             .execute(&context, json!({"limit": 2}))

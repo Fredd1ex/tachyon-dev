@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use super::version::{conflict, sha256, version};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tachyon_model::ToolSpec;
@@ -70,12 +71,13 @@ impl Tool for ReadTool {
             }
             let limit = requested_limit.min(context.policy.max_read_lines);
             let path = resolve_existing(context, &input.path).await?;
-            let metadata = tokio::fs::metadata(&path).await.map_err(io_error)?;
+            let file = tokio::fs::File::open(&path).await.map_err(io_error)?;
+            let metadata = file.metadata().await.map_err(io_error)?;
+            let snapshot_version = version(&metadata);
             if !metadata.is_file() {
                 return Err(ToolError::invalid("read path is not a regular file"));
             }
 
-            let file = tokio::fs::File::open(&path).await.map_err(io_error)?;
             let mut reader = BufReader::new(file);
             let mut buffer = [0_u8; 8192];
             let mut content = Vec::with_capacity(context.policy.max_return_bytes.min(64 * 1024));
@@ -121,6 +123,16 @@ impl Tool for ReadTool {
                 returned_lines += 1;
             }
 
+            if version(&reader.get_ref().metadata().await.map_err(io_error)?) != snapshot_version
+                || version(&tokio::fs::metadata(&path).await.map_err(io_error)?) != snapshot_version
+            {
+                return Err(conflict());
+            }
+            // Hash only the complete snapshot already collected, never a prefix or
+            // a second full-file scan merely to supply metadata for a bounded read.
+            let content_sha256 =
+                (offset == 1 && !truncated && !saw_more && content.len() as u64 == metadata.len())
+                    .then(|| sha256(&content));
             let content = match String::from_utf8(content) {
                 Ok(content) => content,
                 Err(error) if error.utf8_error().error_len().is_none() && truncated => {
@@ -145,6 +157,8 @@ impl Tool for ReadTool {
                     "offset": offset,
                     "lines": returned_lines,
                     "size_bytes": metadata.len(),
+                    "version": snapshot_version,
+                    "sha256": content_sha256,
                 }),
             );
             result.truncated = truncated || saw_more;
@@ -199,6 +213,7 @@ mod tests {
             policy: Arc::new(ToolPolicy::worker_default(root)),
             event_sink: Arc::new(NoopEventSink),
             output_store: Arc::new(NoopOutputStore),
+            host_service: None,
         };
         let result = ReadTool::new()
             .execute(
@@ -234,6 +249,7 @@ mod tests {
             policy: Arc::new(ToolPolicy::worker_default(root)),
             event_sink: Arc::new(NoopEventSink),
             output_store: Arc::new(NoopOutputStore),
+            host_service: None,
         };
         let error = ReadTool::new()
             .execute(&context, json!({"path":"binary"}))

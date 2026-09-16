@@ -7,6 +7,9 @@
 //! interface. This keeps the CLI, TUI, and foreground runtime
 //! in lock-step over a single protocol.
 
+pub mod agents;
+pub mod context;
+pub mod continuation;
 pub mod interaction;
 pub mod transport;
 pub mod types;
@@ -20,3 +23,6 @@ pub const FOREGROUND_ID: &str = "foreground";
 pub const BACKGROUND_ID: &str = "background";
 /// Stable identity of the curated-memory service/agent boundary.
 pub const MEMORY_ID: &str = "memory";
+pub mod campaign;
+pub mod integration;
+pub mod work;

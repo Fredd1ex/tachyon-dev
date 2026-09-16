@@ -5,6 +5,7 @@
 
 use crate::config::Config;
 use crate::style::{palette, render};
+use tachyon_util::credentials::StoreStatus;
 
 pub fn list() {
     let cfg = Config::load();
@@ -69,6 +70,16 @@ pub fn login() -> Result<(), String> {
     let key =
         rpassword::prompt_password("OpenRouter API key: ").map_err(|error| error.to_string())?;
     let key = key.trim();
+    let confirmation = persist_login(key, tachyon_util::credentials::store_openrouter_key)?;
+    println!("{confirmation}");
+    println!("Restart the daemon to use it: tachyon daemon restart");
+    Ok(())
+}
+
+fn persist_login(
+    key: &str,
+    store: impl FnOnce(&str) -> Result<StoreStatus, String>,
+) -> Result<&'static str, String> {
     if key.is_empty() {
         return Err("key cannot be empty".into());
     }
@@ -76,15 +87,50 @@ pub fn login() -> Result<(), String> {
     {
         return Err("key looks like a placeholder".into());
     }
-    tachyon_util::credentials::store_openrouter_key(key)?;
-    println!("Credential stored in the operating system credential store.");
-    println!("Restart the daemon to use it: tachyon daemon restart");
-    Ok(())
+    match store(key)? {
+        StoreStatus::Persistent => Ok("Credential saved to the persistent operating system credential store (survives reboot). Environment overrides still take precedence."),
+        StoreStatus::Volatile => Ok("WARNING: Persistent credential storage failed (it may be unavailable or locked). Credential saved to the volatile Linux kernel keyring and will be lost on reboot (or earlier if cleared). It overrides any older persistent key until then; after reboot that older key may become active again. Configure/unlock Secret Service and log in again for persistent storage. Environment overrides still take precedence."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_reports_actual_storage_lifetime() {
+        let fake_store = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let connection = fake_store.clone();
+        let confirmation = persist_login("fake-login-key", move |key| {
+            *connection.borrow_mut() = Some(key.to_string());
+            Ok(StoreStatus::Persistent)
+        })
+        .unwrap();
+        assert!(confirmation.contains("persistent"));
+        assert!(confirmation.contains("survives reboot"));
+        assert!(!confirmation.contains("fake-login-key"));
+        let warning = persist_login("fake-login-key", |_| Ok(StoreStatus::Volatile)).unwrap();
+        assert!(warning.contains("WARNING"));
+        assert!(warning.contains("lost on reboot"));
+        assert!(warning.contains("older key may become active"));
+        assert!(!warning.contains("survives reboot"));
+        assert!(!warning.contains("fake-login-key"));
+        // The login connection is gone; a new client still sees the saved value.
+        let new_connection = fake_store.clone();
+        assert_eq!(new_connection.borrow().as_deref(), Some("fake-login-key"));
+        assert_eq!(
+            persist_login("fake-login-key", |_| Err("persistent store locked".into())).unwrap_err(),
+            "persistent store locked"
+        );
+        for key in ["", "sk-test-fake", "placeholder", "your-api-key"] {
+            assert!(persist_login(key, |_| panic!("invalid key must not be stored")).is_err());
+        }
+    }
 }
 
 pub fn logout() -> Result<(), String> {
     tachyon_util::credentials::delete_openrouter_key()?;
-    println!("Credential removed from the operating system credential store.");
+    println!("Stored credentials removed (or already absent), including both persistent and volatile stores on Linux. OPENROUTER_API_KEY is unchanged; unset it separately in the daemon environment.");
     println!("Restart the daemon to clear it: tachyon daemon restart");
     Ok(())
 }

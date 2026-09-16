@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ghost", "crates/memory", "crates/orchestrators", "crates/tachyon-background", "crates/tachyon-foreground", "crates/tachyon-model", "crates/tachyond", "crates/tachyon-agent-supervisor", "crates/tachyon", "crates/tachyon-api", "crates/tachyon-client", "crates/tachyon-tui", "crates/tachyon-util"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 

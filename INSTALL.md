@@ -79,8 +79,25 @@ tachyon providers login
 tachyon daemon restart
 ```
 
-On Linux, Tachyon uses the kernel keyring, so the credential is memory-backed
-and must be entered again after a reboot.
+On Linux, Tachyon prefers the persistent default collection of a Secret Service
+provider over the user session D-Bus. A provider (for example GNOME Keyring or
+KeePassXC with Secret Service integration enabled) must already be installed,
+running, and have an unlocked persistent default collection. Tachyon does not
+install a provider or unlock collections for you. Availability is not guaranteed
+by a desktop environment, including COSMIC. Headless sessions also need access
+to that user session bus and unlocked store.
+
+If persistent storage fails (including an unavailable or locked store), login
+falls back to the Linux kernel keyring with an explicit warning: this credential
+is volatile and is lost on reboot, or earlier if the keyring is cleared. There is
+no plaintext fallback. Reads prefer an existing volatile key over a persistent
+key so a newer fallback login remains active after Secret Service unlocks.
+This also reads entries from the previous kernel-keyring backend. A successful
+persistent login clears the volatile override; cleanup failures are reported.
+After reboot, an older persistent key can become active again if you have not
+logged in persistently with the new key. See [Credentials](docs/tachyon/CREDENTIALS.md)
+for precedence, failure handling, and logout details. macOS Keychain and Windows
+Credential Manager continue to use their native backends.
 
 For ephemeral or CI use, export the API key before starting Tachyond. An
 environment value takes precedence over the credential store:

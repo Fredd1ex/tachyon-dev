@@ -4,8 +4,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tachyon_model::ToolSpec;
 
+use super::version::{check, version};
 use super::write::{atomic_replace, read_bounded_file};
-use crate::harness::runtime::path::resolve_write_target;
+use super::write_lock::lock_target;
 use crate::harness::runtime::{
     decode_input, Capability, Tool, ToolContext, ToolError, ToolErrorCode, ToolFuture, ToolResult,
 };
@@ -33,7 +34,9 @@ impl EditTool {
                     "properties": {
                         "path": { "type": "string" },
                         "old": { "type": "string", "minLength": 1 },
-                        "new": { "type": "string" }
+                        "new": { "type": "string" },
+                        "expected_version": { "type": "string", "description": "Optional read metadata.version; pass when editing inspected content to reject stale snapshots." },
+                        "expected_sha256": { "type": "string", "description": "Optional SHA-256 of the entire original file, not a read slice." }
                     },
                     "required": ["path", "old", "new"],
                     "additionalProperties": false
@@ -70,8 +73,25 @@ impl Tool for EditTool {
                     context.policy.max_write_bytes
                 )));
             }
-            let target = resolve_write_target(context, &input.path, false).await?;
+            let (_writer, target) = lock_target(context, &input.path, false).await?;
+            if !target.existed {
+                return Err(ToolError::new(
+                    ToolErrorCode::NotFound,
+                    "edit target does not exist",
+                    false,
+                ));
+            }
+            let snapshot = tokio::fs::metadata(&target.path)
+                .await
+                .map_err(|error| ToolError::new(ToolErrorCode::Io, error.to_string(), false))?;
+            let snapshot_version = version(&snapshot);
             let original = read_bounded_file(&target.path, context.policy.max_write_bytes).await?;
+            check(
+                input.expected_version.as_deref(),
+                input.expected_sha256.as_deref(),
+                &snapshot_version,
+                Some(&original),
+            )?;
             if original.contains(&0) {
                 return Err(ToolError::new(
                     ToolErrorCode::UnsupportedBinary,
@@ -117,7 +137,14 @@ impl Tool for EditTool {
             replacement.extend_from_slice(&original[..offset]);
             replacement.extend_from_slice(input.new.as_bytes());
             replacement.extend_from_slice(&original[offset + input.old.len()..]);
-            atomic_replace(context, &target, &replacement, Some(&original)).await?;
+            atomic_replace(
+                context,
+                &target,
+                &replacement,
+                Some(&original),
+                Some(&snapshot_version),
+            )
+            .await?;
 
             Ok(ToolResult::success(
                 format!("edited one occurrence in {}", input.path),
@@ -140,6 +167,8 @@ struct EditInput {
     path: String,
     old: String,
     new: String,
+    expected_version: Option<String>,
+    expected_sha256: Option<String>,
 }
 
 #[cfg(test)]
@@ -165,6 +194,7 @@ mod tests {
             policy: Arc::new(ToolPolicy::worker_default(root)),
             event_sink: Arc::new(NoopEventSink),
             output_store: Arc::new(NoopOutputStore),
+            host_service: None,
         }
     }
 

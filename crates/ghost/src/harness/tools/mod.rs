@@ -2,9 +2,12 @@
 
 //! Compiled-in tool implementations, schemas, and colocated guidance.
 
+pub mod agents;
 pub mod artifact;
 pub mod browser;
+pub mod ctx;
 pub mod exec;
+pub mod history;
 pub mod python;
 pub mod workspace;
 
@@ -27,3 +30,4 @@ mod tests {
         assert!(chars < 850, "worker schemas grew to {chars} chars");
     }
 }
+pub mod work;

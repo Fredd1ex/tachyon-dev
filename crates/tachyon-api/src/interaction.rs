@@ -17,6 +17,9 @@ pub struct InteractionMetadata {
     pub turn_id: Option<String>,
     pub generation: u64,
     pub occurred_at_ms: u64,
+    /// Host-selected workspace for this turn, never inferred from model output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 impl InteractionMetadata {
@@ -35,6 +38,7 @@ impl InteractionMetadata {
             turn_id: None,
             generation: 0,
             occurred_at_ms,
+            cwd: None,
         }
     }
 }
@@ -136,6 +140,7 @@ mod tests {
             turn_id: Some("3".into()),
             generation: 4,
             occurred_at_ms: 123,
+            cwd: None,
         }
     }
 

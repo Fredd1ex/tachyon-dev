@@ -324,6 +324,11 @@ async fn rg_candidates(
         .arg("--files-with-matches")
         .arg("--null")
         .arg("--no-messages")
+        .arg("--glob")
+        .arg(format!(
+            "!{}/**",
+            crate::harness::runtime::path::NATIVE_WRITE_LOCK_DIRECTORY
+        ))
         .arg("--max-filesize")
         .arg(max_file_bytes.to_string())
         .current_dir(root)
@@ -482,6 +487,7 @@ mod tests {
             policy: Arc::new(ToolPolicy::worker_default(root)),
             event_sink: Arc::new(NoopEventSink),
             output_store: Arc::new(NoopOutputStore),
+            host_service: None,
         }
     }
 

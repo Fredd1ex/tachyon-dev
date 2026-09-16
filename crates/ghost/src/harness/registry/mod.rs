@@ -7,6 +7,7 @@ use std::time::Instant;
 use serde_json::Value;
 use tachyon_model::ToolSpec;
 
+pub mod activation;
 pub mod builtins;
 pub mod manifest;
 pub mod packages;
@@ -17,14 +18,17 @@ use crate::harness::runtime::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
+    #[error("retained activation unavailable or version/permission mismatch: {0}")]
+    ActivationMismatch(String),
     #[error("duplicate tool name: {0}")]
     Duplicate(String),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: HashMap<&'static str, Arc<dyn Tool>>,
     manifests: Vec<manifest::Manifest>,
+    activation: Option<Arc<activation::WorkTools>>,
 }
 
 impl ToolRegistry {
@@ -59,21 +63,13 @@ impl ToolRegistry {
         definitions
     }
 
-    /// Only advertise package guidance when all of its documented operations
-    /// are allowed. Partial packages still expose their permitted tool schemas.
+    /// Current per-work catalog and loaded interfaces, filtered by current policy.
+    /// Partial packages still expose their permitted tool schemas, not guidance.
     pub fn guidance(&self, policy: &ToolPolicy) -> String {
-        self.manifests
-            .iter()
-            .filter(|manifest| {
-                manifest.operations.iter().all(|name| {
-                    self.tools
-                        .get(name)
-                        .is_some_and(|tool| policy.permits(tool.as_ref()))
-                })
-            })
-            .map(|manifest| manifest.usage.trim())
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        self.activation
+            .as_ref()
+            .map(|work| work.guidance(policy))
+            .unwrap_or_default()
     }
 
     pub async fn execute(
@@ -82,6 +78,7 @@ impl ToolRegistry {
         context: &ToolContext,
         input: Value,
     ) -> Result<ToolResult, ToolError> {
+        let _work_call = self.work_call().await;
         let tool = self
             .tools
             .get(name)
@@ -106,22 +103,30 @@ impl ToolRegistry {
             .checked_add(context.policy.max_duration)
             .unwrap_or(context.deadline);
         let deadline = context.deadline.min(policy_deadline);
-        let result = if tool.manages_own_lifecycle() {
-            tool.execute(context, input).await
-        } else {
-            tokio::select! {
-                _ = context.cancellation.cancelled() => Err(ToolError::new(
-                    ToolErrorCode::Cancelled,
-                    "tool call cancelled",
-                    true,
-                )),
-                _ = tokio::time::sleep_until(deadline.into()) => Err(ToolError::new(
-                    ToolErrorCode::Timeout,
-                    "tool call timed out",
-                    true,
-                )),
-                result = tool.execute(context, input) => result,
+        let evidence_input = input.clone();
+        let execution = async {
+            if tool.manages_own_lifecycle() {
+                tool.execute_with_registry(context, input, self).await
+            } else {
+                tokio::select! {
+                    _ = context.cancellation.cancelled() => Err(ToolError::new(
+                        ToolErrorCode::Cancelled,
+                        "tool call cancelled",
+                        true,
+                    )),
+                    _ = tokio::time::sleep_until(deadline.into()) => Err(ToolError::new(
+                        ToolErrorCode::Timeout,
+                        "tool call timed out",
+                        true,
+                    )),
+                    result = tool.execute_with_registry(context, input, self) => result,
+                }
             }
+        };
+        let result = tokio::select! {
+            biased;
+            _ = self.work_ended() => Err(ToolError::new(ToolErrorCode::Cancelled, "work has ended", false)),
+            result = execution => result,
         };
 
         let result = match result {
@@ -145,14 +150,39 @@ impl ToolRegistry {
                     result.truncated = true;
                 }
                 result.truncated |= byte_truncated;
+                if result.truncated {
+                    if let Some(digest) = result.metadata.get_mut("sha256") {
+                        *digest = Value::Null;
+                    }
+                }
                 let full_envelope = result.to_json(context.policy.max_return_bytes);
-                if full_envelope.len() > context.policy.max_model_content_bytes {
-                    result.output_ref = context.output_store.put(full_envelope).await;
+                if (self.activation.is_some() && matches!(name, "read" | "grep" | "ls" | "find"))
+                    || full_envelope.len() > context.policy.max_model_content_bytes
+                {
+                    let store: Arc<dyn crate::harness::runtime::ToolOutputStore> =
+                        match self.work_outputs() {
+                            Ok(store) => store,
+                            Err(_) => context.output_store.clone(),
+                        };
+                    result.output_ref = tokio::select! {
+                        biased;
+                        _ = self.work_ended() => None,
+                        reference = store.put(full_envelope) => reference,
+                    };
+                    if result.output_ref.is_none() {
+                        result.metadata["retention_gap"] =
+                            serde_json::json!("native envelope output capacity unavailable");
+                    }
                 }
                 Ok(result)
             }
             Err(error) => Err(error),
         };
+        drop(_work_call);
+        let observed = result.clone().unwrap_or_else(ToolError::into_result);
+        context
+            .event_sink
+            .record_result(name, context, &evidence_input, &observed);
         let duration = started.elapsed();
         let (success, truncated, bytes_out, error_code) = match &result {
             Ok(result) => (
@@ -198,6 +228,98 @@ mod tests {
         entered: Arc<AtomicBool>,
         delay: Duration,
         content: String,
+    }
+
+    #[tokio::test]
+    async fn work_envelope_reference_is_retrievable_by_ctx_and_expires() {
+        let mut installed = ToolRegistry::default();
+        let mut tool = FakeTool::new("fake");
+        tool.content = "large result".repeat(100);
+        installed.register(tool).unwrap();
+        installed
+            .register(crate::harness::tools::ctx::CtxTool::new())
+            .unwrap();
+        let mut context = context(Default::default());
+        Arc::make_mut(&mut context.policy)
+            .enabled_tools
+            .insert("ctx".into());
+        Arc::make_mut(&mut context.policy).max_model_content_bytes = 256;
+        let work = installed
+            .for_work(&context.policy, &[], &Default::default())
+            .unwrap();
+        let result = work.execute("fake", &context, json!({})).await.unwrap();
+        let reference = result.output_ref.unwrap();
+        let page = work
+            .execute(
+                "ctx",
+                &context,
+                json!({"action":"read", "reference":reference}),
+            )
+            .await
+            .unwrap();
+        assert!(page.content.contains("large result"));
+        let other = installed
+            .for_work(&context.policy, &[], &Default::default())
+            .unwrap();
+        assert_eq!(
+            other
+                .execute(
+                    "ctx",
+                    &context,
+                    json!({"action":"read", "reference":reference})
+                )
+                .await
+                .unwrap_err()
+                .code,
+            ToolErrorCode::PermissionDenied
+        );
+        work.finish_work().await;
+        assert!(work.work_outputs().unwrap().list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn work_finish_is_bounded_survives_waiter_drop_and_runs_once() {
+        struct SlowCleanup(FakeTool, Arc<std::sync::atomic::AtomicUsize>);
+        impl Tool for SlowCleanup {
+            fn name(&self) -> &'static str {
+                self.0.name()
+            }
+            fn schema(&self) -> &ToolSpec {
+                self.0.schema()
+            }
+            fn capabilities(&self) -> &'static [Capability] {
+                self.0.capabilities()
+            }
+            fn execute<'a>(&'a self, context: &'a ToolContext, input: Value) -> ToolFuture<'a> {
+                self.0.execute(context, input)
+            }
+            fn end_work(&self, _: uuid::Uuid) -> crate::harness::runtime::CleanupFuture {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                Box::pin(std::future::pending())
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut installed = ToolRegistry::default();
+        installed
+            .register(SlowCleanup(FakeTool::new("fake"), calls.clone()))
+            .unwrap();
+        let context = context(Default::default());
+        let work = installed
+            .for_work(&context.policy, &[], &Default::default())
+            .unwrap();
+        let started = Instant::now();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), work.finish_work())
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(6), work.clone().finish_work())
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(7));
+        assert!(work.execute("fake", &context, json!({})).await.is_err());
+        drop(work);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     impl FakeTool {
@@ -273,6 +395,7 @@ mod tests {
             }),
             event_sink: Arc::new(NoopEventSink),
             output_store: Arc::new(NoopOutputStore),
+            host_service: None,
         }
     }
 

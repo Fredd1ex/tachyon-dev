@@ -4,10 +4,13 @@ use std::path::{Component, Path, PathBuf};
 
 use super::{ToolContext, ToolError, ToolErrorCode};
 
+pub(crate) const NATIVE_WRITE_LOCK_DIRECTORY: &str = ".tachyon-write-locks";
+
 pub(crate) struct WriteTarget {
     pub path: PathBuf,
     pub parent: PathBuf,
     pub existed: bool,
+    pub locked_parent: Option<std::fs::File>,
 }
 
 pub(crate) async fn resolve_existing(
@@ -102,6 +105,7 @@ pub(crate) async fn resolve_write_target(
             path: parent.join(candidate.file_name().expect("file name validated")),
             parent,
             existed: false,
+            locked_parent: None,
         }),
         Err(error) => Err(io_error(requested, error)),
     }
@@ -123,6 +127,13 @@ async fn existing_write_target(
     if !metadata.is_file() {
         return Err(ToolError::invalid("write target is not a regular file"));
     }
+    if metadata.permissions().readonly() {
+        return Err(ToolError::new(
+            ToolErrorCode::PermissionDenied,
+            "read-only files cannot be replaced",
+            false,
+        ));
+    }
     let path = tokio::fs::canonicalize(candidate)
         .await
         .map_err(|error| io_error(requested, error))?;
@@ -137,6 +148,7 @@ async fn existing_write_target(
         path,
         parent,
         existed: true,
+        locked_parent: None,
     })
 }
 
@@ -169,11 +181,14 @@ fn candidate(context: &ToolContext, requested: &str) -> Result<PathBuf, ToolErro
 }
 
 pub(crate) fn is_allowed(context: &ToolContext, path: &Path) -> bool {
-    context
-        .policy
-        .allowed_roots
-        .iter()
-        .any(|root| path.starts_with(root))
+    !path
+        .components()
+        .any(|part| part.as_os_str() == NATIVE_WRITE_LOCK_DIRECTORY)
+        && context
+            .policy
+            .allowed_roots
+            .iter()
+            .any(|root| path.starts_with(root))
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -235,6 +250,7 @@ mod tests {
             policy: Arc::new(ToolPolicy::worker_default(root)),
             event_sink: Arc::new(NoopEventSink),
             output_store: Arc::new(NoopOutputStore),
+            host_service: None,
         }
     }
 

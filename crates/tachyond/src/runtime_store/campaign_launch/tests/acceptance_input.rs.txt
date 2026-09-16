@@ -1,0 +1,4 @@
+// Offline acceptance input. The implementation deliberately violates its test.
+fn total(a: u32, b: u32) -> u32 { a - b }
+#[test]
+fn adds() { assert_eq!(total(3, 2), 5); }

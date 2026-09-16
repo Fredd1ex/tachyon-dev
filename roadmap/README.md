@@ -50,3 +50,7 @@ contract.
 6. Make Tachyond an idempotent durable scheduler with restart reconciliation.
 7. Introduce the independent Background Coordinator and research task graphs.
 8. Build evaluation, replay, fault-injection, and benchmark gates.
+9. After feature completion, pass a release-blocking independent security audit
+   for research/isolation features; maintain targeted review and threat modeling
+   throughout. See the deferred [security contract](../docs/ghost/SECURITY.md) and
+   [security TODO](../docs/ghost/todos/todo.md#security-and-isolation).

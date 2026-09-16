@@ -13,6 +13,8 @@ installation, and repository status:
   component boundaries.
 - [`tachyon/INTERACTION.md`](tachyon/INTERACTION.md) - concurrent turns,
   delegation, events, and TUI publication.
+- [`tachyon/WORKSPACES.md`](tachyon/WORKSPACES.md) - host-selected cwd, explicit
+  managed work, lazy provisioning, and workspace-matched reuse.
 - [`tachyon/MEMORY.md`](tachyon/MEMORY.md) - memory service and persistence
   direction.
 - [`tachyon/RELIABILITY.md`](tachyon/RELIABILITY.md) - reliability invariants
@@ -36,10 +38,33 @@ Daemon-owned process, lifecycle, and recovery contracts:
 
 Worker execution and security boundaries:
 
-- [`ghost/HARNESS.md`](ghost/HARNESS.md) - Ghost model/tool loop and execution
-  backend.
+- [`ghost/ACCEPTANCE.md`](ghost/ACCEPTANCE.md) - offline scripted real-Ghost repair
+  and distributed evidence acceptance, remaining workflow gaps and benchmark authorization.
+- [`ghost/CONTINUATION.md`](ghost/CONTINUATION.md) - explicit local snapshot
+  continuation, fresh-process claims, configuration checks, and recovery limits.
+- [`ghost/WORK.md`](ghost/WORK.md) - core status, durable attention and typed CLI
+  answers, resident input waits, and explicit completion proposals.
+
+- [`ghost/HARNESS.md`](ghost/HARNESS.md) - implemented layout, model/tool loop,
+  package discovery and activation, tool maintenance, IPython setup, and tests.
+- [`ghost/TERMINOLOGY.md`](ghost/TERMINOLOGY.md) - canonical foundation vocabulary
+  and current naming/migration boundaries.
+- [`ghost/API.md`](ghost/API.md) - current metadata IPC and tool examples,
+  separated from proposed admission contracts.
+- [`ghost/RESEARCH.md`](ghost/RESEARCH.md) - research foundation draft, ledger and
+  budget direction, and attributed external references; not launch authorization.
+- [`ghost/PYTHON.md`](ghost/PYTHON.md) - workspace-only Python bridge, native
+  authorization, framed protocol, in-memory state, and work-end cleanup limits.
+- [`ghost/EXECUTION.md`](ghost/EXECUTION.md) - asynchronous exec, work cleanup,
+  bounded output spools, and ctx paging/search with live-work references.
+- [`ghost/GROUPS.md`](ghost/GROUPS.md) - durable host-internal campaign groups,
+  shared limits, transactional dispatch, terminal acknowledgements, and swarm gaps.
+- [`ghost/BROWSER.md`](ghost/BROWSER.md) - restricted Lightpanda browser, eager
+  provisioning, URL reading and automation (not a full web search engine).
 - [`ghost/SANDBOX.md`](ghost/SANDBOX.md) - workspace access and isolation
-  policy.
+  guardrails and proposed isolation policy (not an enforced sandbox).
+- [`ghost/SECURITY.md`](ghost/SECURITY.md) - deferred microVM trust boundary,
+  host-stability requirements, and pending independent security audit release gate.
 
 ## Specifications
 

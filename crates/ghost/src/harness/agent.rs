@@ -14,6 +14,26 @@ pub type ModelFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Completion, ModelError>> + Send + 'a>>;
 
 pub trait AgentModel: Send + Sync {
+    fn retain_outputs<'a>(
+        &'a self,
+        _outputs: &'a dyn super::runtime::ToolOutputStore,
+    ) -> super::runtime::OutputStoreFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn chat_with_context<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [ToolSpec],
+        _context: &'a tachyon_api::context::WorkerContextMetadata,
+    ) -> ModelFuture<'a> {
+        self.chat(messages, tools)
+    }
+    fn completion_proposal(&self) -> Option<tachyon_api::work::CompletionProposal> {
+        None
+    }
+    fn instruction_revision(&self) -> Option<u64> {
+        None
+    }
     fn chat<'a>(&'a self, messages: &'a [ChatMessage], tools: &'a [ToolSpec]) -> ModelFuture<'a>;
 }
 
@@ -26,6 +46,96 @@ impl AgentModel for Model {
     }
 }
 
+#[cfg(unix)]
+impl AgentModel for tachyon_model::broker::BrokerClient {
+    fn retain_outputs<'a>(
+        &'a self,
+        outputs: &'a dyn super::runtime::ToolOutputStore,
+    ) -> super::runtime::OutputStoreFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            use sha2::{Digest, Sha256};
+            use tachyon_model::broker::{ResourceUpload, UploadReply};
+            for reference in outputs.references() {
+                let first = outputs.export_page(&reference, 0).await?;
+                let (retained, total, storage_failed) =
+                    (first.retained, first.total, first.storage_failed);
+                let mut hash = Sha256::new();
+                let mut offset = 0;
+                let mut page = first;
+                loop {
+                    hash.update(&page.bytes);
+                    offset += page.bytes.len() as u64;
+                    if offset == retained {
+                        break;
+                    }
+                    page = outputs.export_page(&reference, offset).await?;
+                }
+                let sha256 = format!("{:x}", hash.finalize());
+                let reply = self
+                    .resource_upload(ResourceUpload::Begin {
+                        handle: reference.id.clone(),
+                        retained,
+                        total,
+                        storage_failed,
+                        sha256: sha256.clone(),
+                    })
+                    .await
+                    .map_err(|_| "output retention channel failed")?;
+                if !matches!(reply, UploadReply::Accepted { offset: 0 }) {
+                    return Err("output retention denied; retained spool gap".into());
+                }
+                offset = 0;
+                while offset < retained {
+                    let page = outputs.export_page(&reference, offset).await?;
+                    let next = offset + page.bytes.len() as u64;
+                    if next <= offset || page.retained != retained || page.total != total {
+                        return Err("output changed during retention".into());
+                    }
+                    let reply = self
+                        .resource_upload(ResourceUpload::Chunk {
+                            offset,
+                            bytes: page.bytes,
+                        })
+                        .await
+                        .map_err(|_| "output retention channel failed")?;
+                    if !matches!(reply, UploadReply::Accepted { offset } if offset == next) {
+                        return Err("output retention chunk rejected".into());
+                    }
+                    offset = next;
+                }
+                let reply = self
+                    .resource_upload(ResourceUpload::Finish {
+                        sha256: Some(sha256.clone()),
+                    })
+                    .await
+                    .map_err(|_| "output retention channel failed")?;
+                if !matches!(reply, UploadReply::Ready { resource } if resource.valid() && resource.version == sha256)
+                {
+                    return Err("output retention did not commit; retained spool gap".into());
+                }
+            }
+            Ok(())
+        })
+    }
+    fn chat_with_context<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [ToolSpec],
+        context: &'a tachyon_api::context::WorkerContextMetadata,
+    ) -> ModelFuture<'a> {
+        Box::pin(self.chat_with_context(messages, tools, context))
+    }
+    fn completion_proposal(&self) -> Option<tachyon_api::work::CompletionProposal> {
+        self.completion_proposal()
+    }
+    fn instruction_revision(&self) -> Option<u64> {
+        self.instruction_revision()
+    }
+    fn chat<'a>(&'a self, messages: &'a [ChatMessage], tools: &'a [ToolSpec]) -> ModelFuture<'a> {
+        Box::pin(self.chat(messages, tools))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum AgentLoopEvent {
     ToolStarted(ToolCall),
@@ -34,6 +144,8 @@ pub enum AgentLoopEvent {
 
 pub trait AgentLoopEventSink: Send + Sync {
     fn emit(&self, event: AgentLoopEvent);
+
+    fn record_wait(&self, _inference: bool, _elapsed: std::time::Duration) {}
 }
 
 pub async fn run_loop<M: AgentModel>(
@@ -44,15 +156,30 @@ pub async fn run_loop<M: AgentModel>(
     max_iterations: usize,
     events: &dyn AgentLoopEventSink,
 ) -> Result<(String, TokenUsage), String> {
-    let tools = registry.definitions(&context.policy);
     let mut usage = TokenUsage::default();
     let mut last_batch = None;
     let mut repeats = 0;
     for _ in 0..max_iterations {
-        let completion = model
-            .chat(messages, &tools)
-            .await
-            .map_err(|error| error.to_string())?;
+        let tools = registry.definitions(&context.policy);
+        // Ephemeral host guidance survives history compaction without accumulating
+        // stale or duplicate system instructions in the transcript.
+        let mut request = messages.clone();
+        let guidance = registry.guidance(&context.policy);
+        if !guidance.is_empty() {
+            if let Some(system) = request
+                .iter_mut()
+                .find(|m| m.role == tachyon_model::Role::System)
+            {
+                system.content.push(Content::Text(guidance));
+            } else {
+                request.insert(0, ChatMessage::new(tachyon_model::Role::System, guidance));
+            }
+        }
+        let started = tokio::time::Instant::now();
+        let metadata = registry.context_metadata();
+        let completion = model.chat_with_context(&request, &tools, &metadata).await;
+        events.record_wait(true, started.elapsed());
+        let completion = completion.map_err(|error| error.to_string())?;
         usage += completion.usage;
         let answer = completion.text.trim().to_string();
         let calls = completion.tool_calls.clone();
@@ -80,7 +207,9 @@ pub async fn run_loop<M: AgentModel>(
             events.emit(AgentLoopEvent::ToolStarted(call.clone()));
         }
         messages.push(completion.to_message());
+        let started = tokio::time::Instant::now();
         let outputs = join_all(calls.iter().map(|call| run_tool(call, registry, context))).await;
+        events.record_wait(false, started.elapsed());
         for (call, result) in calls.into_iter().zip(outputs) {
             let output = result.to_json(MAX_RETURN_BYTES);
             events.emit(AgentLoopEvent::ToolFinished {
@@ -94,6 +223,9 @@ pub async fn run_loop<M: AgentModel>(
                     output: result.to_json(context.policy.max_model_content_bytes),
                 }],
             });
+        }
+        if let Some(proposal) = model.completion_proposal() {
+            return Ok((proposal.summary, usage));
         }
     }
     Err("max iterations reached".into())
@@ -148,7 +280,7 @@ mod tests {
             tools: &'a [ToolSpec],
         ) -> ModelFuture<'a> {
             Box::pin(async move {
-                assert_eq!(tools.len(), 8);
+                assert_eq!(tools.len(), 9);
                 if let Some(previous) = messages.last().filter(|message| message.role == Role::Tool)
                 {
                     let output = previous
@@ -169,6 +301,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingSink {
+        waits: Mutex<Vec<(bool, Duration)>>,
         tools: Mutex<Vec<String>>,
         call_ids: Mutex<Vec<Option<String>>>,
         artifacts: Mutex<Vec<ArtifactRegistration>>,
@@ -188,6 +321,9 @@ mod tests {
 
     impl AgentLoopEventSink for RecordingSink {
         fn emit(&self, _event: AgentLoopEvent) {}
+        fn record_wait(&self, inference: bool, elapsed: Duration) {
+            self.waits.lock().unwrap().push((inference, elapsed));
+        }
     }
 
     fn tool(id: &str, name: &str, arguments: serde_json::Value) -> Completion {
@@ -201,6 +337,58 @@ mod tests {
             usage: TokenUsage::default(),
             finish_reason: Some("tool_calls".into()),
         }
+    }
+
+    #[tokio::test]
+    async fn timing_records_one_wait_for_a_parallel_tool_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut batch = tool("1", "ls", json!({"path":"."}));
+        batch
+            .tool_calls
+            .extend(tool("2", "ls", json!({"path":"."})).tool_calls);
+        let model = ScriptedModel {
+            steps: Mutex::new(VecDeque::from([
+                batch,
+                Completion {
+                    text: "done".into(),
+                    tool_calls: Vec::new(),
+                    usage: TokenUsage::default(),
+                    finish_reason: Some("stop".into()),
+                },
+            ])),
+        };
+        let sink = Arc::new(RecordingSink::default());
+        let context = ToolContext {
+            workspace_root: root.clone(),
+            cwd: root.clone(),
+            identity: ToolIdentity::default(),
+            deadline: Instant::now() + Duration::from_secs(10),
+            cancellation: CancellationToken::new(),
+            policy: Arc::new(ToolPolicy::worker_default(root)),
+            event_sink: sink.clone(),
+            output_store: Arc::new(NoopOutputStore),
+            host_service: None,
+        };
+        run_loop(
+            &model,
+            &mut vec![],
+            &native_registry(),
+            &context,
+            3,
+            sink.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sink.tools.lock().unwrap().len(), 2);
+        let waits = sink.waits.lock().unwrap();
+        assert_eq!(
+            waits
+                .iter()
+                .map(|(inference, _)| *inference)
+                .collect::<Vec<_>>(),
+            [true, false, true]
+        );
     }
 
     #[tokio::test]
@@ -273,6 +461,7 @@ mod tests {
             policy: Arc::new(ToolPolicy::worker_default(root.clone())),
             event_sink: sink.clone(),
             output_store: Arc::new(NoopOutputStore),
+            host_service: None,
         };
         let mut messages = vec![ChatMessage::new(
             Role::User,
