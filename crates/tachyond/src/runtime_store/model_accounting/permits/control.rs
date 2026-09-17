@@ -261,6 +261,73 @@ impl RuntimeStore {
         {
             return Err("revoked or mismatched permit".into());
         }
+        if matches!(&request, Request::Todo { .. } | Request::Monitor { .. }) {
+            use tachyon_api::{
+                agents::services::Scope,
+                monitor::{MonitorQuery, MonitorScope},
+                todo::TodoScope,
+            };
+            let tx = self.database.begin_write().map_err(|e| e.to_string())?;
+            Self::admitted_funding_in(&tx, &grant.funding)?;
+            drop(tx);
+            return Ok(match request {
+                Request::Todo { request } => {
+                    let scope = match request.scope() {
+                        Scope::CurrentWork => TodoScope::Work {
+                            work_id: identity.work_id.clone(),
+                        },
+                        Scope::CurrentCampaign => TodoScope::Campaign {
+                            campaign_id: identity.campaign_id.clone(),
+                        },
+                    };
+                    let result = self
+                        .todos(crate::runtime_store::todo::TodoAuthority::Ghost {
+                            scope: scope.clone(),
+                            work_id: identity.work_id.clone(),
+                            campaign_id: identity.campaign_id.clone(),
+                        })
+                        .and_then(|facade| facade.execute(request.bind(scope.clone())))
+                        .map_err(|error| match error {
+                            tachyon_api::todo::TodoError::Storage { .. } => {
+                                tachyon_api::todo::TodoError::Storage {
+                                    message: "todo storage unavailable".into(),
+                                }
+                            }
+                            error => error,
+                        });
+                    Reply::Todo { scope, result }
+                }
+                Request::Monitor {
+                    request:
+                        tachyon_api::agents::services::MonitorRequest::Snapshot {
+                            scope,
+                            after,
+                            limit,
+                        },
+                } => {
+                    let scope = match scope {
+                        Scope::CurrentWork => MonitorScope::Work {
+                            campaign_id: identity.campaign_id.clone(),
+                            work_id: identity.work_id.clone(),
+                        },
+                        Scope::CurrentCampaign => MonitorScope::Campaign {
+                            campaign_id: identity.campaign_id.clone(),
+                        },
+                    };
+                    let query = MonitorQuery {
+                        scope,
+                        after,
+                        limit,
+                    };
+                    let result = self
+                        .monitor_sample(std::slice::from_ref(&query))
+                        .map_err(|_| tachyon_api::monitor::MonitorError::Unavailable)
+                        .and_then(|mut samples| samples.remove(0));
+                    Reply::Monitor { query, result }
+                }
+                _ => unreachable!(),
+            });
+        }
         if let Request::Resource { request } = &request {
             let tx = self.database.begin_write().map_err(|e| e.to_string())?;
             Self::admitted_funding_in(&tx, &grant.funding)?;
@@ -286,7 +353,9 @@ impl RuntimeStore {
             Request::Templates { after, limit } => {
                 self.catalog_templates(&address(identity.work_id.clone()), after.as_deref(), limit)?
             }
-            Request::Resource { .. } => unreachable!(),
+            Request::Resource { .. } | Request::Todo { .. } | Request::Monitor { .. } => {
+                unreachable!()
+            }
             Request::Wait { .. } => return Err("wait requires asynchronous host boundary".into()),
             request @ (Request::Spawn { .. } | Request::Group { .. }) => {
                 self.admit_catalog(address(identity.work_id.clone()), request)?

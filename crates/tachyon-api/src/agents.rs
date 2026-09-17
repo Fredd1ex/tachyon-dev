@@ -1,11 +1,19 @@
 //! Private, permit-bound coordination. These are not public daemon IPC requests.
 use serde::{Deserialize, Serialize};
+pub mod services;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Control {
     Templates,
     Resource,
+    Todo,
+    /// Explicit campaign-scope grants, never implied by Work membership.
+    TodoCampaign,
+    MonitorCampaign,
+    /// Ancillary host aggregate capacity observations; no Host scope or registry IDs.
+    MonitorAvailability,
+    Monitor,
     Wait,
     Spawn,
     Group,
@@ -22,6 +30,12 @@ pub enum Control {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    Todo {
+        request: services::TodoRequest,
+    },
+    Monitor {
+        request: services::MonitorRequest,
+    },
     Propose {
         profile_id: String,
         objective: String,
@@ -123,6 +137,14 @@ impl Proposal {
 impl Request {
     pub fn control(&self) -> Control {
         match self {
+            Self::Todo { request } => match request.scope() {
+                services::Scope::CurrentWork => Control::Todo,
+                services::Scope::CurrentCampaign => Control::TodoCampaign,
+            },
+            Self::Monitor { request } => match request.scope() {
+                services::Scope::CurrentWork => Control::Monitor,
+                services::Scope::CurrentCampaign => Control::MonitorCampaign,
+            },
             Self::Templates { .. } => Control::Templates,
             Self::Resource { .. } => Control::Resource,
             Self::Wait { .. } => Control::Wait,
@@ -142,6 +164,18 @@ impl Request {
         let id = |s: &str| !s.trim().is_empty() && s.len() <= 256;
         let text = |s: &str| !s.is_empty() && s.len() <= 4096;
         let valid = match self {
+            Self::Todo {
+                request: services::TodoRequest::List { limit, .. },
+            } => limit.is_none_or(|n| (1..=8).contains(&n)),
+            Self::Todo { .. } => true, // Durable facade validates mutation and cursor bounds.
+            Self::Monitor {
+                request: services::MonitorRequest::Snapshot { after, limit, .. },
+            } => {
+                (1..=crate::monitor::MAX_PAGE).contains(limit)
+                    && after.as_deref().is_none_or(|s| {
+                        !s.is_empty() && s.len() <= 512 && !s.chars().any(char::is_control)
+                    })
+            }
             Self::Propose {
                 profile_id,
                 objective,
@@ -373,6 +407,14 @@ pub enum ResultPhase {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
+    Todo {
+        scope: crate::todo::TodoScope,
+        result: Result<crate::todo::TodoResponse, crate::todo::TodoError>,
+    },
+    Monitor {
+        query: crate::monitor::MonitorQuery,
+        result: Result<crate::monitor::MonitorPayload, crate::monitor::MonitorError>,
+    },
     Templates {
         templates: Vec<Template>,
         next_cursor: Option<String>,

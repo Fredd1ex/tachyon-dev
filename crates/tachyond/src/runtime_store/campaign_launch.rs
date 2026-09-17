@@ -84,6 +84,78 @@ pub(crate) struct CampaignService {
     stopping: std::sync::atomic::AtomicBool,
 }
 
+impl CampaignService {
+    pub(crate) fn monitor_capacity(&self) -> Result<tachyon_api::monitor::Capacity, String> {
+        use tachyon_api::monitor::*;
+        let active = self
+            .active
+            .try_lock()
+            .map_err(|_| "campaign registry unavailable")?;
+        Ok(Capacity {
+            resource: CapacityResource::Campaign,
+            sampled_at_ms: super::monitor::now_ms(),
+            limit: Decimal(self.store.host_capacity.limits.max_campaigns as u128),
+            held: Decimal(active.len() as u128),
+            queued: Decimal(0),
+            unresolved: Observed::Unknown,
+        })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn monitor_campaign_contention_preserves_stale_and_allows_shutdown() {
+    use tachyon_api::monitor::*;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(RuntimeStore::open(&dir.path().join("runtime.redb")).unwrap());
+    let campaigns = Arc::new(CampaignService {
+        store: store.clone(),
+        root: dir.path().into(),
+        active: Mutex::new(BTreeMap::new()),
+        stopping: false.into(),
+    });
+    let registry = Arc::new(Mutex::new(crate::Registry {
+        campaigns: Some(campaigns.clone()),
+        ..Default::default()
+    }));
+    let shutdown = registry.lock().unwrap().service_shutdown.clone();
+    let (monitor, sampler) =
+        crate::monitor::Monitor::start(Arc::downgrade(&registry), store, shutdown);
+    let lease = monitor
+        .acquire(
+            MonitorQuery {
+                scope: MonitorScope::Host,
+                after: None,
+                limit: MAX_PAGE,
+            },
+            true,
+        )
+        .unwrap();
+    let first = lease.latest(None).unwrap().unwrap();
+    assert!(first.payload.is_some() && first.stale.is_none());
+    let guard = campaigns.active.lock().unwrap();
+    let stale = (0..3).find_map(|_| lease.latest(Some(&first.version)).unwrap());
+    monitor.stop();
+    let (done, ended) = std::sync::mpsc::channel();
+    let joiner = std::thread::spawn(move || {
+        sampler.join().unwrap();
+        done.send(()).unwrap();
+    });
+    let stopped = ended.recv_timeout(Duration::from_secs(1));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = guard;
+        panic!("poison campaign monitor fixture");
+    }));
+    joiner.join().unwrap();
+    let unavailable = campaigns.monitor_capacity().is_err();
+    campaigns.active.clear_poison();
+    stopped.unwrap();
+    let stale = stale.expect("campaign source must not block the sampler");
+    assert_eq!(stale.payload, first.payload);
+    assert_eq!(stale.stale, Some(MonitorError::Unavailable));
+    assert!(unavailable);
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

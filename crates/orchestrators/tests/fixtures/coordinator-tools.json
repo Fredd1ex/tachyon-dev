@@ -1,0 +1,185 @@
+[
+  {
+    "description": "Delegate one objective requiring fresh work.",
+    "name": "spawn_agent",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "lifetime_class": {
+          "default": "short",
+          "description": "short: up to 3 assignments; long: daemon lifetime; persistent: reattaches after restart",
+          "enum": [
+            "short",
+            "long",
+            "persistent"
+          ],
+          "type": "string"
+        },
+        "purpose": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Fan out independent work to materially cut latency, including same-method lists; group dependent or strongly shared-state work.",
+    "name": "spawn_agents",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "lifetime_class": {
+          "default": "short",
+          "description": "short: up to 3 assignments; long: daemon lifetime; persistent: reattaches after restart",
+          "enum": [
+            "short",
+            "long",
+            "persistent"
+          ],
+          "type": "string"
+        },
+        "tasks": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8,
+          "type": "array"
+        }
+      },
+      "required": [
+        "tasks"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Inspect a worker's daemon-authoritative state.",
+    "name": "agent_inspect",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The Tachyon agent id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Read a worker's current state without blocking the daemon.",
+    "name": "agent_await",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The Tachyon agent id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Terminate, persist, and clean up a worker.",
+    "name": "agent_release",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The Tachyon agent id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Retain a verified completed worker and optionally promote or demote its lifecycle as the task evolves. Short allows 3 more assignments, long lasts until daemon exit, and persistent is reattached after daemon restart.",
+    "name": "agent_retain",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The Tachyon agent id.",
+          "type": "string"
+        },
+        "lease_until_secs": {
+          "description": "Optional Unix timestamp at which retention may expire.",
+          "type": "integer"
+        },
+        "lifetime_class": {
+          "description": "Optional promotion or demotion to a different lifetime policy.",
+          "enum": [
+            "short",
+            "long",
+            "persistent"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Place a worker in a visible grace period before termination so it can be retained before the deadline.",
+    "name": "agent_stage",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "ttl_secs": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "ttl_secs"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Replace a worker with a new objective, retaining its identity and dependencies.",
+    "name": "agent_replan",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "description": "The Tachyon agent id.",
+          "type": "string"
+        },
+        "task": {
+          "description": "The replacement durable objective.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "task"
+      ],
+      "type": "object"
+    }
+  }
+]

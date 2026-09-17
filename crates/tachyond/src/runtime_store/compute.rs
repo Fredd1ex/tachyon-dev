@@ -38,6 +38,156 @@ struct Record {
     final_ms: Option<u64>,
 }
 
+pub(super) fn monitor_in(
+    tx: &redb::ReadTransaction,
+    queries: &[tachyon_api::monitor::MonitorQuery],
+    output: &mut [Result<
+        tachyon_api::monitor::MonitorPayload,
+        tachyon_api::monitor::MonitorError,
+    >],
+) -> Result<(), String> {
+    use super::monitor::add;
+    let table = tx.open_table(JOBS).map_err(|e| e.to_string())?;
+    for row in table.iter().map_err(|e| e.to_string())? {
+        let (_, value) = row.map_err(|e| e.to_string())?;
+        let record: Record = serde_json::from_slice(value.value()).map_err(|e| e.to_string())?;
+        for (query, output) in queries.iter().zip(output.iter_mut()) {
+            if !query
+                .scope
+                .matches(&record.identity.campaign_id, Some(&record.identity.work_id))
+            {
+                continue;
+            }
+            let Ok(output) = output else {
+                continue;
+            };
+            let jobs = &mut output.durable.native_jobs;
+            let gpu = record.workload == (JobWorkload::Gpu {});
+            add(
+                if gpu {
+                    &mut jobs.gpu_charged_wall_ms
+                } else {
+                    &mut jobs.cpu_charged_wall_ms
+                },
+                record.final_ms.unwrap_or(record.reserved_ms).into(),
+            )?;
+            if record.final_ms.is_none() {
+                add(&mut jobs.unresolved, 1)?;
+                add(
+                    if gpu {
+                        &mut jobs.gpu_unresolved
+                    } else {
+                        &mut jobs.cpu_unresolved
+                    },
+                    1,
+                )?;
+            } else {
+                add(&mut jobs.finalized, 1)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+impl State {
+    pub(super) fn monitor(
+        &self,
+        cpu_limit: usize,
+        gpu_limit: usize,
+        cpu_available: usize,
+    ) -> Vec<tachyon_api::monitor::Capacity> {
+        use tachyon_api::monitor::*;
+        [
+            (
+                CapacityResource::Cpu,
+                cpu_limit,
+                cpu_limit.saturating_sub(cpu_available),
+                JobWorkload::Cpu {},
+            ),
+            (
+                CapacityResource::Gpu,
+                gpu_limit,
+                self.live
+                    .values()
+                    .filter(|(_, permit)| permit.is_none())
+                    .count(),
+                JobWorkload::Gpu {},
+            ),
+        ]
+        .into_iter()
+        .map(|(resource, limit, held, workload)| Capacity {
+            resource,
+            sampled_at_ms: super::monitor::now_ms(),
+            limit: Decimal(limit as u128),
+            held: Decimal(held as u128),
+            queued: Decimal(
+                self.queue
+                    .iter()
+                    .filter(|(_, _, class, _)| *class == workload)
+                    .count() as u128,
+            ),
+            // Durable unresolved occupancy is reported separately in NativeJobs.
+            unresolved: Observed::Unknown,
+        })
+        .collect()
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use tachyon_api::monitor::*;
+    #[test]
+    fn monitor_native_wall_charge_keeps_unresolved_and_zero_final_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RuntimeStore::open(&dir.path().join("runtime.redb")).unwrap();
+        let tx = store.database.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(JOBS).unwrap();
+            for (id, workload, final_ms) in [
+                ("a", JobWorkload::Cpu {}, None),
+                ("b", JobWorkload::Gpu {}, Some(0)),
+                ("c", JobWorkload::Cpu {}, Some(u64::MAX)),
+            ] {
+                let record = Record {
+                    profile: "SECRET_PROFILE".into(),
+                    session: Uuid::new_v4(),
+                    identity: WorkIdentity {
+                        campaign_id: "c".into(),
+                        work_id: "w".into(),
+                        attempt_id: "SECRET_ATTEMPT".into(),
+                        generation: 1,
+                        instruction_revision: 1,
+                        class: tachyon_model::accounting::RequestClass::Work,
+                    },
+                    workload,
+                    reserved_ms: u64::MAX,
+                    device_ids: vec!["SECRET_DEVICE".into()],
+                    final_ms,
+                };
+                table
+                    .insert(id, serde_json::to_vec(&record).unwrap().as_slice())
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let q = MonitorQuery {
+            scope: MonitorScope::Host,
+            after: None,
+            limit: 100,
+        };
+        let p = store.monitor_sample(&[q]).unwrap().remove(0).unwrap();
+        assert_eq!(
+            p.durable.native_jobs.cpu_charged_wall_ms.0,
+            u128::from(u64::MAX) * 2
+        );
+        assert_eq!(p.durable.native_jobs.gpu_charged_wall_ms.0, 0);
+        assert_eq!(p.durable.native_jobs.unresolved.0, 1);
+        assert_eq!(p.durable.native_jobs.finalized.0, 2);
+        assert!(!serde_json::to_string(&p).unwrap().contains("SECRET"));
+    }
+}
+
 impl RuntimeStore {
     pub(super) fn cleanup_job_in(
         tx: &redb::WriteTransaction,

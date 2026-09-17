@@ -8,9 +8,13 @@
 //! in lock-step over a single protocol.
 
 pub mod agents;
+pub mod campaign_oversight;
 pub mod context;
 pub mod continuation;
 pub mod interaction;
+pub mod monitor;
+pub mod operational_events;
+pub mod todo;
 pub mod transport;
 pub mod types;
 

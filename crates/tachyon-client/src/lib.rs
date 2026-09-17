@@ -15,6 +15,8 @@ use tachyon_api::types::{AgentInfo, ApiRequest, ApiResponse, DaemonInfo, Schedul
 /// Error surfaced to the caller.
 #[derive(Debug)]
 pub enum ClientError {
+    Monitor(tachyon_api::monitor::MonitorError),
+    Todo(tachyon_api::todo::TodoError),
     Io(io::Error),
     Api(String),
     NoDaemon,
@@ -23,6 +25,8 @@ pub enum ClientError {
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ClientError::Monitor(error) => write!(f, "monitor error: {error:?}"),
+            ClientError::Todo(error) => write!(f, "todo error: {error:?}"),
             ClientError::Io(e) => write!(f, "ipc error: {e}"),
             ClientError::Api(m) => write!(f, "{m}"),
             ClientError::NoDaemon => {
@@ -72,11 +76,107 @@ impl Client {
         let resp = self.conn.exchange(req)?;
         match resp {
             ApiResponse::Error { message, .. } => Err(ClientError::Api(message)),
+            ApiResponse::TodoError { error } => Err(ClientError::Todo(error)),
+            ApiResponse::MonitorError { error } => Err(ClientError::Monitor(error)),
             other => Ok(other),
         }
     }
 
     // ---- Mirrored API methods -----------------------------------------
+
+    pub fn monitor_get(
+        &mut self,
+        query: tachyon_api::monitor::MonitorQuery,
+    ) -> Result<tachyon_api::monitor::MonitorSnapshot, ClientError> {
+        query.validate().map_err(ClientError::Monitor)?;
+        match self.request(&ApiRequest::MonitorGet { query }, Duration::from_secs(30))? {
+            ApiResponse::Monitor { snapshot } => Ok(snapshot),
+            _ => Err(ClientError::Api("unexpected monitor response".into())),
+        }
+    }
+
+    pub fn todo(
+        &mut self,
+        request: tachyon_api::todo::TodoRequest,
+    ) -> Result<tachyon_api::todo::TodoResponse, ClientError> {
+        match self.request(&ApiRequest::Todo(request), Duration::from_secs(30))? {
+            ApiResponse::Todo { response } => Ok(response),
+            _ => Err(ClientError::Api("unexpected todo response".into())),
+        }
+    }
+
+    pub fn todo_snapshot(
+        &mut self,
+        scope: tachyon_api::todo::TodoScope,
+        limit: Option<usize>,
+        cursor: Option<tachyon_api::todo::TodoCursor>,
+    ) -> Result<tachyon_api::todo::TodoResponse, ClientError> {
+        match self.request(
+            &ApiRequest::TodoSnapshot {
+                scope,
+                limit,
+                cursor,
+            },
+            Duration::from_secs(30),
+        )? {
+            ApiResponse::Todo { response } => Ok(response),
+            _ => Err(ClientError::Api("unexpected todo snapshot response".into())),
+        }
+    }
+
+    pub fn todo_list(
+        &mut self,
+        scope: tachyon_api::todo::TodoScope,
+        filter: tachyon_api::todo::TodoFilter,
+        limit: Option<usize>,
+        cursor: Option<tachyon_api::todo::TodoCursor>,
+    ) -> Result<tachyon_api::todo::TodoResponse, ClientError> {
+        self.todo(tachyon_api::todo::TodoRequest::List {
+            scope,
+            filter,
+            limit,
+            cursor,
+        })
+    }
+
+    pub fn todo_add(
+        &mut self,
+        scope: tachyon_api::todo::TodoScope,
+        command_id: String,
+        expected_revision: u64,
+        title: String,
+        description: String,
+    ) -> Result<tachyon_api::todo::TodoResponse, ClientError> {
+        self.todo(tachyon_api::todo::TodoRequest::Add {
+            scope,
+            command_id,
+            expected_revision,
+            title,
+            description,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn todo_update(
+        &mut self,
+        scope: tachyon_api::todo::TodoScope,
+        command_id: String,
+        id: String,
+        expected_revision: u64,
+        title: Option<String>,
+        description: Option<String>,
+        status: Option<tachyon_api::todo::TodoStatus>,
+    ) -> Result<tachyon_api::todo::TodoResponse, ClientError> {
+        self.todo(tachyon_api::todo::TodoRequest::Update {
+            scope,
+            command_id,
+            id,
+            expected_revision,
+            title,
+            description,
+            status,
+        })
+    }
 
     /// Trusted host control lookup. Scope selects storage, not caller authority.
     pub fn artifact_get(
@@ -378,3 +478,130 @@ impl Subscription {
 }
 
 pub use tachyon_api::types as api;
+
+/// Dedicated latest-value connection. No event replay and no overflow queue.
+pub struct MonitorSubscription {
+    conn: Connection,
+}
+impl MonitorSubscription {
+    pub fn open(
+        query: tachyon_api::monitor::MonitorQuery,
+        after: Option<tachyon_api::monitor::MonitorVersion>,
+    ) -> Result<Self, ClientError> {
+        query.validate().map_err(ClientError::Monitor)?;
+        let mut conn = Connection::connect(tachyon_util::daemon::socket_path())?;
+        conn.send(&ApiRequest::MonitorSubscribe { query, after })?;
+        Ok(Self { conn })
+    }
+    pub fn recv(&mut self) -> Result<tachyon_api::monitor::MonitorSnapshot, ClientError> {
+        match self.conn.recv()? {
+            ApiResponse::Monitor { snapshot } => Ok(snapshot),
+            ApiResponse::MonitorError { error } => Err(ClientError::Monitor(error)),
+            ApiResponse::Error { message, .. } => Err(ClientError::Api(message)),
+            _ => Err(ClientError::Api("unexpected monitor response".into())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use tachyon_api::monitor::*;
+    use tachyon_api::transport::{read_request, write_response};
+
+    #[test]
+    fn monitor_client_keeps_typed_snapshots_stale_errors_and_disconnects() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "tachyon-monitor-client-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let conn = Connection::connect(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let query = MonitorQuery {
+            scope: MonitorScope::Host,
+            after: None,
+            limit: 100,
+        };
+        let expected = query.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            assert_eq!(
+                read_request(&mut reader).unwrap(),
+                ApiRequest::MonitorGet {
+                    query: expected.clone()
+                }
+            );
+            for epoch in ["old-daemon", "new-daemon"] {
+                write_response(
+                    &mut stream,
+                    &ApiResponse::Monitor {
+                        snapshot: MonitorSnapshot {
+                            query: expected.clone(),
+                            version: MonitorVersion {
+                                epoch: epoch.into(),
+                                sequence: 1,
+                            },
+                            payload: None,
+                            stale: Some(MonitorError::Unavailable),
+                        },
+                    },
+                )
+                .unwrap();
+            }
+            write_response(
+                &mut stream,
+                &ApiResponse::MonitorError {
+                    error: MonitorError::Stopped,
+                },
+            )
+            .unwrap();
+        });
+        let mut client = Client { conn };
+        let snapshot = client.monitor_get(query).unwrap();
+        assert_eq!(snapshot.version.epoch, "old-daemon");
+        assert_eq!(snapshot.stale, Some(MonitorError::Unavailable));
+        let mut subscription = MonitorSubscription { conn: client.conn };
+        assert_eq!(subscription.recv().unwrap().version.epoch, "new-daemon");
+        assert!(matches!(
+            subscription.recv(),
+            Err(ClientError::Monitor(MonitorError::Stopped))
+        ));
+        assert!(matches!(subscription.recv(), Err(ClientError::Io(_))));
+        server.join().unwrap();
+    }
+}
+
+/// Dedicated durable feed connection. Empty batches are checkpoints/heartbeats.
+pub struct OperationalSubscription {
+    conn: Connection,
+}
+
+impl OperationalSubscription {
+    pub fn open(
+        scope: tachyon_api::todo::TodoScope,
+        after: tachyon_api::operational_events::OperationalWatermark,
+    ) -> Result<Self, ClientError> {
+        let mut conn = Connection::connect(tachyon_util::daemon::socket_path())?;
+        conn.send(&ApiRequest::OperationalSubscribe { scope, after })?;
+        Ok(Self { conn })
+    }
+
+    pub fn recv(
+        &mut self,
+    ) -> Result<tachyon_api::operational_events::OperationalBatch, ClientError> {
+        match self.conn.recv()? {
+            ApiResponse::OperationalBatch { batch } => Ok(batch),
+            ApiResponse::TodoError { error } => Err(ClientError::Todo(error)),
+            ApiResponse::Error { message, .. } => Err(ClientError::Api(message)),
+            _ => Err(ClientError::Api(
+                "unexpected operational feed response".into(),
+            )),
+        }
+    }
+}

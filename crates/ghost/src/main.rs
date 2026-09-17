@@ -211,7 +211,7 @@ fn main() -> ExitCode {
             if client
                 .controls
                 .iter()
-                .any(|c| *c != tachyon_api::agents::Control::Resource)
+                .any(|c| !matches!(c, tachyon_api::agents::Control::Resource | tachyon_api::agents::Control::Todo | tachyon_api::agents::Control::TodoCampaign | tachyon_api::agents::Control::Monitor | tachyon_api::agents::Control::MonitorCampaign | tachyon_api::agents::Control::MonitorAvailability))
             {
                 packages
                     .register(ghost::harness::tools::agents::package(client.clone()))
@@ -226,6 +226,15 @@ fn main() -> ExitCode {
                     .register(ghost::harness::tools::history::package(client.clone()))
                     .expect("unique broker history package");
                 policy.enabled_tools.insert("history".into());
+            }
+            for (todo, name, grants) in [
+                (true, "todo", [tachyon_api::agents::Control::Todo, tachyon_api::agents::Control::TodoCampaign]),
+                (false, "monitor", [tachyon_api::agents::Control::Monitor, tachyon_api::agents::Control::MonitorCampaign]),
+            ] {
+                if grants.iter().any(|grant| client.controls.contains(grant)) {
+                    packages.register(ghost::harness::tools::services::package(client.clone(), todo)).expect("unique broker service package");
+                    policy.enabled_tools.insert(name.into());
+                }
             }
         }
         if let Some((_, request)) = &broker_work {

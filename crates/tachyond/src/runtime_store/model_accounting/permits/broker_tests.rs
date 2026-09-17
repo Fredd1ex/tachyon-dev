@@ -111,7 +111,7 @@ fn call<'a>(
     }
 }
 
-async fn fixture(
+pub(super) async fn fixture(
     store: Arc<RuntimeStore>,
     mode: &'static str,
 ) -> (
@@ -192,6 +192,15 @@ async fn fixture_with_barrier(
                 std::future::pending::<()>().await;
             }
             let body = match mode {
+                "services" | "services-python" if wire["messages"].as_array().unwrap().iter().all(|m| m["role"] != "tool") => {
+                    let calls = if mode == "services-python" {
+                        vec![serde_json::json!({"index":0,"id":"services","function":{"name":"ipython","arguments":serde_json::json!({"code":"import json\nt = require('todo')\nm = require('monitor')\nprint((await t.add(title='durable-plan-marker', command_id='local-model', expected_revision=0))['content'])\nprint((await m.snapshot())['content'])\nprint((await work.status())['content'])"}).to_string()}})]
+                    } else {
+                        [("todo", serde_json::json!({"action":"add","title":"durable-plan-marker","command_id":"local-model","expected_revision":0})), ("monitor", serde_json::json!({"action":"snapshot"})), ("work", serde_json::json!({"action":"status"}))].into_iter().enumerate().map(|(i, (name, input))| serde_json::json!({"index":i,"id":format!("service-{i}"),"function":{"name":name,"arguments":input.to_string()}})).collect()
+                    };
+                    format!("data: {}\n\ndata: [DONE]\n\n", serde_json::json!({"choices":[{"delta":{"tool_calls":calls}}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7,"cost":0.0000061}}))
+                }
+                "services" | "services-python" => format!("{VALID}data: [DONE]\n\n"),
                 "history" if wire["messages"].as_array().unwrap().iter().all(|m| m["role"] != "tool") => {
                     let actions = [
                         serde_json::json!({"action":"attempts","query":{"limit":8}}),

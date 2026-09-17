@@ -1141,6 +1141,173 @@ mod tests {
     }
 
     #[test]
+    fn two_turn_protocol_pending_checkpoint_and_paged_copy() {
+        let directory = Directory::new();
+        let mut first = Visits::open(&directory.0).unwrap();
+        let events = crate::tests::two_turn_fixture();
+        // Put the two fixture turns on opposite sides of a real archive page boundary.
+        let mut threads = conversation(TURNS_PER_PAGE - 1);
+        for (step, event) in events.iter().enumerate() {
+            first.observe(event);
+            let mut projected = event.clone();
+            projected.metadata.turn_id = event
+                .metadata
+                .turn_id
+                .as_deref()
+                .map(|turn| conversation_turn(&event.metadata.conversation_id, turn));
+            apply_interaction_event(&mut threads[0], projected);
+            for item in &mut threads[0].items {
+                item.timestamp = 100;
+            }
+            first.save(&threads).unwrap();
+            if step == 4 {
+                let expected = vec![(conversation_turn("fixture", "2"), 100)];
+                assert_eq!(first.recovery(), expected);
+                assert_eq!(
+                    read_pending(&first.root.join(&first.own)).unwrap(),
+                    expected.into_iter().collect()
+                );
+                let page = read_page(&first.root.join(&first.own), 0).unwrap();
+                assert_eq!(page[0].items.last().unwrap().text, "Checking α\n\n");
+            }
+        }
+        assert!(first.recovery().is_empty());
+        assert_eq!(page_count(&first.root.join(&first.own)).unwrap(), 2);
+        let expected = [
+            format!("{}:\n  first α\n\n\n{}:\n# Corrected α\n\n- one\n\n```text\n  exact  \n```\n\n", names().user, names().conversation),
+            format!("{}:\nsecond 界\r\n\n\n{}:\n  **second** 界\r\n\r\n```rust\r\n    ready();  \r\n```\r\n", names().user, names().conversation),
+        ];
+        let mut visits = Visits::open(&directory.0).unwrap();
+        let mut restored = vec![Thread::new_foreground()];
+        visits.latest(&mut restored).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+        let mut cache = TurnLayoutCache::default();
+        let mut projection = TurnProjection::default();
+        let mut view = TranscriptView::default();
+        let mut scroll = TranscriptScroll::default();
+        for (index, selected) in [(1, 0), (0, TURNS_PER_PAGE - 1), (1, 0)] {
+            if index == 0 {
+                assert!(visits.page(&mut restored, true).unwrap());
+            } else if visits.selected.as_ref().unwrap().1 == 0 {
+                assert!(visits.page(&mut restored, false).unwrap());
+            }
+            let mut open = Some(selected);
+            reset_transcript(
+                &mut scroll,
+                &mut view,
+                &mut cache,
+                &mut open,
+                &mut projection,
+            );
+            for redraw in 0..2 {
+                let builds = cache.builds;
+                terminal
+                    .draw(|f| {
+                        draw_conversation(
+                            f,
+                            f.area(),
+                            &restored,
+                            false,
+                            "",
+                            &mut scroll,
+                            &mut cache,
+                            &mut view,
+                            Some(selected),
+                            None,
+                            &mut projection,
+                        );
+                    })
+                    .unwrap();
+                if redraw == 1 {
+                    assert_eq!(cache.builds, builds);
+                }
+                assert_eq!(
+                    selected_chat_cell_text(&restored, Some(selected)),
+                    Some(expected[index].clone())
+                );
+                let mut copied = Vec::new();
+                assert!(handle_copy_key(
+                    event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                    MouseCapture::default(),
+                    false,
+                    "",
+                    &restored,
+                    Some(selected),
+                    |text| {
+                        copied.push(text.to_owned());
+                        true
+                    },
+                ));
+                assert_eq!(copied, [expected[index].clone()]);
+            }
+        }
+    }
+
+    #[test]
+    fn pending_history_publishes_independent_finals_without_foreground_events() {
+        use tachyon_api::types::{HistoryEntry, HistoryKind, HistoryRole};
+        let events = crate::tests::two_turn_fixture();
+        let entries: Vec<_> = events
+            .iter()
+            .filter_map(|event| {
+                let InteractionEvent::ConversationFinished { text } = &event.event else {
+                    return None;
+                };
+                Some(HistoryEntry {
+                    event_id: event.metadata.message_id.clone(),
+                    kind: HistoryKind::Conversation,
+                    conversation_id: event.metadata.conversation_id.clone(),
+                    turn_id: event.metadata.turn_id.clone(),
+                    occurred_at_ms: event.metadata.occurred_at_ms,
+                    role: HistoryRole::Assistant,
+                    text: text.clone(),
+                    task_id: None,
+                    task_state: None,
+                })
+            })
+            .collect();
+        let pending = [
+            (conversation_turn("fixture", "2"), 100),
+            (conversation_turn("fixture", "3"), 101),
+        ];
+        for available in 1..=entries.len() {
+            let mut published = Vec::new();
+            recover_pages(
+                &pending,
+                200,
+                |since, until, limit| {
+                    assert_eq!((since, until, limit), (0, 200, 256));
+                    let mut page = entries[..available].to_vec();
+                    for (kind, role) in [
+                        (HistoryKind::Task, HistoryRole::Assistant),
+                        (HistoryKind::Conversation, HistoryRole::Notification),
+                        (HistoryKind::Conversation, HistoryRole::User),
+                    ] {
+                        let mut noise = entries[0].clone();
+                        noise.kind = kind;
+                        noise.role = role;
+                        noise.text = "RAW EVIDENCE OR NOTIFICATION".into();
+                        page.push(noise);
+                    }
+                    Ok(page)
+                },
+                |entry| {
+                    published.push(entry);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(published, entries[..available]);
+            assert_eq!(published[0].turn_id.as_deref(), Some("3"));
+            if available == 3 {
+                assert_eq!(published[1].event_id, "finish-2");
+                assert_eq!(published[2].event_id, "correct-2");
+                assert_ne!(published[1].text, published[2].text);
+            }
+        }
+    }
+
+    #[test]
     fn end_then_up_without_current_turns_returns_to_latest_archive() {
         let directory = Directory::new();
         let mut first = Visits::open(&directory.0).unwrap();

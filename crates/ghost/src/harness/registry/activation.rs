@@ -206,6 +206,10 @@ impl ToolRegistry {
         for name in eager {
             let _ = work.activate(name, policy);
         }
+        // Instructions only. Durable plans and samples are retrieved by explicit tools.
+        for name in ["todo", "monitor"] {
+            let _ = work.activate(name, policy);
+        }
         let mut registry = self.clone();
         registry.register(Discovery {
             work: work.clone(),

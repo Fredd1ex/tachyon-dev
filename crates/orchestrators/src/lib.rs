@@ -5,11 +5,14 @@
 //! Prompt policy, provider-neutral schemas, and deterministic orchestration
 //! decisions live here. Runtime/model adapters belong to their role hosts.
 
+pub mod agents;
 pub mod attention;
-pub mod background;
 pub mod capabilities;
 pub mod control;
-pub mod conversation;
+pub mod registry;
 pub mod scheduler;
 pub mod tasks;
 pub mod tools;
+
+// Shipped foreground, background, and Ghost consumers use these paths.
+pub use agents::{conversation, coordinator as background};

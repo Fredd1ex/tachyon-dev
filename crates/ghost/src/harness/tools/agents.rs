@@ -13,7 +13,17 @@ pub fn package(client: Arc<BrokerClient>) -> Package {
         .controls
         .iter()
         .copied()
-        .filter(|c| *c != Control::Resource)
+        .filter(|c| {
+            !matches!(
+                c,
+                Control::Resource
+                    | Control::Todo
+                    | Control::TodoCampaign
+                    | Control::Monitor
+                    | Control::MonitorCampaign
+                    | Control::MonitorAvailability
+            )
+        })
         .collect();
     Package {
         manifest: Manifest {

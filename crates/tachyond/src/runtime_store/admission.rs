@@ -14,6 +14,73 @@ pub(super) const WORK: TableDefinition<&str, &[u8]> =
 pub(super) const PENDING: TableDefinition<&str, ()> =
     TableDefinition::new("campaign_dispatch_pending");
 const MAX_BATCH: usize = 32;
+pub(super) fn monitor_allocation(
+    tx: &redb::ReadTransaction,
+    scope: &tachyon_api::monitor::MonitorScope,
+) -> Result<Option<String>, String> {
+    let tachyon_api::monitor::MonitorScope::Work {
+        campaign_id,
+        work_id,
+    } = scope
+    else {
+        return Ok(None);
+    };
+    let table = tx.open_table(WORK).map_err(err)?;
+    let Some(row) = table.get(work_id.as_str()).map_err(err)? else {
+        return Ok(None);
+    };
+    let work = decode(row.value(), work_id)?;
+    Ok((work.admission.campaign_id == *campaign_id).then_some(work.dispatch_id))
+}
+
+pub(super) fn monitor_in(
+    tx: &redb::ReadTransaction,
+    queries: &[tachyon_api::monitor::MonitorQuery],
+    output: &mut [Result<
+        tachyon_api::monitor::MonitorPayload,
+        tachyon_api::monitor::MonitorError,
+    >],
+) -> Result<(), String> {
+    use tachyon_api::monitor::*;
+    let table = tx.open_table(WORK).map_err(err)?;
+    for row in table.iter().map_err(err)? {
+        let (key, value) = row.map_err(err)?;
+        let work = decode(value.value(), key.value())?;
+        for (query, output) in queries.iter().zip(output.iter_mut()) {
+            if !query
+                .scope
+                .matches(&work.admission.campaign_id, Some(&work.admission.work_id))
+            {
+                continue;
+            }
+            let Ok(output) = output else {
+                continue;
+            };
+            super::monitor::add(&mut output.durable.admitted_work, 1)?;
+            if matches!(query.scope, MonitorScope::Host) {
+                continue;
+            }
+            let state = match work.state {
+                DispatchState::Admitted => "admitted",
+                DispatchState::DispatchingUnknown => "dispatching_unknown",
+                DispatchState::Registered { .. } => "registered",
+                DispatchState::ConfirmedUnspent => "confirmed_unspent",
+                DispatchState::Cancelled => "cancelled",
+            };
+            super::monitor::entry(
+                &mut output.registered,
+                query,
+                RegisteredEntry {
+                    id: work.admission.work_id.clone(),
+                    role: RegisteredRole::CampaignWork,
+                    state: state.into(),
+                    pid: None,
+                },
+            );
+        }
+    }
+    Ok(())
+}
 const MAX_SCAN: usize = 64;
 const CURSOR: TableDefinition<&str, &str> = TableDefinition::new("campaign_dispatch_cursor");
 

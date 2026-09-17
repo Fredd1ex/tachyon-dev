@@ -75,7 +75,7 @@ matches = await ws.grep(pattern="TODO")
 ```
 
 The bridged packages are `workspace`, `exec`, `ctx`, `browser`, `artifact`, and
-host-enabled `history`, `work`, and `agents`
+host-enabled `history`, `work`, `agents`, `todo`, and `monitor`
 (see [AGENTS.md](AGENTS.md)). Workspace operations are
 `read`, `write`, `edit`, `ls`, `find`, and `grep`. `search` is an alias for **grep**,
 with exactly grep's schema (`pattern`, not a separate `query` API). Methods take
@@ -83,6 +83,10 @@ keyword arguments and return the native ToolResult envelope as a dictionary.
 Native failures raised as ToolError become Python RuntimeError with the structured
 error dictionary; native ToolResult `is_error` remains visible in the returned
 dictionary. No duplicate file/search implementation exists in Python.
+
+For durable plan and monitor methods, scope grants, revision conflicts and source
+authority, see [Durable Plans And Monitoring](TODOS_MONITOR.md). These services use
+the same generic descriptors; no Python plan or monitoring state is authoritative.
 
 `require` uses the existing authorized, idempotent activation API. It selects
 concise guidance and returns current schemas; it never grants permissions.

@@ -1,0 +1,41 @@
+[
+  {
+    "description": "Submit one advisory semantic review of the supplied worker result.",
+    "name": "submit_work_review",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "enum": [
+            "accept",
+            "rework"
+          ],
+          "type": "string"
+        },
+        "lifecycle": {
+          "enum": [
+            "keep_current",
+            "release",
+            "retain_short",
+            "retain_long",
+            "retain_persistent"
+          ],
+          "type": "string"
+        },
+        "rationale": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "revised_objective": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "decision",
+        "rationale"
+      ],
+      "type": "object"
+    }
+  }
+]

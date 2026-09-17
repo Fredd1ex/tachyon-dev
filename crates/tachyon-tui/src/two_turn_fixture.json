@@ -1,0 +1,11 @@
+[
+  {"protocol_version":1,"message_id":"accept-2","correlation_id":"request-2","causation_id":"command-2","conversation_id":"fixture","turn_id":"2","generation":1,"occurred_at_ms":100,"event":"user_turn_accepted","text":"  first α\n"},
+  {"protocol_version":1,"message_id":"accept-3","correlation_id":"request-3","causation_id":"command-3","conversation_id":"fixture","turn_id":"3","generation":1,"occurred_at_ms":101,"event":"user_turn_accepted","text":"second 界\r\n"},
+  {"protocol_version":1,"message_id":"delta-2","correlation_id":"request-2","causation_id":"command-2","conversation_id":"fixture","turn_id":"2","generation":1,"occurred_at_ms":102,"event":"conversation_delta","text":"Checking α\n\n"},
+  {"protocol_version":1,"message_id":"delta-3","correlation_id":"request-3","causation_id":"command-3","conversation_id":"fixture","turn_id":"3","generation":1,"occurred_at_ms":103,"event":"conversation_delta","text":"  **second** 界\r\n"},
+  {"protocol_version":1,"message_id":"finish-3","correlation_id":"request-3","causation_id":"command-3","conversation_id":"fixture","turn_id":"3","generation":1,"occurred_at_ms":104,"event":"conversation_finished","text":"  **second** 界\r\n\r\n```rust\r\n    ready();  \r\n```\r\n"},
+  {"protocol_version":1,"message_id":"finish-2","correlation_id":"request-2","causation_id":"command-2","conversation_id":"fixture","turn_id":"2","generation":1,"occurred_at_ms":105,"event":"conversation_finished","text":"# First α\n\n- one\n\n```text\n  exact  \n```\n\n"},
+  {"protocol_version":1,"message_id":"late-2","correlation_id":"request-2","causation_id":"command-2","conversation_id":"fixture","turn_id":"2","generation":1,"occurred_at_ms":106,"event":"conversation_delta","text":"LATE MUST NOT APPEND"},
+  {"protocol_version":1,"message_id":"correct-2","correlation_id":"request-2","causation_id":"command-2","conversation_id":"fixture","turn_id":"2","generation":1,"occurred_at_ms":107,"event":"conversation_finished","text":"# Corrected α\n\n- one\n\n```text\n  exact  \n```\n\n"},
+  {"protocol_version":1,"message_id":"notice-1","correlation_id":"reminder-1","causation_id":null,"conversation_id":"fixture","turn_id":null,"generation":1,"occurred_at_ms":108,"event":"user_visible_notification_published","text":"UNRELATED NOTIFICATION"}
+]

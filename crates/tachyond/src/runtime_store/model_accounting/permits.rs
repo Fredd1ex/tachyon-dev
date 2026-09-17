@@ -11,6 +11,8 @@ mod context;
 #[cfg(target_os = "linux")]
 mod control;
 mod cpu_jobs;
+#[cfg(all(test, target_os = "linux"))]
+mod service_tests;
 #[cfg(target_os = "linux")]
 mod subprocess;
 mod work;
@@ -362,47 +364,66 @@ impl ModelBroker {
                     let nonce = permit.0;
                     let reservation = reservation.clone();
                     let allowed = self.allowed_controls.contains(&request.control());
+                    let availability = self
+                        .allowed_controls
+                        .contains(&tachyon_api::agents::Control::MonitorAvailability);
                     #[cfg(target_os = "linux")]
                     let launches = self.launches.clone();
                     #[cfg(target_os = "linux")]
                     let research_artifacts = self.research_artifacts.clone();
-                    let operation = tokio::task::spawn_blocking(move || {
-                        if !allowed || Instant::now() >= deadline {
-                            return tachyon_api::agents::Reply::Denied;
-                        }
-                        #[cfg(target_os = "linux")]
-                        {
-                            let reply = store
-                                .broker_control_with_context(
-                                    nonce,
-                                    &reservation,
-                                    request,
-                                    research_artifacts.as_deref(),
-                                )
-                                .unwrap_or(tachyon_api::agents::Reply::Denied);
-                            if let tachyon_api::agents::Reply::CancellationRequested {
-                                work_id,
-                                generation,
-                            } = &reply
+                    let operation =
+                        tokio::task::spawn_blocking(move || {
+                            if !allowed || Instant::now() >= deadline {
+                                return tachyon_api::agents::Reply::Denied;
+                            }
+                            #[cfg(target_os = "linux")]
                             {
-                                if let Ok(registry) = launches.lock() {
-                                    if let Some(cancel) = registry.get(&(
-                                        reservation.identity.campaign_id.clone(),
-                                        work_id.clone(),
-                                        *generation,
-                                    )) {
-                                        cancel.send_replace(true);
+                                let mut reply = store
+                                    .broker_control_with_context(
+                                        nonce,
+                                        &reservation,
+                                        request,
+                                        research_artifacts.as_deref(),
+                                    )
+                                    .unwrap_or(tachyon_api::agents::Reply::Denied);
+                                if availability {
+                                    if let tachyon_api::agents::Reply::Monitor { result, .. } =
+                                        &mut reply
+                                    {
+                                        // Aggregate counts only; never project another campaign's records.
+                                        if let Ok(payload) = result {
+                                            match store.monitor_capacities() {
+                                                Ok(capacities) => payload.capacities = capacities,
+                                                Err(_) => *result = Err(
+                                                    tachyon_api::monitor::MonitorError::Unavailable,
+                                                ),
+                                            }
+                                        }
                                     }
                                 }
+                                if let tachyon_api::agents::Reply::CancellationRequested {
+                                    work_id,
+                                    generation,
+                                } = &reply
+                                {
+                                    if let Ok(registry) = launches.lock() {
+                                        if let Some(cancel) = registry.get(&(
+                                            reservation.identity.campaign_id.clone(),
+                                            work_id.clone(),
+                                            *generation,
+                                        )) {
+                                            cancel.send_replace(true);
+                                        }
+                                    }
+                                }
+                                reply
                             }
-                            reply
-                        }
-                        #[cfg(not(target_os = "linux"))]
-                        {
-                            let _ = (store, nonce, reservation, request);
-                            tachyon_api::agents::Reply::Denied
-                        }
-                    });
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                let _ = (store, nonce, reservation, request);
+                                tachyon_api::agents::Reply::Denied
+                            }
+                        });
                     let reply = tokio::select! {
                         biased;
                         _ = stream.read(&mut unexpected) => return Err(protocol_error()),

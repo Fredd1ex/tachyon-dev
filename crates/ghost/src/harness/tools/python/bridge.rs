@@ -33,6 +33,8 @@ pub(crate) const PACKAGES: &[(&str, &[&str])] = &[
     ("agents", &["agents"]),
     ("history", &["history"]),
     ("work", &["work"]),
+    ("todo", &["todo"]),
+    ("monitor", &["monitor"]),
     ("browser", &["agent_browser"]),
     ("artifact", &["artifact"]),
 ];
@@ -379,7 +381,7 @@ mod tests {
         .for_work(&policy, &[], &Default::default())
         .unwrap();
         for (package, _) in PACKAGES {
-            if matches!(*package, "agents" | "history" | "work") {
+            if matches!(*package, "agents" | "history" | "work" | "todo" | "monitor") {
                 assert!(registry.python_require(package, &policy).is_err());
                 assert!(!policy.enabled_tools.contains(*package));
                 continue;

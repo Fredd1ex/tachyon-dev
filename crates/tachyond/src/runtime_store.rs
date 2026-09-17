@@ -9,11 +9,14 @@ pub(crate) mod execution;
 pub(crate) mod groups;
 mod integration;
 pub(crate) mod model_accounting;
+pub(crate) mod monitor;
+pub(crate) mod operational_events;
 mod research;
 #[cfg(target_os = "linux")]
 pub(crate) mod research_context;
 #[cfg(target_os = "linux")]
 pub(crate) mod scheduler;
+pub(crate) mod todo;
 
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -246,6 +249,8 @@ impl RuntimeStore {
             admission::initialize(&write)?;
             groups::initialize(&write)?;
             coordination::initialize(&write)?;
+            operational_events::initialize(&write)?;
+            todo::initialize(&write)?;
             #[cfg(target_os = "linux")]
             execution::initialize(&write)?;
         }

@@ -9,6 +9,9 @@ pub mod ctx;
 pub mod exec;
 pub mod history;
 pub mod python;
+pub mod services;
+#[cfg(test)]
+mod services_tests;
 pub mod workspace;
 
 pub use browser::agent_browser;

@@ -13,6 +13,214 @@ use super::{research::CAMPAIGNS, RuntimeStore};
 const ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("campaign_ledger_roots");
 const RECEIPTS: TableDefinition<&str, &[u8]> = TableDefinition::new("campaign_ledger_receipts");
 
+pub(super) fn monitor_in(
+    tx: &redb::ReadTransaction,
+    queries: &[tachyon_api::monitor::MonitorQuery],
+    allocations: &[Option<String>],
+    output: &mut [Result<
+        tachyon_api::monitor::MonitorPayload,
+        tachyon_api::monitor::MonitorError,
+    >],
+) -> Result<(), String> {
+    use tachyon_api::monitor::*;
+    let table = tx.open_table(ROOTS).map_err(err)?;
+    for row in table.iter().map_err(err)? {
+        let (key, value) = row.map_err(err)?;
+        let ledger = decode(value.value(), key.value())?;
+        let funding = monitor_funding(&ledger, None)?;
+        for ((query, allocation), output) in queries.iter().zip(allocations).zip(output.iter_mut())
+        {
+            let campaign = match &query.scope {
+                MonitorScope::Host => true,
+                MonitorScope::Campaign { campaign_id } | MonitorScope::Work { campaign_id, .. } => {
+                    campaign_id == &ledger.campaign_id
+                }
+            };
+            if !campaign {
+                continue;
+            }
+            let Ok(output) = output else { continue };
+            if matches!(output.durable.inference, Observed::Unknown) {
+                output.durable.inference = Observed::Known(Inference::default());
+            }
+            let Observed::Known(totals) = &mut output.durable.inference else {
+                unreachable!()
+            };
+            project_monitor(&ledger, allocation.as_deref(), totals)?;
+            let local;
+            let funding = if let Some(id) = allocation {
+                local = monitor_funding(&ledger, Some(id))?;
+                &local
+            } else {
+                &funding
+            };
+            if matches!(output.durable.funding, Observed::Unknown) {
+                output.durable.funding = Observed::Known(Funding::default());
+            }
+            let Observed::Known(total) = &mut output.durable.funding else {
+                unreachable!()
+            };
+            for (to, from) in [
+                (&mut total.work, &funding.work),
+                (&mut total.verification, &funding.verification),
+            ] {
+                monitor_amounts(&mut to.authorized, &from.authorized)?;
+                monitor_amounts(&mut to.committed, &from.committed)?;
+                monitor_amounts(&mut to.available, &from.available)?;
+            }
+            monitor_amounts(&mut total.debt, &funding.debt)?;
+            if let Observed::Known(n) = funding.paused_ledgers {
+                if matches!(total.paused_ledgers, Observed::Unknown) {
+                    total.paused_ledgers = Observed::Known(Decimal(0));
+                }
+                if let Observed::Known(ref mut to) = total.paused_ledgers {
+                    super::monitor::add(to, n.0)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn monitor_amounts(
+    to: &mut tachyon_api::monitor::Amounts,
+    from: &tachyon_api::monitor::Amounts,
+) -> Result<(), String> {
+    super::monitor::add(&mut to.tokens, from.tokens.0)?;
+    super::monitor::add(&mut to.cost_micro_usd, from.cost_micro_usd.0)
+}
+
+fn monitor_funding(
+    ledger: &Ledger,
+    allocation: Option<&str>,
+) -> Result<tachyon_api::monitor::Funding, String> {
+    use tachyon_api::monitor::*;
+    let amounts = |t: Totals| Amounts {
+        tokens: Decimal(t.tokens),
+        cost_micro_usd: Decimal(t.cost_micro_usd),
+    };
+    let charged = |r: &Reservation| match r.usage {
+        Usage::Final(n) => n,
+        Usage::Provisional(n) => Units {
+            tokens: n.tokens.max(r.reserved.tokens),
+            cost_micro_usd: n.cost_micro_usd.max(r.reserved.cost_micro_usd),
+        },
+        Usage::Unknown => r.reserved,
+    };
+    let mut funding = Funding::default();
+    for (pool, limit, target) in [
+        (Pool::Work, ledger.envelope.work, &mut funding.work),
+        (
+            Pool::Verification,
+            ledger.envelope.verification,
+            &mut funding.verification,
+        ),
+    ] {
+        let (limit, committed) = if let Some(id) = allocation {
+            let r = ledger
+                .reservations
+                .get(id)
+                .ok_or("missing monitor allocation")?;
+            if r.pool != pool {
+                continue;
+            }
+            if ledger.allocations.contains_key(id) {
+                let allowance = ledger.allocation_allowance(id)?;
+                let mut committed = Totals::default();
+                for r in ledger
+                    .reservations
+                    .values()
+                    .filter(|r| r.allocation.as_deref() == Some(id))
+                {
+                    committed.add(charged(r))?;
+                }
+                (allowance, committed)
+            } else {
+                let mut committed = Totals::default();
+                committed.add(charged(r))?;
+                (r.reserved, committed)
+            }
+        } else {
+            (limit, ledger.committed(pool)?)
+        };
+        target.authorized = amounts(Totals {
+            tokens: limit.tokens.into(),
+            cost_micro_usd: limit.cost_micro_usd.into(),
+        });
+        target.committed = amounts(committed);
+        target.available = amounts(Totals {
+            tokens: u128::from(limit.tokens).saturating_sub(committed.tokens),
+            cost_micro_usd: u128::from(limit.cost_micro_usd)
+                .saturating_sub(committed.cost_micro_usd),
+        });
+        if allocation.is_some_and(|id| ledger.allocations.get(id) == Some(&true)) {
+            target.available = Amounts::default();
+        }
+    }
+    if allocation.is_none() {
+        funding.debt = amounts(ledger.debt);
+        funding.paused_ledgers = Observed::Known(Decimal(u128::from(ledger.admissions_paused)));
+    } else {
+        // Work debt cannot reveal another allocation's usage.
+        for (id, r) in &ledger.reservations {
+            if !ledger.allocations.contains_key(id)
+                && (Some(id.as_str()) == allocation || r.allocation.as_deref() == allocation)
+            {
+                if let Usage::Final(n) | Usage::Provisional(n) = r.usage {
+                    super::monitor::add(
+                        &mut funding.debt.tokens,
+                        n.tokens.saturating_sub(r.reserved.tokens).into(),
+                    )?;
+                    super::monitor::add(
+                        &mut funding.debt.cost_micro_usd,
+                        n.cost_micro_usd
+                            .saturating_sub(r.reserved.cost_micro_usd)
+                            .into(),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(funding)
+}
+
+fn project_monitor(
+    ledger: &Ledger,
+    allocation: Option<&str>,
+    totals: &mut tachyon_api::monitor::Inference,
+) -> Result<(), String> {
+    use super::monitor::add;
+    let amounts = |to: &mut tachyon_api::monitor::Amounts, units: Units| -> Result<(), String> {
+        add(&mut to.tokens, units.tokens.into())?;
+        add(&mut to.cost_micro_usd, units.cost_micro_usd.into())
+    };
+    for (id, r) in &ledger.reservations {
+        if allocation.is_some_and(|a| id != a && r.allocation.as_deref() != Some(a)) {
+            continue;
+        }
+        // Funding containers are not inference reports and must never double count children.
+        if ledger.allocations.contains_key(id) {
+            add(&mut totals.allocation_parents, 1)?;
+            continue;
+        }
+        match r.usage {
+            Usage::Unknown => add(&mut totals.unknown_reports, 1)?,
+            Usage::Provisional(n) => {
+                amounts(&mut totals.provisional_usage, n)?;
+                add(&mut totals.provisional_reports, 1)?;
+            }
+            Usage::Final(n) => {
+                amounts(&mut totals.final_usage, n)?;
+                add(&mut totals.final_reports, 1)?;
+            }
+        }
+        if !matches!(r.usage, Usage::Final(_)) {
+            amounts(&mut totals.unresolved_reserved, r.reserved)?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn initialize(write: &WriteTransaction) -> Result<(), String> {
     write.open_table(ROOTS).map_err(err)?;
     write.open_table(RECEIPTS).map_err(err)?;
@@ -23,6 +231,278 @@ pub(super) fn initialize(write: &WriteTransaction) -> Result<(), String> {
 mod tests {
     use super::*;
     use tachyon_api::types::{ApiRequest, ApiResponse, CampaignStatus};
+
+    #[test]
+    fn monitor_actuals_wide_provisional_unknown_and_parent_exclusion() {
+        use tachyon_api::monitor::*;
+        let mut ledger = Ledger {
+            schema_version: 1,
+            revision: 1,
+            campaign_id: "c".into(),
+            envelope: envelope(),
+            reservations: BTreeMap::new(),
+            allocations: BTreeMap::from([("parent".into(), false)]),
+            transfers: BTreeMap::new(),
+            debt: Totals::default(),
+            admissions_paused: false,
+        };
+        for (id, allocation, usage) in [
+            ("parent", None, Usage::Unknown),
+            ("a", Some("parent"), Usage::Final(units(u64::MAX))),
+            ("b", Some("parent"), Usage::Final(units(u64::MAX))),
+            ("c", Some("parent"), Usage::Provisional(units(u64::MAX))),
+            ("d", Some("parent"), Usage::Provisional(units(u64::MAX))),
+            ("e", Some("parent"), Usage::Unknown),
+            ("z", None, Usage::Final(units(0))),
+        ] {
+            ledger.reservations.insert(
+                id.into(),
+                Reservation {
+                    allocation: allocation.map(str::to_owned),
+                    pool: Pool::Work,
+                    reserved: units(10),
+                    usage,
+                    cancellation_requested: false,
+                },
+            );
+        }
+        let mut totals = Inference::default();
+        project_monitor(&ledger, None, &mut totals).unwrap();
+        assert_eq!(totals.final_usage.tokens.0, u128::from(u64::MAX) * 2);
+        assert_eq!(totals.provisional_usage.tokens, totals.final_usage.tokens);
+        assert_eq!(totals.unknown_reports.0, 1);
+        assert_eq!(totals.final_reports.0, 3);
+        assert_eq!(totals.allocation_parents.0, 1);
+        assert_eq!(totals.unresolved_reserved.tokens.0, 30);
+        assert!(serde_json::to_string(&totals)
+            .unwrap()
+            .contains("\"36893488147419103230\""));
+        let mut work = Inference::default();
+        project_monitor(&ledger, Some("parent"), &mut work).unwrap();
+        assert_eq!(work.final_reports.0, 2);
+    }
+
+    #[test]
+    fn monitor_persisted_overrun_totals_remain_exact_beyond_u64() {
+        use tachyon_api::monitor::*;
+        let dir = tempfile::tempdir().unwrap();
+        let store = RuntimeStore::open(&dir.path().join("runtime.redb")).unwrap();
+        let campaign = campaign(&store, "monitor-wide");
+        store
+            .host_authorize_campaign_envelope("grant", &campaign, envelope())
+            .unwrap();
+        for id in ["a", "b", "c", "d"] {
+            store
+                .campaign_ledger_command(id, &campaign, reserve(id, Pool::Work, 10))
+                .unwrap();
+        }
+        for (id, usage) in [
+            ("a", Usage::Final(units(u64::MAX))),
+            ("b", Usage::Final(units(u64::MAX))),
+            ("c", Usage::Provisional(units(u64::MAX))),
+            ("d", Usage::Provisional(units(u64::MAX))),
+        ] {
+            store
+                .campaign_ledger_command(&format!("report-{id}"), &campaign, reconcile(id, usage))
+                .unwrap();
+        }
+        let query = MonitorQuery {
+            scope: MonitorScope::Campaign {
+                campaign_id: campaign,
+            },
+            after: None,
+            limit: 100,
+        };
+        let payload = store.monitor_sample(&[query]).unwrap().remove(0).unwrap();
+        let Observed::Known(ref inference) = payload.durable.inference else {
+            panic!()
+        };
+        assert_eq!(inference.final_usage.tokens.0, u128::from(u64::MAX) * 2);
+        assert_eq!(
+            inference.provisional_usage.cost_micro_usd.0,
+            u128::from(u64::MAX) * 2
+        );
+        let wire = serde_json::to_string(&payload).unwrap();
+        assert!(wire.contains("\"36893488147419103230\""));
+        assert_eq!(
+            serde_json::from_str::<MonitorPayload>(&wire).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn monitor_snapshot_is_read_only_scoped_redacted_and_known_zero() {
+        use super::super::admission::{Admission, DispatchOutcome};
+        use tachyon_api::monitor::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.redb");
+        let store = RuntimeStore::open(&path).unwrap();
+        let c = campaign(&store, "monitor");
+        let other = campaign(&store, "monitor-other");
+        let query = |scope| MonitorQuery {
+            scope,
+            after: None,
+            limit: 100,
+        };
+        let cq = query(MonitorScope::Campaign {
+            campaign_id: c.clone(),
+        });
+        assert_eq!(
+            store.monitor_sample(&[cq.clone()]).unwrap()[0]
+                .as_ref()
+                .unwrap()
+                .durable
+                .inference,
+            Observed::Unknown
+        );
+        store
+            .host_authorize_campaign_envelope("grant", &c, envelope())
+            .unwrap();
+        let p = store
+            .monitor_sample(&[cq.clone()])
+            .unwrap()
+            .remove(0)
+            .unwrap();
+        assert_eq!(p.durable.inference, Observed::Known(Inference::default()));
+        let admitted = store
+            .admit_campaign_work(Admission {
+                work_id: "work".into(),
+                campaign_id: c.clone(),
+                objective: "SECRET_PROMPT_https://secret.invalid/home/private".into(),
+                generation: 1,
+                instruction_revision: 1,
+                pool: Pool::Work,
+                upper_bound: units(60),
+            })
+            .unwrap();
+        store
+            .dispatch_campaign_batch(1, |_| DispatchOutcome::Registered {
+                worker_id: "worker".into(),
+            })
+            .unwrap();
+        store
+            .campaign_ledger_command(
+                "fund",
+                &c,
+                LedgerCommand::FundAllocation {
+                    reservation_id: admitted.dispatch_id.clone(),
+                    work_id: "work".into(),
+                },
+            )
+            .unwrap();
+        store
+            .campaign_ledger_command(
+                "reserve",
+                &c,
+                LedgerCommand::ReserveAllocated {
+                    reservation_id: "request".into(),
+                    allocation_id: admitted.dispatch_id,
+                    pool: Pool::Work,
+                    reserved: units(20),
+                },
+            )
+            .unwrap();
+        store
+            .campaign_ledger_command("settle", &c, reconcile("request", Usage::Final(units(7))))
+            .unwrap();
+        store.retained.configure(&c, Some(100)).unwrap();
+        let receipt = store
+            .retained
+            .reserve(&c, "artifact", "secret-artifact", 20, "SECRET_IDENTITY")
+            .unwrap();
+        store.retained.ready(&receipt, 12).unwrap();
+        store
+            .retained
+            .reserve(&c, "trace", "secret-trace", 3, "SECRET_IDENTITY")
+            .unwrap();
+        let before = store.campaign_ledger(&c).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let tx = store.database.begin_read().unwrap();
+        let watermark = super::super::operational_events::watermark(
+            &tx.open_table(super::super::operational_events::METADATA)
+                .unwrap(),
+        )
+        .unwrap();
+        drop(tx);
+        // A write-lock held by this thread would deadlock a mutating projection.
+        let write = store.database.begin_write().unwrap();
+        let queries = [
+            query(MonitorScope::Host),
+            cq,
+            query(MonitorScope::Work {
+                campaign_id: c.clone(),
+                work_id: "work".into(),
+            }),
+            query(MonitorScope::Campaign {
+                campaign_id: other.clone(),
+            }),
+            query(MonitorScope::Work {
+                campaign_id: other,
+                work_id: "work".into(),
+            }),
+        ];
+        let samples = store.monitor_sample(&queries).unwrap();
+        drop(write);
+        assert_eq!(samples[4], Err(MonitorError::NotFound));
+        let p = samples[1].as_ref().unwrap();
+        let Observed::Known(ref usage) = p.durable.inference else {
+            panic!()
+        };
+        assert_eq!(usage.final_usage.tokens.0, 7);
+        assert_eq!(usage.unknown_reports.0, 0);
+        let Observed::Known(ref storage) = p.durable.retained_storage else {
+            panic!()
+        };
+        assert_eq!(storage.reserved_bytes.0, 3);
+        assert_eq!(storage.ready_bytes.0, 12);
+        let work = samples[2].as_ref().unwrap();
+        assert_eq!(work.durable.retained_storage, Observed::Unknown);
+        let Observed::Known(ref funding) = work.durable.funding else {
+            panic!()
+        };
+        assert_eq!(funding.work.available.tokens.0, 53);
+        assert_eq!(funding.work.committed.tokens.0, 7);
+        assert_eq!(
+            samples[3].as_ref().unwrap().durable.inference,
+            Observed::Unknown
+        );
+        let json = serde_json::to_string(&samples).unwrap();
+        assert!(!json.contains("SECRET"));
+        assert!(!json.contains("secret.invalid"));
+        assert!(!json.contains("secret-artifact"));
+        assert_eq!(store.campaign_ledger(&c).unwrap(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let tx = store.database.begin_read().unwrap();
+        assert_eq!(
+            super::super::operational_events::watermark(
+                &tx.open_table(super::super::operational_events::METADATA)
+                    .unwrap()
+            )
+            .unwrap(),
+            watermark
+        );
+        assert_eq!(
+            samples[0].as_ref().unwrap().durable.sampled_at_ms,
+            p.durable.sampled_at_ms
+        );
+        assert!(samples[0]
+            .as_ref()
+            .unwrap()
+            .capacities
+            .iter()
+            .all(|c| c.sampled_at_ms >= p.durable.sampled_at_ms));
+        drop(tx);
+        // Host capacity failure must not invalidate independent scoped observations.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.compute.lock().unwrap();
+            panic!("poison host capacity fixture");
+        }));
+        let scoped = store.monitor_sample(&queries[1..2]).unwrap();
+        assert!(scoped[0].as_ref().unwrap().same_values(p));
+        let mixed = store.monitor_sample(&queries[..2]).unwrap();
+        assert_eq!(mixed[0], Err(MonitorError::Unavailable));
+        assert!(mixed[1].as_ref().unwrap().same_values(p));
+    }
 
     fn units(n: u64) -> Units {
         Units {

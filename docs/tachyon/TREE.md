@@ -15,6 +15,7 @@ tachyon/
 │   └── v0.3.0/                   # Ghost research harness and tool runtime
 ├── docs/
 │   ├── README.md                 # Documentation index and maintenance rules
+│   ├── interaction/              # Host layout and descriptive role registry
 │   ├── tachyon/                  # Shared and user-facing system documentation
 │   │   ├── ARCHITECTURE.md       # Runtime ownership and boundaries
 │   │   ├── INTERACTION.md        # Conversation routing and concurrency
@@ -44,13 +45,10 @@ tachyon/
 │   │   └── src/
 │   │       ├── lib.rs             # Orchestration policy/domain exports
 │   │       ├── capabilities.rs    # Neutral conversation/background capabilities
-│   │       ├── conversation/
-│   │       │   ├── mod.rs         # Conversation turns and capability policy
-│   │       │   ├── prompt.rs      # Conversation and spoken-response prompts
-│   │       │   └── policy.rs      # Routing, answerability, and execution policy
-│   │       ├── background/
-│   │       │   ├── mod.rs         # Background capability policy
-│   │       │   └── prompt.rs      # Background Coordinator prompt
+│   │       ├── registry.rs        # Descriptive Conversation/Coordinator inventory
+│   │       ├── agents/
+│   │       │   ├── conversation/  # Prompt Markdown/renderers, tools, routing policy
+│   │       │   └── coordinator/   # Prompt Markdown/renderers and tools
 │   │       ├── attention.rs       # Priority and result delivery policy
 │   │       ├── tasks.rs            # Durable task identity/state model
 │   │       ├── scheduler.rs        # Dependency readiness rules
@@ -62,11 +60,24 @@ tachyon/
 │   │   └── src/lib.rs             # Explicit model config, OpenRouter requests,
 │   │                              # SSE framing, usage, messages, and tool calls
 │   │
-│   ├── tachyon-foreground/        # User-facing foreground runtime
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── main.rs            # Turn state, checkpoints, delegation, events
-│   │       └── interaction.rs     # Conversation model/streaming adapters
+│   ├── interaction/               # Existing host crates, not a shared crate
+│   │   ├── foreground/            # Package/bin: tachyon-foreground
+│   │   │   ├── Cargo.toml
+│   │   │   └── src/
+│   │   │       ├── main.rs        # Turn/model loop and tool dispatch/validation
+│   │   │       ├── input.rs       # Typed and legacy input decoding
+│   │   │       ├── turns.rs       # Evidence, ordered history and snapshots
+│   │   │       ├── checkpoints.rs # Checkpoint format and writer
+│   │   │       ├── delegation.rs  # Daemon service adapters
+│   │   │       ├── model.rs       # Conversation policy/model adapters
+│   │   │       └── streaming.rs   # Event correlation and stdout publication
+│   │   └── background/            # Package/bin: tachyon-background
+│   │       ├── Cargo.toml
+│   │       └── src/
+│   │           ├── main.rs        # Startup, model configuration and wiring
+│   │           ├── requests.rs    # Concurrent request processing and output
+│   │           ├── review.rs      # Semantic review and decision validation
+│   │           └── scheduling.rs  # Schedule request validation
 │   │
 │   ├── tachyon/                  # User-facing CLI and daemon lifecycle client
 │   │   ├── Cargo.toml
@@ -141,11 +152,13 @@ tachyon-client/src/lib.rs
 tachyond/src/main.rs
         │
         ├── spawns tachyon-foreground --agent-id foreground
+        ├── spawns tachyon-background
         ├── spawns ghost --chat/--task --role worker
         └── spawns tachyon-memory --root .../memory --socket .../memory.sock
                     │
                     ├── orchestrators/src/   # prompts and deterministic role policy
-                    ├── tachyon-foreground/ # foreground state and model adapters
+                    ├── interaction/foreground/ # foreground state and model adapters
+                    ├── interaction/background/ # review and scheduling host
                     ├── tachyon-model/src/lib.rs # shared model runtime
                     ├── ghost/src/model.rs   # config compatibility adapter
                     └── ghost/src/harness/   # worker execution capabilities
@@ -171,7 +184,7 @@ markers alongside structured events.
 | Worker lifecycle policy | Background Coordinator plus Tachyond API enforcement |
 | Portals | Tachyond policy/control plane |
 | MicroVM backend | `crates/ghost/src/harness/backend.rs` and Tachyond runtime |
-| Conversation/background prompts | `crates/orchestrators/src/*/prompt.rs` |
-| Turn scheduling policy | `crates/orchestrators/src/conversation/policy.rs` |
+| Conversation/background prompts | `crates/orchestrators/src/agents/*/prompt.rs` and adjacent Markdown |
+| Turn scheduling policy | `crates/orchestrators/src/agents/conversation/policy.rs` |
 | Worker capabilities | `crates/ghost/src/harness` |
 | Interaction tests | Foreground runtime tests plus orchestration policy tests |

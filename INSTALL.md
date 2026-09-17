@@ -142,6 +142,13 @@ orchestrator = "Orchestrator"
 
 ## Build and Run
 
+Run Cargo from the repository root. The interaction hosts live in
+`crates/interaction/foreground` and `crates/interaction/background`; their package
+and executable names remain `tachyon-foreground` and `tachyon-background`.
+Tachyond resolves them beside its own executable unless `TACHYON_FOREGROUND_BIN`
+or `TACHYON_BACKGROUND_BIN` overrides the corresponding path. The source move
+does not change `target/release` output names or require configuration migration.
+
 ```bash
 cargo build --release
 ./target/release/tachyon daemon start

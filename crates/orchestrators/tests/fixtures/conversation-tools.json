@@ -1,0 +1,331 @@
+[
+  {
+    "description": "Delegate one objective requiring fresh work.",
+    "name": "spawn_agent",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "lifetime_class": {
+          "default": "short",
+          "description": "short: up to 3 assignments; long: daemon lifetime; persistent: reattaches after restart",
+          "enum": [
+            "short",
+            "long",
+            "persistent"
+          ],
+          "type": "string"
+        },
+        "purpose": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Fan out independent work to materially cut latency, including same-method lists; group dependent or strongly shared-state work.",
+    "name": "spawn_agents",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "lifetime_class": {
+          "default": "short",
+          "description": "short: up to 3 assignments; long: daemon lifetime; persistent: reattaches after restart",
+          "enum": [
+            "short",
+            "long",
+            "persistent"
+          ],
+          "type": "string"
+        },
+        "tasks": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8,
+          "type": "array"
+        }
+      },
+      "required": [
+        "tasks"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Consult authoritative durable user memory when profile context is relevant, or apply one user-requested durable memory change. Never answer a durable user-profile question from conversation text alone. Recall before forget or correct so returned IDs can be used exactly.",
+    "name": "memory",
+    "parameters": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "action": {
+              "const": "recall"
+            }
+          },
+          "required": [
+            "action",
+            "query",
+            "include_history"
+          ]
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "remember"
+            }
+          },
+          "required": [
+            "action",
+            "value",
+            "kind",
+            "namespace",
+            "relation",
+            "scope",
+            "cardinality"
+          ]
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "forget"
+            }
+          },
+          "required": [
+            "action",
+            "target_ids"
+          ]
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "correct"
+            }
+          },
+          "required": [
+            "action",
+            "target_ids",
+            "value",
+            "kind",
+            "namespace",
+            "relation",
+            "scope",
+            "cardinality"
+          ]
+        }
+      ],
+      "properties": {
+        "action": {
+          "enum": [
+            "recall",
+            "remember",
+            "forget",
+            "correct"
+          ],
+          "type": "string"
+        },
+        "cardinality": {
+          "enum": [
+            "one",
+            "many"
+          ],
+          "type": "string"
+        },
+        "include_history": {
+          "description": "Whether prior conversation and task history are relevant to this recall.",
+          "type": "boolean"
+        },
+        "kind": {
+          "enum": [
+            "fact",
+            "preference",
+            "constraint",
+            "goal",
+            "routine",
+            "relationship"
+          ],
+          "type": "string"
+        },
+        "namespace": {
+          "maxLength": 100,
+          "minLength": 1,
+          "type": "string"
+        },
+        "query": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "relation": {
+          "maxLength": 100,
+          "minLength": 1,
+          "type": "string"
+        },
+        "scope": {
+          "maxLength": 100,
+          "minLength": 1,
+          "type": "string"
+        },
+        "target_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "topics": {
+          "items": {
+            "maxLength": 50,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 8,
+          "type": "array"
+        },
+        "value": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Manage durable reminders and future agent work. Preserve timing from clarification follow-ups; do not spawn future work immediately. Use start_at for 'at', finish_by for 'by', and day next when no date is given.",
+    "name": "schedule",
+    "parameters": {
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "action": {
+              "const": "create"
+            }
+          },
+          "required": [
+            "action",
+            "text",
+            "delay_seconds"
+          ]
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "create"
+            }
+          },
+          "required": [
+            "action",
+            "text",
+            "local_time",
+            "day"
+          ]
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "list"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "cancel"
+            }
+          },
+          "required": [
+            "action",
+            "id"
+          ]
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "start_at"
+            }
+          },
+          "required": [
+            "action",
+            "objective"
+          ]
+        },
+        {
+          "properties": {
+            "action": {
+              "const": "finish_by"
+            }
+          },
+          "required": [
+            "action",
+            "objective"
+          ]
+        }
+      ],
+      "properties": {
+        "action": {
+          "enum": [
+            "create",
+            "list",
+            "cancel",
+            "start_at",
+            "finish_by"
+          ],
+          "type": "string"
+        },
+        "day": {
+          "enum": [
+            "next",
+            "today",
+            "tomorrow"
+          ],
+          "type": "string"
+        },
+        "delay_seconds": {
+          "maximum": 31536000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "type": "string"
+        },
+        "local_time": {
+          "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
+          "type": "string"
+        },
+        "objective": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "text": {
+          "maxLength": 500,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  }
+]

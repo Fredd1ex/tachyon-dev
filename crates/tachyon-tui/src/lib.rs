@@ -56,6 +56,8 @@ use tachyon_api::{
 
 use tachyon_client::{Client, Subscription};
 
+mod daemon_state_cache;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct MouseCapture(bool);
 
@@ -685,6 +687,7 @@ impl Thread {
 
 /// Events from background subscription threads.
 enum TuiEvent {
+    Operational,
     Clipboard(CopyOutcome),
     Recovered(tachyon_api::types::HistoryEntry),
     Line {
@@ -715,6 +718,8 @@ enum PaneTab {
     Agents,
     Scheduled,
     Memory,
+    Todos,
+    Resources,
 }
 
 const ORCHESTRATORS_TAB_LABEL: &str = " ORCHESTRATORS ";
@@ -1616,6 +1621,11 @@ pub fn run() -> io::Result<()> {
     // Floating agent pane.
     let mut pane_open: bool = false;
     let mut pane_tab = PaneTab::Foreground;
+    let mut operational_worker = daemon_state_cache::Worker::default();
+    let mut operational_query = None;
+    let mut operational_view = daemon_state_cache::View::default();
+    let mut operational_scroll = 0u16;
+    let mut live_conversation = daemon_state_cache::CurrentConversation::default();
     let mut commands_open: bool = false;
     let mut info_open: bool = false;
 
@@ -1641,6 +1651,36 @@ pub fn run() -> io::Result<()> {
     let mut last_draw = Instant::now() - Duration::from_secs(1);
 
     loop {
+        let desired = if pane_open {
+            match pane_tab {
+                PaneTab::Todos => live_conversation
+                    .scope()
+                    .map(|scope| match &operational_query {
+                        Some(daemon_state_cache::Query::Todos { scope: old, .. })
+                            if old == &scope =>
+                        {
+                            operational_query.clone().unwrap()
+                        }
+                        _ => daemon_state_cache::Query::Todos {
+                            scope,
+                            cursor: None,
+                        },
+                    }),
+                PaneTab::Resources => Some(match &operational_query {
+                    Some(query @ daemon_state_cache::Query::Resources { .. }) => query.clone(),
+                    _ => daemon_state_cache::Query::Resources { after: None },
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if desired != operational_query {
+            operational_query = desired;
+            operational_view = daemon_state_cache::View::default();
+            operational_scroll = 0;
+        }
+        operational_worker.select(operational_query.clone(), &sub_out);
         // Poll daemon + agents; subscribe to new agents.
         if last_poll.elapsed() > Duration::from_secs(1) {
             last_poll = Instant::now();
@@ -1702,6 +1742,15 @@ pub fn run() -> io::Result<()> {
         while let Ok(ev) = sub_rx.try_recv() {
             redraw = true;
             match ev {
+                TuiEvent::Operational => {
+                    if let Some(view) = operational_worker.take() {
+                        if operational_query != view.query {
+                            operational_query = view.query.clone();
+                            operational_scroll = 0;
+                        }
+                        operational_view = view;
+                    }
+                }
                 TuiEvent::Clipboard(outcome) => {
                     clipboard_notice = Some((outcome.notice(), Instant::now()));
                 }
@@ -1729,6 +1778,14 @@ pub fn run() -> io::Result<()> {
                         continue;
                     }
                     visits.observe(&envelope);
+                    if live_conversation.observe(&agent_id, &envelope.metadata)
+                        && pane_tab == PaneTab::Todos
+                    {
+                        operational_worker.select(None, &sub_out);
+                        operational_query = None;
+                        operational_view = daemon_state_cache::View::default();
+                        operational_scroll = 0;
+                    }
                     checkpoint |= matches!(
                         envelope.event,
                         InteractionEvent::UserTurnAccepted { .. }
@@ -1911,6 +1968,8 @@ pub fn run() -> io::Result<()> {
                         &agent_infos,
                         &scheduled_tasks,
                         pane_tab,
+                        &operational_view,
+                        operational_scroll,
                     );
                 }
                 if info_open {
@@ -2042,6 +2101,55 @@ pub fn run() -> io::Result<()> {
                         if pane_open {
                             commands_open = false;
                             info_open = false;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+                        if pane_open && matches!(pane_tab, PaneTab::Todos | PaneTab::Resources) =>
+                    {
+                        match key.code {
+                            KeyCode::Up => {
+                                operational_scroll = operational_scroll.saturating_sub(1)
+                            }
+                            KeyCode::Down => {
+                                operational_scroll = operational_scroll
+                                    .saturating_add(1)
+                                    .min(operational_view.rows.lines().count().saturating_sub(1)
+                                        as u16)
+                            }
+                            _ => {
+                                let first = key.code == KeyCode::PageUp;
+                                let next = match &operational_query {
+                                    Some(daemon_state_cache::Query::Todos { scope, .. })
+                                        if first || operational_view.next_todo.is_some() =>
+                                    {
+                                        Some(daemon_state_cache::Query::Todos {
+                                            scope: scope.clone(),
+                                            cursor: if first {
+                                                None
+                                            } else {
+                                                operational_view.next_todo.clone()
+                                            },
+                                        })
+                                    }
+                                    Some(daemon_state_cache::Query::Resources { .. })
+                                        if first || operational_view.next_resource.is_some() =>
+                                    {
+                                        Some(daemon_state_cache::Query::Resources {
+                                            after: if first {
+                                                None
+                                            } else {
+                                                operational_view.next_resource.clone()
+                                            },
+                                        })
+                                    }
+                                    _ => operational_query.clone(),
+                                };
+                                if next != operational_query {
+                                    operational_query = next;
+                                    operational_view = daemon_state_cache::View::default();
+                                    operational_scroll = 0;
+                                }
+                            }
                         }
                     }
                     KeyCode::Up => {
@@ -2176,6 +2284,12 @@ pub fn run() -> io::Result<()> {
                             continue;
                         }
                         let cmd = input.trim().to_string();
+                        if cmd.is_empty()
+                            && pane_open
+                            && matches!(pane_tab, PaneTab::Todos | PaneTab::Resources)
+                        {
+                            continue;
+                        }
                         if cmd.is_empty() {
                             // No text: toggle collapse on the focused thread.
                             if focus > 0 {
@@ -2280,6 +2394,8 @@ pub fn run() -> io::Result<()> {
                             PaneTab::Agents => PaneTab::Foreground,
                             PaneTab::Scheduled => PaneTab::Agents,
                             PaneTab::Memory => PaneTab::Scheduled,
+                            PaneTab::Todos => PaneTab::Memory,
+                            PaneTab::Resources => PaneTab::Todos,
                         };
                         if pane_tab == PaneTab::Foreground && focus > 1 {
                             focus = 0;
@@ -2289,7 +2405,9 @@ pub fn run() -> io::Result<()> {
                         pane_tab = match pane_tab {
                             PaneTab::Foreground => PaneTab::Agents,
                             PaneTab::Agents => PaneTab::Scheduled,
-                            PaneTab::Scheduled | PaneTab::Memory => PaneTab::Memory,
+                            PaneTab::Scheduled => PaneTab::Memory,
+                            PaneTab::Memory => PaneTab::Todos,
+                            PaneTab::Todos | PaneTab::Resources => PaneTab::Resources,
                         };
                         if pane_tab == PaneTab::Agents
                             && focus < 2
@@ -2352,6 +2470,17 @@ pub fn run() -> io::Result<()> {
                                 );
                                 let inner_x = pane.x.saturating_add(1);
                                 let inner_right = pane.x + pane.width.saturating_sub(1);
+                                if m.row == pane.y + pane.height.saturating_sub(1)
+                                    && m.column >= inner_x
+                                    && m.column < inner_right.min(inner_x + 18)
+                                {
+                                    pane_tab = if m.column < inner_x + 7 {
+                                        PaneTab::Todos
+                                    } else {
+                                        PaneTab::Resources
+                                    };
+                                    continue;
+                                }
                                 let tabs_x = pane.x.saturating_add(
                                     1 + WINDOW_LOGO_BUTTON.chars().count() as u16 + 1,
                                 );
@@ -2404,7 +2533,7 @@ pub fn run() -> io::Result<()> {
                                             }
                                         }
                                         PaneTab::Scheduled => {}
-                                        PaneTab::Memory => {}
+                                        PaneTab::Memory | PaneTab::Todos | PaneTab::Resources => {}
                                     }
                                     continue;
                                 }
@@ -7048,6 +7177,8 @@ fn draw_agent_pane(
     agent_infos: &HashMap<String, AgentInfo>,
     scheduled_tasks: &[ScheduledTaskInfo],
     tab: PaneTab,
+    operational: &daemon_state_cache::View,
+    operational_scroll: u16,
 ) {
     f.render_widget(Clear, area);
     let block = Block::default()
@@ -7107,6 +7238,44 @@ fn draw_agent_pane(
         },
     );
 
+    // Extra tabs use the bottom border, preserving existing header hit targets and rows.
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" TODO ", tab_style(tab == PaneTab::Todos)),
+            Span::raw(" "),
+            Span::styled(" RESOURCES ", tab_style(tab == PaneTab::Resources)),
+        ])),
+        Rect {
+            x: inner.x,
+            y: area.y + area.height.saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        },
+    );
+    if matches!(tab, PaneTab::Todos | PaneTab::Resources) {
+        let text = if operational.rows.is_empty() {
+            if tab == PaneTab::Todos {
+                "Waiting for live conversation metadata or todo snapshot (unknown)."
+            } else {
+                "Waiting for Host monitor data (unknown)."
+            }
+        } else {
+            &operational.rows
+        };
+        f.render_widget(
+            Paragraph::new(text).scroll((operational_scroll, 0)),
+            sections[0],
+        );
+        f.render_widget(Paragraph::new(if operational.stale {
+            "STALE / disconnected; last known data retained\nRead-only | arrows scroll | PgDn next page | PgUp first page"
+        } else if tab == PaneTab::Todos {
+            "Read-only; ask an agent to edit todos\nArrows scroll | PgDn next page | PgUp first page"
+        } else {
+            "Read-only Host observations; unknown is not zero\nArrows scroll | PgDn next page | PgUp first page"
+        }), sections[1]);
+        return;
+    }
+
     let header = Row::new(["NAME", "STATUS", "POLICY", "CAPACITY", "DURATION", "TASK"]).style(
         Style::default()
             .fg(Color::Gray)
@@ -7121,6 +7290,7 @@ fn draw_agent_pane(
         Constraint::Min(16),
     ];
     let rows = match tab {
+        PaneTab::Todos | PaneTab::Resources => unreachable!(),
         PaneTab::Foreground => {
             let daemon_status = match daemon {
                 Some(info) if info.provider_ready => "online",
@@ -7302,12 +7472,11 @@ fn draw_agent_pane(
     );
     f.render_widget(
         Paragraph::new(match tab {
+            PaneTab::Todos | PaneTab::Resources => unreachable!(),
             PaneTab::Scheduled => {
                 "left/right tabs · durable scheduled work · worker appears when execution starts"
             }
-            PaneTab::Memory => {
-                "left/right tabs · placeholder · inspection and modification controls planned"
-            }
+            PaneTab::Memory => "left/right tabs · placeholder · right: TODO, RESOURCES (read-only)",
             PaneTab::Foreground | PaneTab::Agents => {
                 "left/right tabs · click a row to focus · s stop · r restart · u resume · k kill"
             }
@@ -8305,6 +8474,335 @@ mod tests {
         }
     }
 
+    pub(super) fn two_turn_fixture() -> Vec<InteractionEventEnvelope> {
+        let wire: serde_json::Value =
+            serde_json::from_str(include_str!("two_turn_fixture.json")).unwrap();
+        wire.as_array()
+            .unwrap()
+            .iter()
+            .map(|value| {
+                let event = decode_interaction_event(&value.to_string()).unwrap();
+                assert_eq!(serde_json::to_value(&event).unwrap(), *value);
+                event
+            })
+            .collect()
+    }
+
+    #[test]
+    fn operational_ticks_preserve_transcript_layout_selection_scroll_and_copy() {
+        let mut threads = vec![Thread::new_foreground()];
+        for event in two_turn_fixture() {
+            apply_interaction_event(&mut threads[0], event);
+        }
+        let selected = Some(0);
+        let expected_copy = selected_chat_cell_text(&threads, selected);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+        let mut cache = TurnLayoutCache::default();
+        let mut projection = TurnProjection::default();
+        let mut view = TranscriptView::default();
+        let mut scroll = TranscriptScroll::default();
+        scroll.scroll_up(1);
+        let mut baseline = None;
+        for tick in 0..4 {
+            let operational = daemon_state_cache::View {
+                rows: format!("Host sample {tick}"),
+                stale: tick == 3,
+                ..Default::default()
+            };
+            terminal
+                .draw(|f| {
+                    draw_conversation(
+                        f,
+                        f.area(),
+                        &threads,
+                        false,
+                        "",
+                        &mut scroll,
+                        &mut cache,
+                        &mut view,
+                        selected,
+                        None,
+                        &mut projection,
+                    );
+                    // Separate pane rendering cannot borrow or mutate transcript state.
+                    if tick > 0 {
+                        let mut pane =
+                            Terminal::new(ratatui::backend::TestBackend::new(72, 18)).unwrap();
+                        pane.draw(|p| {
+                            draw_agent_pane(
+                                p,
+                                p.area(),
+                                &threads,
+                                1,
+                                None,
+                                None,
+                                &HashMap::new(),
+                                &[],
+                                PaneTab::Resources,
+                                &operational,
+                                0,
+                            )
+                        })
+                        .unwrap();
+                    }
+                })
+                .unwrap();
+            let actual = (
+                terminal.backend().buffer().clone(),
+                cache.builds,
+                scroll.clone(),
+            );
+            if let Some(expected) = &baseline {
+                assert_eq!(&actual, expected);
+            } else {
+                baseline = Some(actual);
+            }
+            assert_eq!(selected_chat_cell_text(&threads, selected), expected_copy);
+        }
+    }
+
+    #[test]
+    fn operational_views_render_cached_unknown_and_stale_without_io() {
+        for width in [28, 72] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, 18)).unwrap();
+            for tab in [PaneTab::Todos, PaneTab::Resources] {
+                for stale in [false, true] {
+                    let view = daemon_state_cache::View {
+                        stale,
+                        ..Default::default()
+                    };
+                    let mut previous = None;
+                    for _ in 0..2 {
+                        terminal
+                            .draw(|f| {
+                                draw_agent_pane(
+                                    f,
+                                    f.area(),
+                                    &[],
+                                    0,
+                                    None,
+                                    None,
+                                    &HashMap::new(),
+                                    &[],
+                                    tab,
+                                    &view,
+                                    0,
+                                )
+                            })
+                            .unwrap();
+                        let buffer = terminal.backend().buffer().clone();
+                        let rendered: String =
+                            buffer.content.iter().map(|cell| cell.symbol()).collect();
+                        assert!(rendered.contains("TODO"));
+                        assert!(rendered.contains("RESOURCES"));
+                        if stale {
+                            assert!(rendered.contains("STALE"));
+                        }
+                        if let Some(previous) = &previous {
+                            assert_eq!(&buffer, previous);
+                        }
+                        previous = Some(buffer);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_turn_protocol_render_copy_and_cache_snapshots() {
+        let events = two_turn_fixture();
+        let mut threads = vec![Thread::new_foreground()];
+        for prompt in ["  first α\n", "second 界\r\n"] {
+            threads[0].add(ItemKind::User, prompt.into());
+            threads[0].reserve_reply();
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+        let mut cache = TurnLayoutCache::default();
+        let mut projection = TurnProjection::default();
+        let mut view = TranscriptView::default();
+        let mut scroll = TranscriptScroll::default();
+        let mut replies = [None, None];
+        let mut identities = HashSet::new();
+        for (step, event) in events.iter().enumerate() {
+            assert!(identities.insert(event.metadata.message_id.clone()));
+            let before = cache.builds;
+            apply_interaction_event(&mut threads[0], event.clone());
+            match &event.event {
+                InteractionEvent::ConversationDelta { text } if step != 6 => {
+                    replies[usize::from(event.metadata.turn_id.as_deref() == Some("3"))] =
+                        Some(text.as_str());
+                }
+                InteractionEvent::ConversationFinished { text } => {
+                    replies[usize::from(event.metadata.turn_id.as_deref() == Some("3"))] =
+                        Some(text.as_str());
+                }
+                _ => {}
+            }
+            if step == 4 {
+                // Turn 3 can finish while turn 2 remains pending, with no foreground events.
+                assert!(threads[0].completed_turns.contains("3"));
+                assert!(!threads[0].completed_turns.contains("2"));
+                assert_eq!(
+                    session_snapshot(&threads)[0].items[1].text,
+                    "Checking α\n\n"
+                );
+            }
+            // Stabilize display timestamps, not protocol identities or payloads.
+            for (index, item) in threads[0].items.iter_mut().enumerate() {
+                item.timestamp = 100 + index as u64;
+            }
+            for redraw in 0..3 {
+                let builds = cache.builds;
+                let screen = terminal.backend().buffer().clone();
+                terminal
+                    .draw(|f| {
+                        draw_conversation(
+                            f,
+                            f.area(),
+                            &threads,
+                            false,
+                            "",
+                            &mut scroll,
+                            &mut cache,
+                            &mut view,
+                            None,
+                            None,
+                            &mut projection,
+                        );
+                    })
+                    .unwrap();
+                if redraw > 0 {
+                    assert_eq!(cache.builds, builds, "unchanged redraw at {step}");
+                    assert_eq!(terminal.backend().buffer(), &screen);
+                }
+                for (selected, prompt) in ["  first α\n", "second 界\r\n"].iter().enumerate() {
+                    let mut expected = format!("{}:\n{prompt}", names().user);
+                    if let Some(reply) = replies[selected] {
+                        expected.push_str(&format!("\n\n{}:\n{reply}", names().conversation));
+                    }
+                    assert_eq!(
+                        selected_chat_cell_text(&threads, Some(selected)),
+                        Some(expected.clone())
+                    );
+                    let mut copied = Vec::new();
+                    assert!(handle_copy_key(
+                        event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+                        MouseCapture::default(),
+                        false,
+                        "",
+                        &threads,
+                        Some(selected),
+                        |text| {
+                            copied.push(text.to_owned());
+                            true
+                        },
+                    ));
+                    assert_eq!(copied, [expected]);
+                }
+            }
+            if (2..=7).contains(&step) {
+                assert_eq!(
+                    cache.builds - before,
+                    usize::from(step != 6),
+                    "event {step}"
+                );
+            }
+        }
+        let builds = cache.builds;
+        let screen = terminal.backend().buffer().clone();
+        let rendered: String = screen.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("Corrected α"));
+        assert!(rendered.contains("ready();"));
+        assert!(rendered.contains("UNRELATED NOTIFICATION"));
+        assert!(!rendered.contains("LATE MUST NOT APPEND"));
+        assert!(!rendered.contains("Checking α"));
+        for id in 1..=3 {
+            let mut metric = envelope(
+                id,
+                AgentEvent::MemoryRecalled {
+                    turn: Some(99),
+                    preference_count: id as u32,
+                    history_count: 0,
+                },
+            );
+            metric.turn_id = Some("99".into());
+            record_correlated_metrics(&mut threads, &metric);
+            assert!(threads[0].metric_revisions.contains_key("99"));
+            terminal
+                .draw(|f| {
+                    draw_conversation(
+                        f,
+                        f.area(),
+                        &threads,
+                        false,
+                        "",
+                        &mut scroll,
+                        &mut cache,
+                        &mut view,
+                        None,
+                        None,
+                        &mut projection,
+                    );
+                })
+                .unwrap();
+            assert_eq!(cache.builds, builds);
+            assert_eq!(terminal.backend().buffer(), &screen);
+        }
+        apply_correlated_agent_event(
+            &mut threads[0],
+            AgentEvent::WorkResult {
+                result: evidence_result(1),
+            },
+            Some("2"),
+        );
+        for item in &mut threads[0].items {
+            if let Some(work) = &mut item.work {
+                item.hidden = false;
+                work.raw_open = true;
+            }
+        }
+        let raw = layout_text(&evidence_layout(&threads, true, Some("work-1")));
+        assert!(raw.contains("secret-code"));
+        assert!(raw.contains("secret-output"));
+        let expected = format!(
+            "{}:\n  first α\n\n\n{}:\n{}",
+            names().user,
+            names().conversation,
+            replies[0].unwrap()
+        );
+        assert_eq!(
+            selected_chat_cell_text(&threads, Some(0)),
+            Some(expected.clone())
+        );
+        assert!(handle_copy_key(
+            event::KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ),
+            MouseCapture(true),
+            true,
+            "draft",
+            &threads,
+            Some(0),
+            |text| {
+                assert_eq!(text, expected);
+                assert_eq!(
+                    copy_to_clipboard_with(
+                        text,
+                        |_, bytes| {
+                            assert_eq!(bytes, expected);
+                            true
+                        },
+                        |_| panic!("fake clipboard succeeded")
+                    ),
+                    CopyOutcome::SystemClipboard
+                );
+                true
+            },
+        ));
+    }
+
     #[test]
     fn copy_handler_preserves_payload_across_streaming_and_completion() {
         let mut threads = vec![Thread::new_foreground()];
@@ -8525,6 +9023,91 @@ mod tests {
             |_| panic!("release copied")
         ));
         assert!(selected_chat_cell_text(&[], None).is_none());
+    }
+
+    #[test]
+    fn copy_key_case_kind_and_modifier_matrix() {
+        let mut threads = vec![Thread::new_foreground()];
+        threads[0].finish_reply("  **α**\n\n".into(), Some("2".into()));
+        let expected = format!("{}:\n  **α**\n\n", names().conversation);
+        let before = serde_json::to_value(session_snapshot(&threads)).unwrap();
+        for capture in [MouseCapture::default(), MouseCapture(true)] {
+            for kind in [
+                event::KeyEventKind::Press,
+                event::KeyEventKind::Repeat,
+                event::KeyEventKind::Release,
+            ] {
+                for (code, modifiers, shortcut, yank) in [
+                    ('y', KeyModifiers::NONE, false, true),
+                    ('Y', KeyModifiers::NONE, false, false),
+                    ('Y', KeyModifiers::SHIFT, false, false),
+                    ('y', KeyModifiers::SHIFT, false, false),
+                    ('y', KeyModifiers::CONTROL, false, false),
+                    ('c', KeyModifiers::CONTROL, false, false),
+                    ('C', KeyModifiers::SHIFT, false, false),
+                    (
+                        'c',
+                        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                        true,
+                        false,
+                    ),
+                    (
+                        'C',
+                        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                        true,
+                        false,
+                    ),
+                    (
+                        'C',
+                        KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT,
+                        true,
+                        false,
+                    ),
+                ] {
+                    for pane in [false, true] {
+                        for input in ["", "draft"] {
+                            let mut copied = Vec::new();
+                            let handled = shortcut || (yank && !pane && input.is_empty());
+                            assert_eq!(
+                                handle_copy_key(
+                                    event::KeyEvent::new_with_kind(
+                                        KeyCode::Char(code),
+                                        modifiers,
+                                        kind
+                                    ),
+                                    capture,
+                                    pane,
+                                    input,
+                                    &threads,
+                                    Some(0),
+                                    |text| {
+                                        copied.push(text.to_owned());
+                                        true
+                                    },
+                                ),
+                                handled,
+                                "{code} {modifiers:?} {kind:?} {capture:?} {pane} {input}"
+                            );
+                            let copies = handled
+                                && (!shortcut || capture.0)
+                                && kind != event::KeyEventKind::Release;
+                            assert_eq!(
+                                copied,
+                                if copies {
+                                    vec![expected.clone()]
+                                } else {
+                                    vec![]
+                                }
+                            );
+                            assert_eq!(
+                                serde_json::to_value(session_snapshot(&threads)).unwrap(),
+                                before
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

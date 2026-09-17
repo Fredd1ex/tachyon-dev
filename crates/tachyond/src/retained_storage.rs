@@ -96,6 +96,70 @@ pub struct Receipt {
 }
 
 impl RetainedStorage {
+    /// Uses the caller's runtime read snapshot, never opens a second transaction.
+    pub fn monitor_in(
+        &self,
+        tx: &redb::ReadTransaction,
+        scopes: &[tachyon_api::monitor::MonitorScope],
+    ) -> Result<Vec<tachyon_api::monitor::Observed<tachyon_api::monitor::Storage>>, String> {
+        use tachyon_api::monitor::*;
+        let mut output: Vec<_> = scopes
+            .iter()
+            .map(|scope| {
+                if matches!(scope, MonitorScope::Work { .. }) {
+                    Observed::Unknown
+                } else {
+                    Observed::Known(Storage::default())
+                }
+            })
+            .collect();
+        let limits = tx.open_table(LIMITS).map_err(err)?;
+        for (scope, output) in scopes.iter().zip(&mut output) {
+            if let Observed::Known(output) = output {
+                output.limit_bytes = match scope {
+                    MonitorScope::Host => Observed::Known(Decimal(self.maximum.into())),
+                    MonitorScope::Campaign { campaign_id } => limits
+                        .get(campaign_id.as_str())
+                        .map_err(err)?
+                        .map_or(Observed::Unknown, |v| {
+                            Observed::Known(Decimal(v.value().into()))
+                        }),
+                    MonitorScope::Work { .. } => Observed::Unknown,
+                };
+            }
+        }
+        let table = tx.open_table(REFS).map_err(err)?;
+        for row in table.iter().map_err(err)? {
+            let (key, value) = row.map_err(err)?;
+            let receipt: Receipt = serde_json::from_slice(value.value()).map_err(err)?;
+            if key.value()
+                != (
+                    receipt.campaign.as_str(),
+                    receipt.kind.as_str(),
+                    receipt.id.as_str(),
+                )
+            {
+                return Err("invalid retained receipt identity".into());
+            }
+            for (scope, output) in scopes.iter().zip(&mut output) {
+                if !scope.matches(&receipt.campaign, None) {
+                    continue;
+                }
+                let Observed::Known(output) = output else {
+                    continue;
+                };
+                let (target, bytes) = match receipt.ready {
+                    Some(n) => (&mut output.ready_bytes, n),
+                    None => (&mut output.reserved_bytes, receipt.expected),
+                };
+                target.0 = target
+                    .0
+                    .checked_add(bytes.into())
+                    .ok_or("monitor storage overflow")?;
+            }
+        }
+        Ok(output)
+    }
     pub fn same_authority(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.database, &other.database) && self.maximum == other.maximum
     }

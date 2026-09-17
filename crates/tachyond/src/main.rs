@@ -2,6 +2,8 @@
 
 mod allocation_policy;
 mod history_store;
+mod messaging;
+mod monitor;
 mod runtime_store;
 use tachyond::artifact_store;
 
@@ -19,20 +21,21 @@ use nix::unistd::Pid;
 use tachyon_api::types::{
     AgentEvent as StructuredAgentEvent, AgentInfo, AgentState, ApiRequest, ApiResponse,
     BackgroundCoordinatorInfo, BackgroundScheduleAction, BackgroundScheduleDecision,
-    BackgroundScheduleRequest, DaemonInfo, EventEnvelope, EventStream, HistoryKind, HistoryRole,
-    LifecycleRecommendation, LifetimeClass, MemoryMutationResult, MemoryRecallItem,
-    MemoryRecallKind, PendingWorkReviewInfo, ReminderInfo, ScheduleDay, WorkOutcome, WorkRequest,
-    WorkResult, WorkReviewContext, WorkReviewDecision, WorkReviewFailure, WorkReviewRecommendation,
-    WorkReviewRequest, PROTO_VERSION,
+    BackgroundScheduleRequest, DaemonInfo, EventEnvelope, EventStream, LifecycleRecommendation,
+    LifetimeClass, MemoryMutationResult, MemoryRecallItem, MemoryRecallKind, PendingWorkReviewInfo,
+    ScheduleDay, WorkOutcome, WorkRequest, WorkResult, WorkReviewContext, WorkReviewDecision,
+    WorkReviewFailure, WorkReviewRecommendation, WorkReviewRequest, PROTO_VERSION,
 };
-use tachyon_api::{
-    InteractionCommand, InteractionCommandEnvelope, InteractionEvent, InteractionEventEnvelope,
-    InteractionMetadata, BACKGROUND_ID, FOREGROUND_ID, MEMORY_ID,
-};
+use tachyon_api::{InteractionCommand, BACKGROUND_ID, FOREGROUND_ID, MEMORY_ID};
 use tachyon_util::guard;
 
 use crate::history_store::HistoryStore;
-use crate::runtime_store::{HistoryProjection, RuntimeStore, RuntimeTaskRecord};
+use crate::messaging::{
+    acknowledge_reminder_notification, emit_schedule_event, encode_interaction_command,
+    encode_reminder_notification, encode_scheduled_task_notification, persist_interaction_history,
+    project_pending_history, stream_agent, stream_work, work_attention_notification,
+};
+use crate::runtime_store::{RuntimeStore, RuntimeTaskRecord};
 use tachyon_memory::{MemoryMutationSource, MemoryStore};
 
 const DEFAULT_BACKGROUND_REVIEW_TIMEOUT_SECS: u64 = 20;
@@ -87,6 +90,8 @@ enum CoordinatorRequest {
 }
 
 struct Registry {
+    service_shutdown: Arc<AtomicBool>,
+    monitor: Option<Arc<monitor::Monitor>>,
     tasks: HashMap<String, Task>,
     works: HashMap<String, WorkRecord>,
     foreground_id: Option<String>,
@@ -104,6 +109,8 @@ struct Registry {
 impl Default for Registry {
     fn default() -> Self {
         Self {
+            service_shutdown: Arc::new(AtomicBool::new(false)),
+            monitor: None,
             tasks: HashMap::new(),
             works: HashMap::new(),
             foreground_id: None,
@@ -136,39 +143,6 @@ impl Registry {
 
     fn get_mut(&mut self, id: &str) -> Option<&mut Task> {
         self.tasks.get_mut(id)
-    }
-
-    fn subscribe(&mut self, id: &str) -> Option<mpsc::Receiver<AgentEvent>> {
-        let (tx, rx) = mpsc::channel();
-        let task = self.tasks.get_mut(id)?;
-        if let Some(usage) = &task.terminal_usage {
-            let _ = tx.send(AgentEvent {
-                stream: EventStream::Stdout,
-                data: usage.clone(),
-            });
-        }
-        if let Some(result) = &task.terminal_result {
-            let _ = tx.send(AgentEvent {
-                stream: EventStream::Stdout,
-                data: result.clone(),
-            });
-        }
-        task.subs.push(tx);
-        Some(rx)
-    }
-
-    fn subscribe_work(&mut self, work_id: &str) -> Option<mpsc::Receiver<AgentEvent>> {
-        let (tx, rx) = mpsc::channel();
-        let work = self.works.get_mut(work_id)?;
-        if let Some(result) = &work.terminal_result {
-            let _ = tx.send(AgentEvent {
-                stream: EventStream::Stdout,
-                data: result.clone(),
-            });
-        } else {
-            work.subs.push(tx);
-        }
-        Some(rx)
     }
 
     fn sorted(&self) -> Vec<AgentInfo> {
@@ -327,84 +301,7 @@ fn existing_work(
     Ok(Some(work.info.clone()))
 }
 
-static INTERACTION_COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static DAEMON_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1 << 63);
-
-fn encode_interaction_command(
-    command: InteractionCommand,
-    correlation_id: Option<String>,
-    causation_id: Option<String>,
-    turn_id: Option<String>,
-    cwd: Option<String>,
-) -> Result<String, String> {
-    let sequence = INTERACTION_COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let message_id = format!("interaction-command-{sequence}");
-    let mut metadata = InteractionMetadata::new(
-        &message_id,
-        correlation_id.unwrap_or_else(|| message_id.clone()),
-        FOREGROUND_ID,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0),
-    );
-    metadata.causation_id = causation_id;
-    metadata.turn_id = turn_id;
-    metadata.cwd = cwd;
-    serde_json::to_string(&InteractionCommandEnvelope { metadata, command })
-        .map_err(|error| format!("encode interaction command: {error}"))
-}
-
-fn encode_reminder_notification(reminder: &ReminderInfo) -> Result<String, String> {
-    let metadata = InteractionMetadata {
-        protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
-        message_id: format!("reminder-delivery-{}", reminder.id),
-        cwd: None,
-        correlation_id: reminder.id.clone(),
-        causation_id: Some(reminder.id.clone()),
-        conversation_id: reminder.conversation_id.clone(),
-        turn_id: None,
-        generation: 0,
-        occurred_at_ms: unix_now_ms(),
-    };
-    serde_json::to_string(&InteractionCommandEnvelope {
-        metadata,
-        command: InteractionCommand::NotifyUser {
-            text: reminder.text.clone(),
-            model: true,
-        },
-    })
-    .map_err(|error| format!("encode reminder notification: {error}"))
-}
-
-fn encode_scheduled_task_notification(
-    task: &tachyon_api::ScheduledTaskInfo,
-    result: &str,
-) -> Result<String, String> {
-    let metadata = InteractionMetadata {
-        protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
-        message_id: format!("scheduled-task-delivery-{}", task.id),
-        cwd: None,
-        correlation_id: task.id.clone(),
-        causation_id: Some(task.id.clone()),
-        conversation_id: task.conversation_id.clone(),
-        turn_id: None,
-        generation: 0,
-        occurred_at_ms: unix_now_ms(),
-    };
-    let context = format!(
-        "A scheduled agent task has finished. Present its result to the user as a concise standalone update.\nObjective: {}\nResult:\n{}",
-        task.objective, result
-    );
-    serde_json::to_string(&InteractionCommandEnvelope {
-        metadata,
-        command: InteractionCommand::NotifyUser {
-            text: context,
-            model: true,
-        },
-    })
-    .map_err(|error| format!("encode scheduled task notification: {error}"))
-}
 
 fn reap_warm_workers(registry: &Arc<Mutex<Registry>>) {
     let configured_ttl = std::env::var("TACHYON_WARM_AGENT_TTL_SECS")
@@ -527,124 +424,6 @@ fn persist_task(registry: &Arc<Mutex<Registry>>, info: &AgentInfo, note: &str) {
     }
 }
 
-fn history_projection(data: &str) -> Option<HistoryProjection> {
-    let envelope = serde_json::from_str::<InteractionEventEnvelope>(data).ok()?;
-    let (role, text) = match envelope.event {
-        InteractionEvent::UserTurnAccepted { text } => (HistoryRole::User, text),
-        InteractionEvent::ConversationFinished { text } => (HistoryRole::Assistant, text),
-        InteractionEvent::UserVisibleNotificationPublished { text } => {
-            (HistoryRole::Notification, text)
-        }
-        InteractionEvent::ConversationDelta { .. }
-        | InteractionEvent::ConversationIntentProduced { .. }
-        | InteractionEvent::ForegroundRequestTimedOut { .. } => return None,
-    };
-    if text.trim().is_empty() {
-        return None;
-    }
-    Some(HistoryProjection {
-        schema_version: 1,
-        event_id: envelope.metadata.message_id,
-        kind: HistoryKind::Conversation,
-        conversation_id: envelope.metadata.conversation_id,
-        turn_id: envelope.metadata.turn_id,
-        occurred_at_ms: envelope.metadata.occurred_at_ms,
-        role,
-        text,
-        task_id: None,
-        task_state: None,
-    })
-}
-
-fn project_pending_history(registry: &Arc<Mutex<Registry>>) -> Result<(), String> {
-    let (runtime, history) = {
-        let registry = registry.lock().unwrap();
-        (
-            registry
-                .runtime_store
-                .clone()
-                .ok_or_else(|| "runtime store unavailable".to_string())?,
-            registry.history_store.clone(),
-        )
-    };
-    let Some(history) = history else {
-        return Ok(());
-    };
-    for projection in runtime.pending_history()? {
-        history.apply(&projection)?;
-        runtime.acknowledge_history(&projection.event_id, unix_now_ms())?;
-    }
-    Ok(())
-}
-
-fn persist_interaction_history(registry: &Arc<Mutex<Registry>>, data: &str) {
-    let Some(projection) = history_projection(data) else {
-        return;
-    };
-    let runtime = registry.lock().unwrap().runtime_store.clone();
-    let Some(runtime) = runtime else {
-        eprintln!("tachyond: runtime store missing for history event");
-        return;
-    };
-    if let Err(error) = runtime.enqueue_history(&projection) {
-        eprintln!("tachyond: enqueue history {}: {error}", projection.event_id);
-        return;
-    }
-    if let Err(error) = project_pending_history(registry) {
-        eprintln!("tachyond: project history: {error}");
-    }
-}
-
-fn acknowledge_reminder_notification(registry: &Arc<Mutex<Registry>>, data: &str) {
-    let Ok(envelope) = serde_json::from_str::<InteractionEventEnvelope>(data) else {
-        return;
-    };
-    if !matches!(
-        envelope.event,
-        InteractionEvent::UserVisibleNotificationPublished { .. }
-    ) {
-        return;
-    }
-    let store = registry.lock().unwrap().runtime_store.clone();
-    let Some(store) = store else { return };
-    if envelope
-        .metadata
-        .correlation_id
-        .starts_with("scheduled-task-")
-    {
-        if let Err(error) =
-            store.acknowledge_scheduled_task_notification(&envelope.metadata.correlation_id)
-        {
-            eprintln!(
-                "tachyond: acknowledge scheduled task {}: {error}",
-                envelope.metadata.correlation_id
-            );
-        }
-        return;
-    }
-    if !envelope.metadata.correlation_id.starts_with("reminder-") {
-        return;
-    }
-    match store.acknowledge_reminder_delivery(
-        &envelope.metadata.correlation_id,
-        envelope.metadata.occurred_at_ms,
-    ) {
-        Ok(reminder) => emit_schedule_event(
-            registry,
-            reminder.conversation_id.clone(),
-            reminder.turn,
-            StructuredAgentEvent::ReminderFired {
-                turn: Some(reminder.turn),
-                reminder_id: reminder.id,
-            },
-        ),
-        Err(error) => eprintln!(
-            "tachyond: acknowledge reminder {}: {error}",
-            envelope.metadata.correlation_id
-        ),
-    }
-}
-
 fn scheduled_result_text(data: &str) -> (String, bool) {
     let result = serde_json::from_str::<EventEnvelope>(data)
         .ok()
@@ -759,14 +538,7 @@ fn run_reminder_scheduler(registry: Arc<Mutex<Registry>>, shutdown: Arc<AtomicBo
                 .collect::<Vec<_>>();
             if user_connected {
                 for q in attention {
-                    let text = format!("Work needs input: campaign={:?} work={:?} request={:?}. Use tachyon campaign attention list. Question: {:?}", q.campaign_id, q.work_id, q.request_id, q.question.chars().take(256).collect::<String>());
-                    if let Ok(command) = encode_interaction_command(
-                        InteractionCommand::NotifyUser { text, model: false },
-                        None,
-                        None,
-                        None,
-                        None,
-                    ) {
+                    if let Ok(command) = work_attention_notification(&q) {
                         if let Ok(input) = task_input(&registry, FOREGROUND_ID) {
                             let _ = write_task_input(input, FOREGROUND_ID, &command);
                         }
@@ -849,31 +621,6 @@ fn emit_memory_event(
         parent_task_id: None,
         tool_call_id: None,
         actor: tachyon_api::Actor::System,
-        sequence,
-        occurred_at_ms: unix_now_ms(),
-        kind,
-    };
-    if let Ok(data) = serde_json::to_string(&envelope) {
-        push_event(registry, FOREGROUND_ID, EventStream::Stdout, &data);
-    }
-}
-
-fn emit_schedule_event(
-    registry: &Arc<Mutex<Registry>>,
-    conversation_id: String,
-    turn: u64,
-    kind: StructuredAgentEvent,
-) {
-    let sequence = DAEMON_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let envelope = EventEnvelope {
-        event_id: sequence,
-        session_id: BACKGROUND_ID.into(),
-        conversation_id: Some(conversation_id),
-        turn_id: Some(turn.to_string()),
-        task_id: None,
-        parent_task_id: None,
-        tool_call_id: None,
-        actor: tachyon_api::Actor::Background,
         sequence,
         occurred_at_ms: unix_now_ms(),
         kind,
@@ -2201,12 +1948,6 @@ fn finish_agent(
     }
 }
 
-// Subscribe path: `subscribe()` hands back an mpsc receiver while still
-// holding the task in the map, so keep the borrow short.
-fn subscribe_unlocked(reg: &mut Registry, id: &str) -> Option<mpsc::Receiver<AgentEvent>> {
-    reg.subscribe(id)
-}
-
 fn main() -> std::process::ExitCode {
     if let Some(code) = guard::guard_or_exit_code() {
         return std::process::ExitCode::from(code as u8);
@@ -2290,8 +2031,9 @@ fn main() -> std::process::ExitCode {
         }
     };
     let reg = Arc::new(Mutex::new(Registry {
+        service_shutdown: shutdown.clone(),
         campaigns: Some(campaigns.clone()),
-        runtime_store: Some(runtime_store),
+        runtime_store: Some(runtime_store.clone()),
         history_store,
         memory_store: Some(memory_store),
         ..Registry::default()
@@ -2312,6 +2054,10 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     start_ready_tasks(&reg);
+
+    let (monitor, monitor_thread) =
+        monitor::Monitor::start(Arc::downgrade(&reg), runtime_store, shutdown.clone());
+    reg.lock().unwrap().monitor = Some(monitor.clone());
 
     // Spawn the foreground runtime.
     {
@@ -2426,6 +2172,8 @@ fn main() -> std::process::ExitCode {
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
 
+    monitor.stop();
+    let _ = monitor_thread.join();
     shutdown_tasks(&reg);
     campaigns.shutdown();
     let _ = background.join();
@@ -2505,10 +2253,12 @@ fn run_ipc_server(
 /// closes. `AgentSubscribe` / `ForegroundSubscribe` change the connection to
 /// a streaming mode and take it over until the stream ends.
 fn handle_connection(stream: UnixStream, registry: Arc<Mutex<Registry>>) -> std::io::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let uid = nix::unistd::geteuid().as_raw();
     #[cfg(target_os = "linux")]
-    if nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)?.uid()
-        != nix::unistd::geteuid().as_raw()
-    {
+    let uid =
+        nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)?.uid();
+    if uid != nix::unistd::geteuid().as_raw() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "daemon IPC requires the same user",
@@ -2525,6 +2275,22 @@ fn handle_connection(stream: UnixStream, registry: Arc<Mutex<Registry>>) -> std:
             Err(_) => return write_response(&mut writer, &ApiResponse::error("bad request")),
         };
 
+        if let ApiRequest::MonitorGet { query } | ApiRequest::MonitorSubscribe { query, .. } = &req
+        {
+            let (monitor, shutdown) = {
+                let registry = registry.lock().unwrap();
+                (registry.monitor.clone(), registry.service_shutdown.clone())
+            };
+            if shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let subscribe = matches!(req, ApiRequest::MonitorSubscribe { .. });
+            monitor::serve(&mut writer, monitor, query.clone(), subscribe)?;
+            if subscribe || shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            continue;
+        }
         if let ApiRequest::AgentSubscribe { id } = &req {
             return stream_agent(&mut writer, id, registry);
         }
@@ -2535,72 +2301,113 @@ fn handle_connection(stream: UnixStream, registry: Arc<Mutex<Registry>>) -> std:
             return stream_agent(&mut writer, FOREGROUND_ID, registry);
         }
 
+        if matches!(
+            req,
+            ApiRequest::Todo(_)
+                | ApiRequest::TodoSnapshot { .. }
+                | ApiRequest::OperationalSubscribe { .. }
+        ) {
+            let (store, shutdown) = {
+                let registry = registry.lock().unwrap();
+                (
+                    registry.runtime_store.clone(),
+                    registry.service_shutdown.clone(),
+                )
+            };
+            if shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let Some(store) = store else {
+                write_service_response(
+                    &mut writer,
+                    &ApiResponse::TodoError {
+                        error: tachyon_api::todo::TodoError::Storage {
+                            message: "runtime store unavailable".into(),
+                        },
+                    },
+                    &shutdown,
+                )?;
+                continue;
+            };
+            let (scope, request) = match &req {
+                ApiRequest::Todo(request) => (request.scope().clone(), Some(request.clone())),
+                ApiRequest::TodoSnapshot {
+                    scope,
+                    limit,
+                    cursor,
+                } => (
+                    scope.clone(),
+                    Some(tachyon_api::todo::TodoRequest::List {
+                        scope: scope.clone(),
+                        filter: Default::default(),
+                        limit: *limit,
+                        cursor: cursor.clone(),
+                    }),
+                ),
+                ApiRequest::OperationalSubscribe { scope, .. } => (scope.clone(), None),
+                _ => unreachable!(),
+            };
+            let facade = store.todos(runtime_store::todo::TodoAuthority::Bound {
+                scope,
+                actor: tachyon_api::todo::TodoActor {
+                    source: "operator".into(),
+                    actor: format!("uid:{uid}"),
+                },
+            });
+            let facade = match facade {
+                Ok(facade) => facade,
+                Err(error) => {
+                    write_service_response(
+                        &mut writer,
+                        &ApiResponse::TodoError { error },
+                        &shutdown,
+                    )?;
+                    continue;
+                }
+            };
+            if let Some(request) = request {
+                let response = match facade.execute(request) {
+                    Ok(response) => ApiResponse::Todo { response },
+                    Err(error) => ApiResponse::TodoError { error },
+                };
+                write_service_response(&mut writer, &response, &shutdown)?;
+                continue;
+            }
+            if let ApiRequest::OperationalSubscribe { mut after, .. } = req {
+                loop {
+                    if shutdown.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    match facade.operational_batch(&after) {
+                        Ok(batch) => {
+                            let idle = batch.watermark == after;
+                            after = batch.watermark.clone();
+                            write_service_response(
+                                &mut writer,
+                                &ApiResponse::OperationalBatch { batch },
+                                &shutdown,
+                            )?;
+                            if idle {
+                                std::thread::sleep(std::time::Duration::from_millis(250));
+                            }
+                        }
+                        Err(error) => {
+                            return write_service_response(
+                                &mut writer,
+                                &ApiResponse::TodoError { error },
+                                &shutdown,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
         let resp = dispatch(&req, &registry);
         if write_response(&mut writer, &resp).is_err() {
             return Ok(());
         }
     }
-}
-
-/// Stream an agent's events to a subscriber until the agent ends.
-fn stream_agent(
-    writer: &mut UnixStream,
-    id: &str,
-    registry: Arc<Mutex<Registry>>,
-) -> std::io::Result<()> {
-    let rx = {
-        let mut reg = registry.lock().unwrap();
-        match subscribe_unlocked(&mut reg, id) {
-            Some(rx) => rx,
-            None => {
-                return write_response(writer, &ApiResponse::error(format!("no such agent: {id}")))
-            }
-        }
-    };
-
-    while let Ok(ev) = rx.recv() {
-        let resp = ApiResponse::Event {
-            stream: ev.stream,
-            data: ev.data,
-        };
-        if write_response(writer, &resp).is_err() {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn stream_work(
-    writer: &mut UnixStream,
-    work_id: &str,
-    registry: Arc<Mutex<Registry>>,
-) -> std::io::Result<()> {
-    let rx = {
-        let mut reg = registry.lock().unwrap();
-        match reg.subscribe_work(work_id) {
-            Some(rx) => rx,
-            None => {
-                return write_response(
-                    writer,
-                    &ApiResponse::error(format!("no such work: {work_id}")),
-                )
-            }
-        }
-    };
-    while let Ok(event) = rx.recv() {
-        if write_response(
-            writer,
-            &ApiResponse::Event {
-                stream: event.stream,
-                data: event.data,
-            },
-        )
-        .is_err()
-        {
-            break;
-        }
-    }
-    Ok(())
 }
 
 fn read_request<R: BufRead>(reader: &mut R) -> std::io::Result<ApiRequest> {
@@ -2622,10 +2429,62 @@ fn write_response<W: Write>(writer: &mut W, resp: &ApiResponse) -> std::io::Resu
     writer.flush()
 }
 
+/// Only the new services use cancellable writes; transcript transports are unchanged.
+fn write_service_response(
+    writer: &mut UnixStream,
+    resp: &ApiResponse,
+    shutdown: &AtomicBool,
+) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    use std::time::{Duration, Instant};
+    let mut bytes = serde_json::to_vec(resp).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    let previous = writer.write_timeout()?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let result = (|| {
+        let mut remaining = bytes.as_slice();
+        while !remaining.is_empty() {
+            if shutdown.load(Ordering::Acquire) {
+                return Err(std::io::Error::new(
+                    ErrorKind::ConnectionAborted,
+                    "service stopped",
+                ));
+            }
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "service write deadline",
+                ));
+            }
+            writer.set_write_timeout(Some(wait.min(Duration::from_millis(250))))?;
+            match writer.write(remaining) {
+                Ok(0) => return Err(std::io::Error::from(ErrorKind::WriteZero)),
+                Ok(n) => remaining = &remaining[n..],
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    })();
+    let restored = writer.set_write_timeout(previous);
+    result.and(restored)
+}
+
 /// Dispatch a request to the registry.
 fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
     use ApiRequest::*;
     match req {
+        MonitorGet { .. } | MonitorSubscribe { .. } => {
+            ApiResponse::error("monitor API requires authenticated operator connection")
+        }
+        Todo(_) | TodoSnapshot { .. } | OperationalSubscribe { .. } => {
+            ApiResponse::error("todo API requires authenticated connection metadata")
+        }
         CampaignIntegrationSnapshot { .. } | CampaignIntegrate { .. } => {
             let store = registry.lock().unwrap().runtime_store.clone();
             store
@@ -4911,7 +4770,9 @@ fn drain_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_store::HistoryProjection;
     use tachyon_api::types::{MemoryIntent, MemoryMutationKind};
+    use tachyon_api::{HistoryKind, HistoryRole};
 
     #[test]
     fn research_campaign_dispatch_is_inert_and_requires_store() {
@@ -4978,6 +4839,130 @@ mod tests {
     }
 
     #[test]
+    fn operational_subscription_stops_with_connected_reader_and_releases_resources() {
+        use tachyon_api::todo::{TodoActor, TodoFilter, TodoRequest, TodoResponse, TodoScope};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RuntimeStore::open(&dir.path().join("runtime.redb")).unwrap());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let scope = TodoScope::Conversation {
+            id: "shutdown-feed".into(),
+        };
+        let TodoResponse::List { watermark, .. } = store
+            .todos(runtime_store::todo::TodoAuthority::Bound {
+                scope: scope.clone(),
+                actor: TodoActor {
+                    source: "operator".into(),
+                    actor: "test".into(),
+                },
+            })
+            .unwrap()
+            .execute(TodoRequest::List {
+                scope: scope.clone(),
+                filter: TodoFilter::default(),
+                limit: None,
+                cursor: None,
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        let registry = Arc::new(Mutex::new(Registry {
+            runtime_store: Some(store.clone()),
+            service_shutdown: shutdown.clone(),
+            ..Default::default()
+        }));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let serving = registry.clone();
+        let (done, ended) = mpsc::channel();
+        let handler = std::thread::spawn(move || {
+            done.send(handle_connection(server, serving)).unwrap();
+        });
+        writeln!(
+            client,
+            "{}",
+            serde_json::to_string(&ApiRequest::OperationalSubscribe {
+                scope,
+                after: watermark,
+            })
+            .unwrap()
+        )
+        .unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(
+            matches!(serde_json::from_str::<ApiResponse>(&line).unwrap(), ApiResponse::OperationalBatch { batch } if batch.events.is_empty())
+        );
+        // The idle feed must observe shutdown without reacquiring the registry.
+        let guard = registry.lock().unwrap();
+        shutdown.store(true, Ordering::Release);
+        let result = ended.recv_timeout(std::time::Duration::from_secs(1));
+        drop(guard);
+        if result.is_err() {
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+        }
+        handler.join().unwrap();
+        result.unwrap().unwrap();
+        assert_eq!(Arc::strong_count(&store), 2);
+        assert_eq!(Arc::strong_count(&registry), 1);
+        assert_eq!(Arc::strong_count(&shutdown), 2);
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn service_writes_cancel_and_deadline_without_changing_other_transports() {
+        use std::io::Read;
+        for cancel in [false, true] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            nix::sys::socket::setsockopt(&server, nix::sys::socket::sockopt::SndBuf, &1024usize)
+                .unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let token = shutdown.clone();
+            let (done, ended) = mpsc::channel();
+            let handler = std::thread::spawn(move || {
+                let result = write_service_response(
+                    &mut server,
+                    &ApiResponse::error("x".repeat(128 * 1024)),
+                    &token,
+                );
+                done.send((result, server.write_timeout().unwrap()))
+                    .unwrap();
+            });
+            // Confirm a partial frame, then leave the socket connected and non-reading.
+            client.read_exact(&mut [0u8; 1]).unwrap();
+            if cancel {
+                shutdown.store(true, Ordering::Release);
+            }
+            let result = ended.recv_timeout(std::time::Duration::from_secs(2));
+            if result.is_err() {
+                client.shutdown(std::net::Shutdown::Both).unwrap();
+            }
+            handler.join().unwrap();
+            let (result, timeout) = result.unwrap();
+            assert_eq!(
+                result.unwrap_err().kind(),
+                if cancel {
+                    std::io::ErrorKind::ConnectionAborted
+                } else {
+                    std::io::ErrorKind::TimedOut
+                }
+            );
+            assert_eq!(timeout, None);
+        }
+    }
+
+    #[test]
     fn research_campaign_ipc_uses_existing_typed_transport() {
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(Mutex::new(Registry {
@@ -5015,6 +5000,185 @@ mod tests {
         drop(client);
         handler.join().unwrap().unwrap();
     }
+
+    #[test]
+    fn todo_ipc_snapshot_mutation_replay_and_live_feed() {
+        use tachyon_api::todo::*;
+        fn exchange(
+            client: &mut UnixStream,
+            reader: &mut BufReader<UnixStream>,
+            req: ApiRequest,
+        ) -> ApiResponse {
+            let mut bytes = serde_json::to_vec(&req).unwrap();
+            bytes.push(b'\n');
+            client.write_all(&bytes).unwrap();
+            receive(reader)
+        }
+        fn receive(reader: &mut BufReader<UnixStream>) -> ApiResponse {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Mutex::new(Registry {
+            runtime_store: Some(Arc::new(
+                RuntimeStore::open(&dir.path().join("runtime.redb")).unwrap(),
+            )),
+            ..Registry::default()
+        }));
+        let connect = || {
+            let (client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let registry = registry.clone();
+            let handler = std::thread::spawn(move || handle_connection(server, registry));
+            let reader = BufReader::new(client.try_clone().unwrap());
+            (client, reader, handler)
+        };
+        let (mut client, mut reader, handler) = connect();
+        let scope = TodoScope::Conversation {
+            id: "public-chat".into(),
+        };
+        let ApiResponse::Todo {
+            response:
+                TodoResponse::List {
+                    watermark: initial,
+                    todos,
+                    ..
+                },
+        } = exchange(
+            &mut client,
+            &mut reader,
+            ApiRequest::TodoSnapshot {
+                scope: scope.clone(),
+                limit: None,
+                cursor: None,
+            },
+        )
+        else {
+            panic!()
+        };
+        assert!(todos.is_empty());
+        let add = ApiRequest::Todo(TodoRequest::Add {
+            scope: scope.clone(),
+            command_id: "public-add".into(),
+            expected_revision: 0,
+            title: "task".into(),
+            description: String::new(),
+        });
+        let ApiResponse::Todo { response: first } = exchange(&mut client, &mut reader, add.clone())
+        else {
+            panic!()
+        };
+        let TodoResponse::Mutation {
+            todo, watermark, ..
+        } = &first
+        else {
+            panic!()
+        };
+        assert_eq!(
+            todo.created_by,
+            TodoActor {
+                source: "operator".into(),
+                actor: format!("uid:{}", nix::unistd::geteuid())
+            }
+        );
+        let ApiResponse::Todo { response: replay } = exchange(&mut client, &mut reader, add) else {
+            panic!()
+        };
+        assert_eq!(first, replay);
+        for scope in [
+            TodoScope::Work {
+                work_id: "missing".into(),
+            },
+            TodoScope::Campaign {
+                campaign_id: "missing".into(),
+            },
+        ] {
+            assert!(matches!(
+                exchange(
+                    &mut client,
+                    &mut reader,
+                    ApiRequest::TodoSnapshot {
+                        scope,
+                        limit: None,
+                        cursor: None
+                    }
+                ),
+                ApiResponse::TodoError {
+                    error: TodoError::AuthorityDenied
+                }
+            ));
+        }
+        let (mut feed, mut feed_reader, feed_handler) = connect();
+        let ApiResponse::OperationalBatch { batch } = exchange(
+            &mut feed,
+            &mut feed_reader,
+            ApiRequest::OperationalSubscribe {
+                scope: scope.clone(),
+                after: initial,
+            },
+        ) else {
+            panic!()
+        };
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(&batch.watermark, watermark);
+        let ApiResponse::Todo {
+            response: TodoResponse::Mutation {
+                watermark: updated, ..
+            },
+        } = exchange(
+            &mut client,
+            &mut reader,
+            ApiRequest::Todo(TodoRequest::Update {
+                scope: scope.clone(),
+                command_id: "public-update".into(),
+                id: todo.id.clone(),
+                expected_revision: 1,
+                title: None,
+                description: None,
+                status: Some(TodoStatus::Completed),
+            }),
+        )
+        else {
+            panic!()
+        };
+        loop {
+            let ApiResponse::OperationalBatch { batch } = receive(&mut feed_reader) else {
+                panic!()
+            };
+            if batch.events.is_empty() {
+                continue;
+            }
+            assert_eq!(batch.watermark, updated);
+            assert_eq!(batch.events.len(), 1);
+            break;
+        }
+        let mut stale = updated;
+        stale.instance_id = uuid::Uuid::new_v4().to_string();
+        let (mut bad, mut bad_reader, bad_handler) = connect();
+        assert!(matches!(
+            exchange(
+                &mut bad,
+                &mut bad_reader,
+                ApiRequest::OperationalSubscribe {
+                    scope,
+                    after: stale
+                }
+            ),
+            ApiResponse::TodoError {
+                error: TodoError::CursorStale
+            }
+        ));
+        bad_handler.join().unwrap().unwrap();
+        drop(feed_reader);
+        drop(feed);
+        assert!(feed_handler.join().unwrap().is_err());
+        drop(reader);
+        drop(client);
+        handler.join().unwrap().unwrap();
+    }
     #[test]
     fn absolute_local_deadlines_distinguish_today_tomorrow_and_next() {
         let now = Local
@@ -5041,30 +5205,49 @@ mod tests {
     }
 
     #[test]
-    fn foreground_commands_are_versioned_and_preserve_multiline_turns() {
-        let wire = encode_interaction_command(
-            InteractionCommand::AcceptUserTurn {
-                text: "line one\nline two".into(),
-            },
-            Some("request-1".into()),
-            None,
-            Some("4".into()),
-            Some("/tmp/selected".into()),
-        )
-        .unwrap();
-        assert!(!wire.contains('\n'));
-        let decoded: InteractionCommandEnvelope = serde_json::from_str(&wire).unwrap();
-        assert_eq!(
-            decoded.metadata.protocol_version,
-            tachyon_api::INTERACTION_PROTOCOL_VERSION
-        );
-        assert_eq!(decoded.metadata.correlation_id, "request-1");
-        assert_eq!(decoded.metadata.turn_id.as_deref(), Some("4"));
-        assert_eq!(decoded.metadata.cwd.as_deref(), Some("/tmp/selected"));
-        assert!(matches!(
-            decoded.command,
-            InteractionCommand::AcceptUserTurn { text } if text == "line one\nline two"
-        ));
+    fn interaction_executable_resolution_preserves_names_and_overrides() {
+        let exe = std::env::current_exe().unwrap();
+        if let Ok(mode) = std::env::var("TACHYON_TEST_INTERACTION_RESOLUTION") {
+            for (actual, name) in [
+                (foreground_path(), "tachyon-foreground"),
+                (background_path(), "tachyon-background"),
+            ] {
+                let expected = if mode == "sibling" {
+                    exe.parent().unwrap().join(name)
+                } else {
+                    std::path::PathBuf::from(format!("/test overrides/{name}"))
+                };
+                assert_eq!(actual, expected);
+            }
+            assert_eq!(foreground_command().get_program(), foreground_path());
+            return;
+        }
+        // Isolate environment changes from parallel host tests; launch only this test.
+        for mode in ["sibling", "override"] {
+            let mut command = Command::new(&exe);
+            command
+                .args([
+                    "--exact",
+                    "tests::interaction_executable_resolution_preserves_names_and_overrides",
+                ])
+                .env("TACHYON_TEST_INTERACTION_RESOLUTION", mode)
+                .env_remove("TACHYON_FOREGROUND_BIN")
+                .env_remove("TACHYON_BACKGROUND_BIN");
+            if mode == "override" {
+                command
+                    .env(
+                        "TACHYON_FOREGROUND_BIN",
+                        "/test overrides/tachyon-foreground",
+                    )
+                    .env(
+                        "TACHYON_BACKGROUND_BIN",
+                        "/test overrides/tachyon-background",
+                    );
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
     }
 
     #[test]
@@ -5077,7 +5260,7 @@ mod tests {
         assert_eq!(&args[..3], &["--agent-id", FOREGROUND_ID, "--new-session"]);
     }
 
-    fn task(id: &str, state: AgentState) -> Task {
+    pub(super) fn task(id: &str, state: AgentState) -> Task {
         Task {
             info: AgentInfo {
                 id: id.into(),
@@ -5583,87 +5766,6 @@ mod tests {
     }
 
     #[test]
-    fn typed_work_result_is_terminal_once_and_replayed_by_work_id() {
-        let registry = Arc::new(Mutex::new(Registry::default()));
-        let mut worker = task("worker", AgentState::Running);
-        worker.warm = true;
-        worker.info.retained = true;
-        worker.info.logical_task_id = Some("work-1".into());
-        let info = worker.info.clone();
-        let request = WorkRequest {
-            context_refs: vec![],
-            constraints: None,
-            attempt: None,
-            work_id: "work-1".into(),
-            objective: "inspect".into(),
-            generation: 0,
-            assignment: 0,
-            deadline_ms: 100,
-            lifetime_class: LifetimeClass::Long,
-        };
-        {
-            let mut reg = registry.lock().unwrap();
-            reg.tasks.insert("worker".into(), worker);
-            reg.works.insert(
-                request.work_id.clone(),
-                WorkRecord {
-                    request: request.clone(),
-                    fingerprint: "fingerprint".into(),
-                    worker_id: "worker".into(),
-                    info,
-                    review: None,
-                    terminal_result: None,
-                    subs: Vec::new(),
-                },
-            );
-        }
-        let result = WorkResult {
-            work_id: request.work_id.clone(),
-            objective: request.objective.clone(),
-            attempt_id: None,
-            candidate_refs: None,
-            final_context: None,
-            generation: 0,
-            instruction_revision: None,
-            evidence: Default::default(),
-            timing: None,
-            assignment: 0,
-            outcome: WorkOutcome::Completed {
-                result: "first".into(),
-                artifacts: Vec::new(),
-                context: String::new(),
-                suggested_reuse: true,
-            },
-        };
-        let event = serde_json::to_string(&StructuredAgentEvent::WorkResult {
-            result: result.clone(),
-        })
-        .unwrap();
-        push_event(&registry, "worker", EventStream::Stdout, &event);
-
-        let duplicate = serde_json::to_string(&StructuredAgentEvent::WorkResult {
-            result: WorkResult {
-                outcome: WorkOutcome::Completed {
-                    result: "second".into(),
-                    artifacts: Vec::new(),
-                    context: String::new(),
-                    suggested_reuse: true,
-                },
-                ..result
-            },
-        })
-        .unwrap();
-        push_event(&registry, "worker", EventStream::Stdout, &duplicate);
-
-        let mut reg = registry.lock().unwrap();
-        assert_eq!(reg.tasks["worker"].info.turns_used, 1);
-        let replay = reg.subscribe_work("work-1").unwrap();
-        let replayed = replay.recv().unwrap();
-        assert!(replayed.data.contains("first"));
-        assert!(!replayed.data.contains("second"));
-    }
-
-    #[test]
     fn review_timing_is_separate_from_execution_for_accept_rework_and_no_provider() {
         for recommendation in [
             WorkReviewRecommendation::Accept {
@@ -6016,77 +6118,6 @@ mod tests {
     }
 
     #[test]
-    fn history_projection_keeps_only_canonical_visible_messages() {
-        let metadata = InteractionMetadata {
-            protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
-            message_id: "message-1".into(),
-            cwd: None,
-            correlation_id: "command-1".into(),
-            causation_id: None,
-            conversation_id: "conversation-1".into(),
-            turn_id: Some("1".into()),
-            generation: 0,
-            occurred_at_ms: 123,
-        };
-        let accepted = InteractionEventEnvelope {
-            metadata: metadata.clone(),
-            event: InteractionEvent::UserTurnAccepted {
-                text: "hello".into(),
-            },
-        };
-        let projection = history_projection(&serde_json::to_string(&accepted).unwrap()).unwrap();
-        assert_eq!(projection.role, HistoryRole::User);
-        assert_eq!(projection.text, "hello");
-
-        let delta = InteractionEventEnvelope {
-            metadata,
-            event: InteractionEvent::ConversationDelta {
-                text: "partial".into(),
-            },
-        };
-        assert!(history_projection(&serde_json::to_string(&delta).unwrap()).is_none());
-    }
-
-    #[test]
-    fn history_outbox_projects_and_acknowledges() {
-        let directory = tempfile::tempdir().unwrap();
-        let registry = Arc::new(Mutex::new(Registry {
-            runtime_store: Some(Arc::new(
-                RuntimeStore::open(&directory.path().join("runtime.redb")).unwrap(),
-            )),
-            history_store: Some(Arc::new(
-                HistoryStore::open(&directory.path().join("history.redb")).unwrap(),
-            )),
-            ..Registry::default()
-        }));
-        let event = InteractionEventEnvelope {
-            metadata: InteractionMetadata {
-                protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
-                message_id: "message-1".into(),
-                cwd: None,
-                correlation_id: "command-1".into(),
-                causation_id: None,
-                conversation_id: "conversation-1".into(),
-                turn_id: Some("1".into()),
-                generation: 0,
-                occurred_at_ms: 123,
-            },
-            event: InteractionEvent::ConversationFinished {
-                text: "answer".into(),
-            },
-        };
-        persist_interaction_history(&registry, &serde_json::to_string(&event).unwrap());
-        let guard = registry.lock().unwrap();
-        assert!(guard
-            .runtime_store
-            .as_ref()
-            .unwrap()
-            .pending_history()
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
     fn typed_memory_mutation_commits_before_reporting_success() {
         let directory = tempfile::tempdir().unwrap();
         let memory = Arc::new(MemoryStore::open(directory.path().join("memories.redb")).unwrap());
@@ -6286,30 +6317,6 @@ mod tests {
             reminder.status,
             tachyon_api::types::ReminderStatus::Cancelled
         );
-    }
-
-    #[test]
-    fn reminder_notification_carries_stable_delivery_identity() {
-        let reminder = ReminderInfo {
-            id: "reminder-123-1".into(),
-            conversation_id: FOREGROUND_ID.into(),
-            turn: 1,
-            text: "Your coffee is ready.".into(),
-            created_at_ms: 123,
-            due_at_ms: 60_123,
-            status: tachyon_api::types::ReminderStatus::Delivering,
-        };
-        let encoded = encode_reminder_notification(&reminder).unwrap();
-        let envelope: InteractionCommandEnvelope = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(envelope.metadata.correlation_id, reminder.id);
-        assert_eq!(
-            envelope.metadata.message_id,
-            "reminder-delivery-reminder-123-1"
-        );
-        assert!(matches!(
-            envelope.command,
-            InteractionCommand::NotifyUser { text, .. } if text == "Your coffee is ready."
-        ));
     }
 
     #[test]

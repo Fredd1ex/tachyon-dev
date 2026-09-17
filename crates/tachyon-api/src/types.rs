@@ -473,6 +473,26 @@ fn default_research_limit() -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ApiRequest {
+    MonitorGet {
+        query: crate::monitor::MonitorQuery,
+    },
+    /// Latest-value stream, not replay. Always starts with a full snapshot.
+    MonitorSubscribe {
+        query: crate::monitor::MonitorQuery,
+        after: Option<crate::monitor::MonitorVersion>,
+    },
+    Todo(crate::todo::TodoRequest),
+    /// Paginated consistent scope view; restart pagination on CursorStale.
+    TodoSnapshot {
+        scope: crate::todo::TodoScope,
+        limit: Option<usize>,
+        cursor: Option<crate::todo::TodoCursor>,
+    },
+    /// Takes over the connection. Replay is exclusive of the supplied watermark.
+    OperationalSubscribe {
+        scope: crate::todo::TodoScope,
+        after: crate::operational_events::OperationalWatermark,
+    },
     /// Same-user host retention control; accepts a Research or Campaign ID.
     LocalRetentionSet {
         id: String,
@@ -1347,6 +1367,21 @@ pub struct EventEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApiResponse {
+    Monitor {
+        snapshot: crate::monitor::MonitorSnapshot,
+    },
+    MonitorError {
+        error: crate::monitor::MonitorError,
+    },
+    Todo {
+        response: crate::todo::TodoResponse,
+    },
+    TodoError {
+        error: crate::todo::TodoError,
+    },
+    OperationalBatch {
+        batch: crate::operational_events::OperationalBatch,
+    },
     LocalRetention {
         id: String,
         archived: bool,

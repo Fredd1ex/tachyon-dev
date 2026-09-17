@@ -53,6 +53,31 @@ pub(crate) struct FairCapacity {
 }
 
 impl FairCapacity {
+    fn monitor(
+        &self,
+        resource: tachyon_api::monitor::CapacityResource,
+        limit: usize,
+    ) -> Result<tachyon_api::monitor::Capacity, String> {
+        use tachyon_api::monitor::*;
+        let queued = self
+            .queue
+            .try_lock()
+            .map_err(|_| "host capacity unavailable")?
+            .count;
+        let unresolved = self
+            .retained
+            .try_lock()
+            .map_err(|_| "host retained capacity unavailable")?
+            .len();
+        Ok(Capacity {
+            resource,
+            sampled_at_ms: super::monitor::now_ms(),
+            limit: Decimal(limit as u128),
+            held: Decimal(limit.saturating_sub(self.slots.available_permits()) as u128),
+            queued: Decimal(queued as u128),
+            unresolved: Observed::Known(Decimal(unresolved as u128)),
+        })
+    }
     #[cfg(test)]
     pub fn available(&self) -> usize {
         self.slots.available_permits()
@@ -168,6 +193,31 @@ impl FairCapacity {
     }
 }
 
+impl super::RuntimeStore {
+    pub(super) fn monitor_capacities(&self) -> Result<Vec<tachyon_api::monitor::Capacity>, String> {
+        use tachyon_api::monitor::CapacityResource::*;
+        let c = &self.host_capacity;
+        let mut output = vec![
+            c.resident
+                .monitor(Resident, c.limits.max_resident_workers)?,
+            c.execution
+                .monitor(Execution, c.limits.max_execution_jobs)?,
+            c.model.monitor(Model, c.limits.max_model_calls)?,
+        ];
+        output.extend(
+            self.compute
+                .try_lock()
+                .map_err(|_| "compute unavailable")?
+                .monitor(
+                    c.limits.max_cpu_jobs,
+                    c.limits.max_gpu_jobs,
+                    c.cpu.available_permits(),
+                ),
+        );
+        Ok(output)
+    }
+}
+
 struct Waiting {
     capacity: Arc<FairCapacity>,
     id: uuid::Uuid,
@@ -233,6 +283,91 @@ impl Drop for CapacityPermit {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn monitor_capacity_contention_and_poison_never_wait_for_source_locks() {
+        use tachyon_api::monitor::*;
+        for source in 0..7 {
+            let dir = tempfile::tempdir().unwrap();
+            let store =
+                Arc::new(crate::RuntimeStore::open(&dir.path().join("runtime.redb")).unwrap());
+            let capacity = match source / 2 {
+                0 => &store.host_capacity.resident,
+                1 => &store.host_capacity.execution,
+                _ => &store.host_capacity.model,
+            };
+            let queue = (source < 6 && source % 2 == 0).then(|| capacity.queue.lock().unwrap());
+            let retained =
+                (source < 6 && source % 2 == 1).then(|| capacity.retained.lock().unwrap());
+            let compute = (source == 6).then(|| store.compute.lock().unwrap());
+            let registry = Arc::new(Mutex::new(crate::Registry::default()));
+            let shutdown = registry.lock().unwrap().service_shutdown.clone();
+            let (monitor, sampler) =
+                crate::monitor::Monitor::start(Arc::downgrade(&registry), store.clone(), shutdown);
+            let lease = monitor
+                .acquire(
+                    MonitorQuery {
+                        scope: MonitorScope::Host,
+                        after: None,
+                        limit: MAX_PAGE,
+                    },
+                    true,
+                )
+                .unwrap();
+            let sample = lease.latest(None).unwrap();
+            monitor.stop();
+            let (done, ended) = std::sync::mpsc::channel();
+            let joiner = std::thread::spawn(move || {
+                sampler.join().unwrap();
+                done.send(()).unwrap();
+            });
+            let stopped = ended.recv_timeout(Duration::from_secs(1));
+            // Release (and poison) before assertions so a regression cannot hang the test.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _guards = (queue, retained, compute);
+                panic!("poison monitor source fixture");
+            }));
+            joiner.join().unwrap();
+            stopped.unwrap();
+            let sample = sample.expect("source sampling must not wait for its lock");
+            assert_eq!(sample.stale, Some(MonitorError::Unavailable));
+            assert!(sample.payload.is_none());
+            assert!(store.monitor_capacities().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_capacity_distinguishes_held_queued_and_retained_unknown() {
+        use tachyon_api::monitor::*;
+        let capacity = FairCapacity::new(2);
+        let held = capacity.acquire("a").await.unwrap();
+        capacity.reserve_unknown("unresolved").unwrap();
+        let queued_capacity = capacity.clone();
+        let waiter = tokio::spawn(async move { queued_capacity.acquire("b").await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while capacity.waiting("b").unwrap() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let sample = capacity.monitor(CapacityResource::Resident, 2).unwrap();
+        assert_eq!(sample.held.0, 2);
+        assert_eq!(sample.queued.0, 1);
+        assert_eq!(sample.unresolved, Observed::Known(Decimal(1)));
+        // Sampling observes but never reclaims unknown occupancy or consumes a waiter.
+        assert_eq!(capacity.available(), 0);
+        assert_eq!(capacity.waiting("b").unwrap(), 1);
+        drop(held);
+        drop(waiter.await.unwrap().unwrap());
+        assert_eq!(
+            capacity
+                .monitor(CapacityResource::Resident, 2)
+                .unwrap()
+                .unresolved,
+            sample.unresolved
+        );
+    }
 
     #[tokio::test]
     async fn exact_cleanup_releases_once_and_restart_debt_is_conservative() {

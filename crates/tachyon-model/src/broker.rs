@@ -545,6 +545,65 @@ impl BrokerClient {
         };
         use tachyon_api::agents::{Reply as ControlReply, Request as ControlRequest};
         let matches = match (request, &reply) {
+            (ControlRequest::Todo { request }, ControlReply::Todo { scope, result }) => {
+                use tachyon_api::{agents::services::Scope, todo::TodoScope};
+                matches!(
+                    (request.scope(), scope),
+                    (Scope::CurrentWork, TodoScope::Work { .. })
+                        | (Scope::CurrentCampaign, TodoScope::Campaign { .. })
+                ) && match result {
+                    Err(_) => true,
+                    Ok(tachyon_api::todo::TodoResponse::List {
+                        todos, next_cursor, ..
+                    }) => {
+                        matches!(request, tachyon_api::agents::services::TodoRequest::List { limit, .. } if todos.len() <= limit.unwrap_or(8))
+                            && todos.iter().all(|t| &t.scope == scope)
+                            && next_cursor.as_ref().is_none_or(|c| &c.scope == scope)
+                    }
+                    Ok(tachyon_api::todo::TodoResponse::Mutation { todo, .. }) => match request {
+                        tachyon_api::agents::services::TodoRequest::Add { .. } => {
+                            todo.revision == 1 && &todo.scope == scope
+                        }
+                        tachyon_api::agents::services::TodoRequest::Update {
+                            id,
+                            expected_revision,
+                            ..
+                        } => {
+                            &todo.scope == scope
+                                && &todo.id == id
+                                && expected_revision.checked_add(1) == Some(todo.revision)
+                        }
+                        _ => false,
+                    },
+                }
+            }
+            (
+                ControlRequest::Monitor {
+                    request:
+                        tachyon_api::agents::services::MonitorRequest::Snapshot {
+                            scope,
+                            after,
+                            limit,
+                        },
+                },
+                ControlReply::Monitor { query, result },
+            ) => {
+                use tachyon_api::{agents::services::Scope, monitor::MonitorScope};
+                &query.after == after
+                    && query.limit == *limit
+                    && matches!(
+                        (scope, &query.scope),
+                        (Scope::CurrentWork, MonitorScope::Work { .. })
+                            | (Scope::CurrentCampaign, MonitorScope::Campaign { .. })
+                    )
+                    && result.as_ref().map_or(true, |p| {
+                        p.registered.entries.len() <= *limit
+                            && (p.capacities.is_empty()
+                                || self
+                                    .controls
+                                    .contains(&tachyon_api::agents::Control::MonitorAvailability))
+                    })
+            }
             (
                 ControlRequest::Templates { after, limit },
                 ControlReply::Templates {

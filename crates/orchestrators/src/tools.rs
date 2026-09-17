@@ -2,6 +2,7 @@
 
 use serde_json::json;
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolSchema {
     pub name: String,
     pub description: String,

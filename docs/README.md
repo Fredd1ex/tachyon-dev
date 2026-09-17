@@ -13,6 +13,8 @@ installation, and repository status:
   component boundaries.
 - [`tachyon/INTERACTION.md`](tachyon/INTERACTION.md) - concurrent turns,
   delegation, events, and TUI publication.
+- [`tachyon/OPERATIONAL_VIEWS.md`](tachyon/OPERATIONAL_VIEWS.md) - optional
+  read-only TODO/resource tabs, bounded caches, and unchanged transcript behavior.
 - [`tachyon/WORKSPACES.md`](tachyon/WORKSPACES.md) - host-selected cwd, explicit
   managed work, lazy provisioning, and workspace-matched reuse.
 - [`tachyon/MEMORY.md`](tachyon/MEMORY.md) - memory service and persistence
@@ -24,11 +26,26 @@ installation, and repository status:
 - [`tachyon/ARCHINSTALL.md`](tachyon/ARCHINSTALL.md) - Arch Linux setup.
 - [`tachyon/TREE.md`](tachyon/TREE.md) - source layout and feature locations.
 
+## Interaction
+
+- [`interaction/ARCHITECTURE.md`](interaction/ARCHITECTURE.md) - implemented host
+  layout, completed structural refactor, and separate integration follow-up.
+- [`interaction/roles.md`](interaction/roles.md) - descriptive role registry,
+  Conversation/Coordinator/Campaign capabilities, and prompt compatibility.
+- [`interaction/daemon-messaging.md`](interaction/daemon-messaging.md) - extracted
+  command, notification, history, and legacy subscription contracts.
+- [`interaction/TODOS.md`](interaction/TODOS.md) - durable structured todos,
+  exact grants, operator endpoints, and transactional operational feed.
+- [`interaction/CAMPAIGN_OVERSIGHT.md`](interaction/CAMPAIGN_OVERSIGHT.md) - explicit
+  one-shot background assessment of host-supplied snapshots, not automatic oversight.
+
 ## Tachyond
 
 Daemon-owned process, lifecycle, and recovery contracts:
 
 - [`tachyond/DAEMON.md`](tachyond/DAEMON.md) - daemon responsibilities and IPC.
+- [`tachyond/MONITORING.md`](tachyond/MONITORING.md) - read-only sources, typed
+  monitoring IPC, scope boundaries, and coalesced sampling.
 - [`tachyond/LIFECYCLE.md`](tachyond/LIFECYCLE.md) - worker lifecycle,
   retention, leases, and cleanup.
 - [`tachyond/REATTACH.md`](tachyond/REATTACH.md) - persistent-worker supervision
@@ -55,6 +72,8 @@ Worker execution and security boundaries:
   budget direction, and attributed external references; not launch authorization.
 - [`ghost/PYTHON.md`](ghost/PYTHON.md) - workspace-only Python bridge, native
   authorization, framed protocol, in-memory state, and work-end cleanup limits.
+- [`ghost/TODOS_MONITOR.md`](ghost/TODOS_MONITOR.md) - optional native/Python
+  todo and monitor tools with independent permit-bound scope grants.
 - [`ghost/EXECUTION.md`](ghost/EXECUTION.md) - asynchronous exec, work cleanup,
   bounded output spools, and ctx paging/search with live-work references.
 - [`ghost/GROUPS.md`](ghost/GROUPS.md) - durable host-internal campaign groups,
