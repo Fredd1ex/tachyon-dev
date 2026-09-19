@@ -2,6 +2,9 @@
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Capability {
+    WebSearch,
+    WebFetch,
+    ConversationCampaign,
     Todo,
     Monitor,
     Respond,
@@ -21,6 +24,9 @@ impl Capability {
     pub fn schema(self) -> crate::tools::ToolSchema {
         use crate::tools;
         match self {
+            Self::WebSearch => crate::agents::conversation::tools::web(false),
+            Self::WebFetch => crate::agents::conversation::tools::web(true),
+            Self::ConversationCampaign => crate::agents::conversation::tools::campaign(),
             Self::Todo => crate::agents::campaign::tools::todo(),
             Self::Monitor => crate::agents::campaign::tools::monitor(),
             Self::Respond => tools::respond(),
@@ -39,6 +45,9 @@ impl Capability {
 
     pub const fn tool_name(self) -> &'static str {
         match self {
+            Self::WebSearch => "websearch",
+            Self::WebFetch => "webfetch",
+            Self::ConversationCampaign => "campaign",
             Self::Todo => "todo",
             Self::Monitor => "monitor",
             Self::Respond => "respond",

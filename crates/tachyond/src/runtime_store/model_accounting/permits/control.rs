@@ -356,7 +356,9 @@ impl RuntimeStore {
             Request::Resource { .. } | Request::Todo { .. } | Request::Monitor { .. } => {
                 unreachable!()
             }
-            Request::Wait { .. } => return Err("wait requires asynchronous host boundary".into()),
+            Request::Wait { .. } | Request::WebSearch { .. } | Request::WebFetch { .. } => {
+                return Err("control requires asynchronous host boundary".into())
+            }
             request @ (Request::Spawn { .. } | Request::Group { .. }) => {
                 self.admit_catalog(address(identity.work_id.clone()), request)?
             }

@@ -13,6 +13,10 @@ pub(super) enum ChatInput {
         metadata: InteractionMetadata,
     },
     Evidence(EvidenceRecord),
+    CampaignAssessment {
+        assessment: tachyon_api::campaign_oversight::PublishedCampaignAssessment,
+        metadata: InteractionMetadata,
+    },
     Recovery(Vec<RecoveredSession>),
     Notification {
         text: String,
@@ -20,12 +24,54 @@ pub(super) enum ChatInput {
         model: bool,
     },
     Compaction(ContextCompactionCommand),
+    Cancel,
     Ignore,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn typed_assessment_has_no_turn_or_implicit_destination() {
+        let wire = serde_json::json!({
+            "protocol_version":1,"message_id":"campaign-assessment-c-1","correlation_id":"campaign-assessment-c-1",
+            "causation_id":"campaign-assessment-c-1","conversation_id":tachyon_api::FOREGROUND_ID,"turn_id":null,"generation":0,"occurred_at_ms":1,
+            "command":"publish_campaign_assessment","assessment":{
+                "id":"campaign-assessment-c-1","campaign_id":"c","revision":1,"objective":"fixture",
+                "assessment":{"summary":"advisory","findings":[],"refs":[],"blockers":[],"attention":"none"},"sources":[]
+            }
+        });
+        assert!(matches!(
+            decode_chat_input(&wire.to_string(), AgentRole::Conversation),
+            ChatInput::CampaignAssessment { .. }
+        ));
+        for (field, value) in [
+            ("turn_id", serde_json::json!("7")),
+            ("conversation_id", serde_json::json!("unrelated")),
+            ("message_id", serde_json::json!("other")),
+            ("correlation_id", serde_json::json!("other")),
+            ("causation_id", serde_json::Value::Null),
+            ("generation", serde_json::json!(1)),
+            ("protocol_version", serde_json::json!(99)),
+            (
+                "attention",
+                serde_json::json!({
+                    "scope": {"kind":"conversation", "id":"foreground"},
+                    "ids":["attention-forged"]
+                }),
+            ),
+        ] {
+            let mut invalid = wire.clone();
+            invalid[field] = value;
+            assert!(
+                matches!(
+                    decode_chat_input(&invalid.to_string(), AgentRole::Conversation),
+                    ChatInput::Ignore
+                ),
+                "accepted invalid {field}"
+            );
+        }
+    }
     use tachyon_api::types::Actor;
     use tachyon_api::{RecoveredSession, FOREGROUND_ID};
     fn interaction_metadata() -> tachyon_api::InteractionMetadata {
@@ -48,6 +94,36 @@ mod tests {
             }
             _ => panic!("expected a user turn"),
         }
+    }
+
+    #[test]
+    fn begin_conversation_cannot_reset_a_running_foreground() {
+        for reset in [false, true] {
+            let line = serde_json::to_string(&InteractionCommandEnvelope {
+                metadata: interaction_metadata(),
+                command: InteractionCommand::BeginConversation { reset },
+            })
+            .unwrap();
+            assert!(matches!(
+                decode_chat_input(&line, AgentRole::Conversation),
+                ChatInput::Ignore
+            ));
+        }
+    }
+
+    #[test]
+    fn conversation_cancellation_reaches_the_scheduler() {
+        let wire = serde_json::to_string(&InteractionCommandEnvelope {
+            metadata: interaction_metadata(),
+            command: InteractionCommand::CancelConversation {
+                reason: "operator cancelled".into(),
+            },
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_chat_input(&wire, AgentRole::Conversation),
+            ChatInput::Cancel
+        ));
     }
 
     #[test]
@@ -168,6 +244,24 @@ pub(super) fn decode_chat_input(line: &str, role: AgentRole) -> ChatInput {
                 InteractionCommand::PublishBackgroundUpdate { event } => {
                     ChatInput::Evidence(EvidenceRecord::Correlated(event))
                 }
+                InteractionCommand::PublishCampaignAssessment { assessment } => {
+                    if metadata.conversation_id != tachyon_api::FOREGROUND_ID
+                        || metadata.turn_id.is_some()
+                        || metadata.message_id != assessment.id
+                        || metadata.correlation_id != assessment.id
+                        || metadata.causation_id.as_deref() != Some(assessment.id.as_str())
+                        || metadata.generation != 0
+                        || metadata.attention.is_some()
+                        || !assessment.id.starts_with("campaign-assessment-")
+                    {
+                        ChatInput::Ignore
+                    } else {
+                        ChatInput::CampaignAssessment {
+                            assessment,
+                            metadata,
+                        }
+                    }
+                }
                 InteractionCommand::RestoreOperationalState { sessions } => {
                     ChatInput::Recovery(sessions)
                 }
@@ -176,8 +270,8 @@ pub(super) fn decode_chat_input(line: &str, role: AgentRole) -> ChatInput {
                     metadata,
                     model,
                 },
-                InteractionCommand::BeginConversation { .. }
-                | InteractionCommand::CancelConversation { .. } => ChatInput::Ignore,
+                InteractionCommand::CancelConversation { .. } => ChatInput::Cancel,
+                InteractionCommand::BeginConversation { .. } => ChatInput::Ignore,
             };
         }
     }

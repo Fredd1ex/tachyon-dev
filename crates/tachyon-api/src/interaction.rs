@@ -6,9 +6,21 @@ use crate::{AgentState, EventEnvelope, LifetimeClass};
 
 pub const INTERACTION_PROTOCOL_VERSION: u16 = 1;
 
+/// Host service readiness snapshot, not authority to spend or a provider credential.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAvailability {
+    pub available: bool,
+    pub reason: Option<String>,
+}
+
 /// Correlation metadata shared by foreground commands and events.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InteractionMetadata {
+    /// Set by the daemon on each accepted turn. Missing legacy metadata fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_availability: Option<WebAvailability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<crate::attention::AttentionFrameMetadata>,
     pub protocol_version: u16,
     pub message_id: String,
     pub correlation_id: String,
@@ -30,6 +42,8 @@ impl InteractionMetadata {
         occurred_at_ms: u64,
     ) -> Self {
         Self {
+            web_availability: None,
+            attention: None,
             protocol_version: INTERACTION_PROTOCOL_VERSION,
             message_id: message_id.into(),
             correlation_id: correlation_id.into(),
@@ -40,6 +54,12 @@ impl InteractionMetadata {
             occurred_at_ms,
             cwd: None,
         }
+    }
+
+    pub fn web_available(&self) -> bool {
+        self.web_availability
+            .as_ref()
+            .is_some_and(|web| web.available)
     }
 }
 
@@ -65,6 +85,9 @@ pub enum InteractionCommand {
     },
     PublishBackgroundUpdate {
         event: EventEnvelope,
+    },
+    PublishCampaignAssessment {
+        assessment: crate::campaign_oversight::PublishedCampaignAssessment,
     },
     RestoreOperationalState {
         sessions: Vec<RecoveredSession>,
@@ -132,6 +155,8 @@ mod tests {
 
     fn metadata() -> InteractionMetadata {
         InteractionMetadata {
+            web_availability: None,
+            attention: None,
             protocol_version: INTERACTION_PROTOCOL_VERSION,
             message_id: "command-7".into(),
             correlation_id: "interaction-3".into(),
@@ -142,6 +167,24 @@ mod tests {
             occurred_at_ms: 123,
             cwd: None,
         }
+    }
+
+    #[test]
+    fn readiness_is_additive_and_legacy_metadata_is_not_available() {
+        let mut original = metadata();
+        let legacy = serde_json::to_value(&original).unwrap();
+        assert!(legacy.get("web_availability").is_none());
+        assert!(!serde_json::from_value::<InteractionMetadata>(legacy)
+            .unwrap()
+            .web_available());
+        original.web_availability = Some(WebAvailability {
+            available: true,
+            reason: None,
+        });
+        let wire = serde_json::to_value(&original).unwrap();
+        assert!(serde_json::from_value::<InteractionMetadata>(wire)
+            .unwrap()
+            .web_available());
     }
 
     #[test]

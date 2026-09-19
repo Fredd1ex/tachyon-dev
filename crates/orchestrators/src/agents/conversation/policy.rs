@@ -80,15 +80,12 @@ pub fn execution_policy(answerability: Option<Answerability>) -> ExecutionPolicy
 }
 
 pub fn follow_up_execution_policy(
-    requires_dependency: bool,
+    _requires_dependency: bool,
     has_accepted_evidence: bool,
     answerability: Option<Answerability>,
 ) -> ExecutionPolicy {
     if has_accepted_evidence {
-        return execution_policy(Some(answerability.unwrap_or(Answerability::NeedsNewWork)));
-    }
-    if requires_dependency {
-        return execution_policy(Some(Answerability::NeedsNewWork));
+        return execution_policy(answerability);
     }
     ExecutionPolicy::default()
 }
@@ -141,16 +138,19 @@ mod tests {
                 force_delegation: false,
             }
         );
-        for policy in [
-            follow_up_execution_policy(true, false, None),
-            follow_up_execution_policy(false, true, None),
-            follow_up_execution_policy(false, true, Some(Answerability::NeedsNewWork)),
-        ] {
-            assert!(policy.force_delegation);
-            assert!(!policy.answer_from_context);
-        }
+        let policy = follow_up_execution_policy(false, true, Some(Answerability::NeedsNewWork));
+        assert!(policy.force_delegation);
+        assert!(!policy.answer_from_context);
         assert_eq!(
             follow_up_execution_policy(false, false, None),
+            ExecutionPolicy::default()
+        );
+        assert_eq!(
+            follow_up_execution_policy(true, false, None),
+            ExecutionPolicy::default()
+        );
+        assert_eq!(
+            follow_up_execution_policy(false, true, None),
             ExecutionPolicy::default()
         );
     }
@@ -201,9 +201,11 @@ mod tests {
             assert!(ANSWERABILITY_PROMPT.contains(boundary));
         }
         assert!(ANSWERABILITY_PROMPT.contains("accepted evidence"));
+        assert!(ANSWERABILITY_PROMPT.contains("clarify ambiguous scope"));
         assert!(ANSWERABILITY_PROMPT.contains("unrequested forecast"));
         assert!(ANSWERABILITY_PROMPT.contains("additional detail"));
         assert!(ANSWERABILITY_PROMPT.contains("required tool exactly once"));
-        assert!(ANSWERABILITY_PROMPT.len() <= 600);
+        assert!(ANSWERABILITY_PROMPT.contains("name, author, or title is a searchable fact"));
+        assert!(ANSWERABILITY_PROMPT.len() <= 750);
     }
 }

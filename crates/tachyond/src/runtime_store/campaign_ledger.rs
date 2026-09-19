@@ -233,6 +233,122 @@ mod tests {
     use tachyon_api::types::{ApiRequest, ApiResponse, CampaignStatus};
 
     #[test]
+    fn budget_attention_is_authoritative_atomic_scoped_and_replay_safe() {
+        use tachyon_api::{attention::AttentionCategory, todo::TodoScope};
+        for mode in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("runtime.redb");
+            let store = RuntimeStore::open(&path).unwrap();
+            let id = campaign(&store, "budget-attention");
+            let other = campaign(&store, "unrelated");
+            let scope = TodoScope::Campaign {
+                campaign_id: id.clone(),
+            };
+            store
+                .host_authorize_campaign_envelope("grant", &id, envelope())
+                .unwrap();
+            let pool = if mode == 2 {
+                Pool::Verification
+            } else {
+                Pool::Work
+            };
+            let reserved = if mode == 2 { 10 } else { 100 };
+            store
+                .campaign_ledger_command("reserve", &id, reserve("request", pool, reserved))
+                .unwrap();
+            // Even a fully reserved envelope and a refused new reservation do not
+            // establish exhaustion: unknown usage must remain unknown.
+            assert!(store
+                .campaign_ledger_command("denied", &id, reserve("too-large", Pool::Work, 101))
+                .is_err());
+            store
+                .campaign_ledger_command(
+                    "partial",
+                    &id,
+                    reconcile("request", Usage::Provisional(units(1))),
+                )
+                .unwrap();
+            assert!(store
+                .attention_snapshot(&scope, None, 10)
+                .unwrap()
+                .records
+                .is_empty());
+            let actual = match mode {
+                0 => Units {
+                    tokens: 100,
+                    cost_micro_usd: 1,
+                },
+                1 => Units {
+                    tokens: 1,
+                    cost_micro_usd: 100,
+                },
+                _ => units(11),
+            };
+            let report = reconcile("request", Usage::Final(actual));
+            let before = store.campaign_ledger(&id).unwrap().unwrap();
+            {
+                let tx = store.database.begin_write().unwrap();
+                RuntimeStore::campaign_ledger_command_in(&tx, "report", &id, report.clone())
+                    .unwrap();
+                // Dropping the writer rolls back both accounting and attention.
+            }
+            assert_eq!(store.campaign_ledger(&id).unwrap().unwrap(), before);
+            assert!(store
+                .attention_snapshot(&scope, None, 10)
+                .unwrap()
+                .records
+                .is_empty());
+            let after = store
+                .campaign_ledger_command("report", &id, report.clone())
+                .unwrap();
+            assert_eq!(after.envelope, before.envelope);
+            assert_eq!(after.reservations.len(), before.reservations.len());
+            assert_eq!(after.admissions_paused, mode == 2);
+            let snapshot = store.attention_snapshot(&scope, None, 10).unwrap();
+            assert_eq!(snapshot.records.len(), 1);
+            let record = &snapshot.records[0];
+            assert_eq!(record.category, AttentionCategory::BudgetBlocked);
+            assert_eq!(record.campaign_id.as_deref(), Some(id.as_str()));
+            assert_eq!(record.work_id, None);
+            assert_eq!((record.generation, record.instruction_revision), (0, 0));
+            assert!(record.delivered_at_ms.is_none());
+            assert!(record.displayed_at_ms.is_none());
+            assert!(record.acknowledged_at_ms.is_none());
+            assert!(store
+                .attention_snapshot(&TodoScope::Campaign { campaign_id: other }, None, 10)
+                .unwrap()
+                .records
+                .is_empty());
+            store
+                .campaign_ledger_command("report", &id, report.clone())
+                .unwrap();
+            store
+                .campaign_ledger_command("same-usage", &id, report.clone())
+                .unwrap();
+            assert_eq!(
+                store.attention_snapshot(&scope, None, 10).unwrap(),
+                snapshot
+            );
+            drop(store);
+            let store = RuntimeStore::open(&path).unwrap();
+            store
+                .campaign_ledger_command("after-reopen", &id, report)
+                .unwrap();
+            assert_eq!(
+                store.attention_snapshot(&scope, None, 10).unwrap(),
+                snapshot
+            );
+            let frame = store.claim_attention_frame(1).unwrap().unwrap();
+            assert_eq!(frame.ids, vec![record.id.clone()]);
+            assert_eq!(frame.scope, scope);
+            assert_eq!(
+                frame.text,
+                "Work is blocked by its budget (1 item). Review attention for details."
+            );
+        }
+    }
+
+    #[test]
     fn monitor_actuals_wide_provisional_unknown_and_parent_exclusion() {
         use tachyon_api::monitor::*;
         let mut ledger = Ledger {
@@ -2108,6 +2224,11 @@ pub(crate) enum LedgerCommand {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum Action {
     HostAuthorize(Envelope),
+    HostService {
+        allocation_id: String,
+        allowance: Units,
+        policy_sha256: String,
+    },
     Command(LedgerCommand),
 }
 
@@ -2135,6 +2256,26 @@ fn identifier(value: &str) -> Result<(), String> {
 }
 
 impl RuntimeStore {
+    /// Host-only atomic allocation of existing Work funds, without a Work admission.
+    pub(super) fn fund_host_service_in(
+        write: &WriteTransaction,
+        campaign_id: &str,
+        allocation_id: &str,
+        allowance: Units,
+        policy_sha256: &str,
+    ) -> Result<Ledger, String> {
+        Self::mutate_campaign_ledger_in(
+            write,
+            &format!("fund:{allocation_id}"),
+            campaign_id,
+            Action::HostService {
+                allocation_id: allocation_id.into(),
+                allowance,
+                policy_sha256: policy_sha256.into(),
+            },
+        )
+    }
+
     /// TRUST BOUNDARY: only a host-authorized caller may invoke this method.
     /// This is not a permission check or an API budget grant. No worker/model/IPC
     /// route calls it. An envelope cannot be replaced or topped up; allocations
@@ -2264,11 +2405,38 @@ impl RuntimeStore {
                     admissions_paused: false,
                 }
             }
-            Action::Command(_) => {
+            Action::Command(_) | Action::HostService { .. } => {
                 existing.ok_or_else(|| err("campaign envelope not authorized"))?
             }
         };
         let before = ledger.clone();
+        if let Action::HostService {
+            allocation_id,
+            allowance,
+            ..
+        } = &action
+        {
+            identifier(allocation_id)?;
+            let mut committed = ledger.committed(Pool::Work)?;
+            committed.add(*allowance)?;
+            if ledger.admissions_paused
+                || !committed.fits(ledger.envelope.work)
+                || ledger.reservations.contains_key(allocation_id)
+            {
+                return Err(err("host service allocation denied"));
+            }
+            ledger.reservations.insert(
+                allocation_id.clone(),
+                Reservation {
+                    allocation: None,
+                    pool: Pool::Work,
+                    reserved: *allowance,
+                    usage: Usage::Unknown,
+                    cancellation_requested: false,
+                },
+            );
+            ledger.allocations.insert(allocation_id.clone(), false);
+        }
         if let Action::Command(command) = &action {
             match command {
                 LedgerCommand::TransferAvailable {
@@ -2509,6 +2677,48 @@ impl RuntimeStore {
             .map_err(err)?;
         drop(roots);
         drop(receipts);
+        if matches!(
+            receipt.action,
+            Action::Command(LedgerCommand::Reconcile { .. })
+        ) {
+            // Allocation parents and unknown holds are not reported spend.
+            let mut reported = Totals::default();
+            for (id, reservation) in &ledger.reservations {
+                if reservation.pool == Pool::Work && !ledger.allocations.contains_key(id) {
+                    if let Usage::Final(actual) | Usage::Provisional(actual) = reservation.usage {
+                        reported.add(actual)?;
+                    }
+                }
+            }
+            let exhausted = (ledger.envelope.work.tokens > 0
+                && reported.tokens >= u128::from(ledger.envelope.work.tokens))
+                || (ledger.envelope.work.cost_micro_usd > 0
+                    && reported.cost_micro_usd >= u128::from(ledger.envelope.work.cost_micro_usd));
+            for (blocked, cause) in [
+                (ledger.admissions_paused, "ledger:admissions-paused"),
+                (exhausted, "ledger:work-envelope-exhausted"),
+            ] {
+                if blocked {
+                    Self::admit_attention_in(
+                        write,
+                        super::attention::AttentionSource {
+                            scope: tachyon_api::todo::TodoScope::Campaign {
+                                campaign_id: campaign_id.into(),
+                            },
+                            campaign_id: Some(campaign_id.into()),
+                            work_id: None,
+                            // Immutable campaign envelope, not an execution assignment.
+                            generation: 0,
+                            instruction_revision: 0,
+                            category: tachyon_api::attention::AttentionCategory::BudgetBlocked,
+                            cause_id: cause.into(),
+                        },
+                        crate::unix_now_ms(),
+                    )?;
+                }
+            }
+            super::campaign_oversight::budget_trigger_in(write, &ledger)?;
+        }
         Ok(ledger)
     }
 }

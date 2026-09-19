@@ -79,58 +79,64 @@ impl ToolRegistry {
         input: Value,
     ) -> Result<ToolResult, ToolError> {
         let _work_call = self.work_call().await;
-        let tool = self
-            .tools
-            .get(name)
-            .ok_or_else(|| ToolError::invalid(format!("unknown tool: {name}")))?;
-        if !context.policy.permits(tool.as_ref()) {
-            return Err(ToolError::new(
-                ToolErrorCode::PermissionDenied,
-                format!("tool is disabled by policy: {name}"),
-                false,
-            ));
-        }
-        if context.cancellation.is_cancelled() {
-            return Err(ToolError::new(
-                ToolErrorCode::Cancelled,
-                "tool call cancelled",
-                true,
-            ));
-        }
-
         let started = Instant::now();
-        let policy_deadline = started
-            .checked_add(context.policy.max_duration)
-            .unwrap_or(context.deadline);
-        let deadline = context.deadline.min(policy_deadline);
         let evidence_input = input.clone();
         let execution = async {
-            if tool.manages_own_lifecycle() {
-                tool.execute_with_registry(context, input, self).await
-            } else {
-                tokio::select! {
-                    _ = context.cancellation.cancelled() => Err(ToolError::new(
-                        ToolErrorCode::Cancelled,
-                        "tool call cancelled",
-                        true,
-                    )),
-                    _ = tokio::time::sleep_until(deadline.into()) => Err(ToolError::new(
-                        ToolErrorCode::Timeout,
-                        "tool call timed out",
-                        true,
-                    )),
-                    result = tool.execute_with_registry(context, input, self) => result,
+            let tool = self
+                .tools
+                .get(name)
+                .ok_or_else(|| ToolError::invalid(format!("unknown tool: {name}")))?;
+            if !context.policy.permits(tool.as_ref()) {
+                return Err(ToolError::new(
+                    ToolErrorCode::PermissionDenied,
+                    format!("tool is disabled by policy: {name}"),
+                    false,
+                ));
+            }
+            if context.cancellation.is_cancelled() {
+                return Err(ToolError::new(
+                    ToolErrorCode::Cancelled,
+                    "tool call cancelled",
+                    true,
+                ));
+            }
+
+            let policy_deadline = started
+                .checked_add(context.policy.max_duration)
+                .unwrap_or(context.deadline);
+            let deadline = context.deadline.min(policy_deadline);
+            let execution = async {
+                if tool.manages_own_lifecycle() {
+                    tool.execute_with_registry(context, input, self).await
+                } else {
+                    tokio::select! {
+                        _ = context.cancellation.cancelled() => Err(ToolError::new(
+                            ToolErrorCode::Cancelled,
+                            "tool call cancelled",
+                            true,
+                        )),
+                        _ = tokio::time::sleep_until(deadline.into()) => Err(ToolError::new(
+                            ToolErrorCode::Timeout,
+                            "tool call timed out",
+                            true,
+                        )),
+                        result = tool.execute_with_registry(context, input, self) => result,
+                    }
                 }
+            };
+            tokio::select! {
+                biased;
+                _ = self.work_ended() => Err(ToolError::new(ToolErrorCode::Cancelled, "work has ended", false)),
+                result = execution => result,
             }
         };
-        let result = tokio::select! {
-            biased;
-            _ = self.work_ended() => Err(ToolError::new(ToolErrorCode::Cancelled, "work has ended", false)),
-            result = execution => result,
-        };
+        let result = execution.await;
 
         let result = match result {
             Ok(mut result) => {
+                // Retain the original envelope before applying caller presentation
+                // limits, up to the runtime's hard output cap.
+                let full_envelope = result.to_json(crate::harness::runtime::MAX_RETURN_BYTES);
                 let (content, byte_truncated) =
                     bound_utf8(&result.content, context.policy.max_return_bytes);
                 result.content = content;
@@ -155,8 +161,9 @@ impl ToolRegistry {
                         *digest = Value::Null;
                     }
                 }
-                let full_envelope = result.to_json(context.policy.max_return_bytes);
                 if (self.activation.is_some() && matches!(name, "read" | "grep" | "ls" | "find"))
+                    || byte_truncated
+                    || line_count > line_limit
                     || full_envelope.len() > context.policy.max_model_content_bytes
                 {
                     let store: Arc<dyn crate::harness::runtime::ToolOutputStore> =

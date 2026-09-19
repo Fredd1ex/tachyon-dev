@@ -6,6 +6,27 @@ signals. No watcher, export/sync, automatic completion or full-plan prompt inser
 is implemented by this layer. Operator endpoints and the operational feed are
 separate adapters over this authority, not separate todo stores.
 
+## Conversation
+
+Conversation exposes the native `todo` tool with `list`, `add`, and `update`.
+The optional `scope` selector defaults to `current_conversation`; the host binds
+it to the current foreground input's `conversation_id`, not transcript text or
+model-supplied identity. Work, arbitrary conversation IDs, and campaign selectors
+are rejected. The separate `campaign` tool can inspect a bounded plan for an
+explicitly linked authorized campaign with `status` and `include_plan: true`;
+that does not broaden the `todo` tool's scope or grant campaign todo mutation.
+
+Mutations require `command_id` and `expected_revision`: the scope revision for
+add, the record revision for update. Structured conflicts remain visible to the
+model; it can list relevant records and issue a revised command with a new ID.
+The host does not automatically retry mutations. List remains available after
+mutations and context replacement, returning durable IDs and revisions on demand.
+The daemon's same-user operator transport supplies provenance; model actor and
+role claims are rejected. Completing a todo is not Work acceptance, and ordinary
+conversation requests do not create campaigns. No Markdown synchronization,
+watcher, export, automatic full-plan prompt insertion, or automatic conversation
+rotation is involved. Context replacement does not delete durable todo records.
+
 ## API
 
 `tachyon_api::todo` exports `TodoRequest`, `TodoResponse`, `TodoError`, `Todo`,
@@ -122,9 +143,10 @@ database instance or future sequence is stale and requires a new snapshot.
 
 The [optional TUI TODO tab](../tachyon/OPERATIONAL_VIEWS.md) uses these endpoints
 read-only, binding scope to live foreground conversation metadata. It is not a
-todo editor or transcript projection. Normal Conversation prompts and default
-tools are unchanged; accepting a conversation ID for operator access does not
-automatically expose a Conversation todo tool. Ghost access remains optional,
+todo editor or transcript projection. The base Conversation prompt is unchanged;
+the native `todo` schema is selected by the Conversation registry and narrowed by
+the host to current-conversation scope. Accepting an arbitrary conversation ID
+on the operator API does not grant that scope to the model tool. Ghost access remains optional,
 with independent exact `Control::Todo` and `Control::TodoCampaign` grants and an
 empty default broker allowlist.
 
@@ -180,6 +202,8 @@ in [Monitoring service shutdown](../tachyond/MONITORING.md#service-shutdown).
 todo page with a monitor snapshot, but does not query or edit todos itself, execute
 model tools, or inject a full plan into normal chat. Markdown plan persistence,
 export/sync, watchers, and automatic todo completion remain outside this layer.
+The opt-in [campaign host pipeline](../tachyon/CAMPAIGN_OVERSIGHT.md) supplies that
+page from its canonical read transaction; it does not grant the model todo mutations.
 
 Pagination uses a typed opaque JSON cursor, without a base64 dependency. It binds
 version, database UUID, scope, exact filter, scope revision, and the last order

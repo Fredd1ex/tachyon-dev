@@ -16,6 +16,8 @@ pub(crate) enum Query {
     Todos {
         scope: TodoScope,
         cursor: Option<TodoCursor>,
+        // Exact UI turn binding participates in cancellation, even for the same scope.
+        turn: Option<String>,
     },
     Resources {
         after: Option<String>,
@@ -58,6 +60,29 @@ pub(crate) struct View {
     pub stale: bool,
     pub next_todo: Option<TodoCursor>,
     pub next_resource: Option<String>,
+    pub checklist: String,
+    pub todo_revision: Option<u64>,
+}
+
+impl View {
+    pub fn global_checklist(&self) -> String {
+        if !matches!(
+            &self.query,
+            Some(Query::Todos {
+                scope: TodoScope::Conversation { .. },
+                ..
+            })
+        ) {
+            return String::new();
+        }
+        if self.stale {
+            format!("Global checklist unknown / stale\n{}", self.checklist)
+        } else if self.todo_revision.is_none() {
+            "Global conversation checklist unknown (loading)".into()
+        } else {
+            self.checklist.clone()
+        }
+    }
 }
 
 #[derive(Default)]
@@ -81,6 +106,10 @@ impl Todos {
             return Err(io::Error::other("expected todo snapshot"));
         };
         if todos.len() > 100
+            || self.watermark.as_ref().is_some_and(|old| {
+                old.instance_id == watermark.instance_id
+                    && (watermark.sequence < old.sequence || scope_revision < self.revision)
+            })
             || todos
                 .iter()
                 .any(|t| &t.scope != scope || t.schema_version != 1 || t.revision == 0)
@@ -125,6 +154,10 @@ impl Todos {
                 return Err(io::Error::other("invalid feed event"));
             }
             let (todo, added) = match event.change {
+                OperationalChange::AttentionChanged { .. } => {
+                    sequence = sequence.max(event.watermark.sequence);
+                    continue;
+                }
                 OperationalChange::TodoAdded { todo } => (todo, true),
                 OperationalChange::TodoUpdated { todo } => (todo, false),
             };
@@ -191,8 +224,46 @@ impl Todos {
         View {
             rows,
             next_todo: self.next.clone(),
+            checklist: self.checklist(scope),
+            todo_revision: Some(self.revision),
             ..View::default()
         }
+    }
+
+    fn checklist(&self, scope: &TodoScope) -> String {
+        use tachyon_api::todo::TodoStatus;
+        if self.records.is_empty() {
+            return String::new();
+        }
+        let label = match scope {
+            TodoScope::Conversation { id } => format!(
+                "Global conversation checklist ({}) - not turn-linked",
+                clean(id)
+            ),
+            TodoScope::Work { work_id } => format!("Work checklist ({})", clean(work_id)),
+            TodoScope::Campaign { campaign_id } => {
+                format!("Campaign checklist ({})", clean(campaign_id))
+            }
+        };
+        let mut rows = vec![label];
+        for todo in self.records.iter().take(3) {
+            let status = match todo.status {
+                TodoStatus::Pending => "[ ] pending",
+                TodoStatus::InProgress => "[>] active",
+                TodoStatus::Blocked => "[!] blocked",
+                TodoStatus::Completed => "[x] complete",
+                TodoStatus::Cancelled => "[-] cancelled",
+            };
+            rows.push(format!("{status}  {}", clean(&todo.title)));
+        }
+        let extra = self.records.len().saturating_sub(3);
+        if extra > 0 || self.next.is_some() {
+            rows.push(format!(
+                "+{extra}{} more (TODO for pages)",
+                if self.next.is_some() { " or more" } else { "" }
+            ));
+        }
+        rows.join("\n")
     }
 }
 
@@ -389,6 +460,7 @@ fn run(
             rows: "Waiting for daemon data (unknown).".into(),
             ..View::default()
         };
+        let mut todos = Todos::default();
         loop {
             let publish = |view: &View| {
                 let mut state = lock.lock().unwrap();
@@ -424,7 +496,7 @@ fn run(
                 }
                 let mut reader = BufReader::new(socket.try_clone()?);
                 match &query {
-                    Query::Todos { scope, cursor } => {
+                    Query::Todos { scope, cursor, .. } => {
                         write_request(
                             &mut socket,
                             &ApiRequest::TodoSnapshot {
@@ -439,10 +511,7 @@ fn run(
                         if !active() {
                             return Ok(());
                         }
-                        let mut todos = Todos {
-                            continued: cursor.is_some(),
-                            ..Todos::default()
-                        };
+                        todos.continued = cursor.is_some();
                         todos.snapshot(response, scope)?;
                         view = todos.view(scope);
                         if !publish(&view) {
@@ -455,6 +524,8 @@ fn run(
                                 after: todos.watermark.clone().unwrap(),
                             },
                         )?;
+                        // Idle push subscriptions must not resnapshot on a timer.
+                        socket.set_read_timeout(None)?;
                         loop {
                             let ApiResponse::OperationalBatch { batch } =
                                 read_response(&mut reader)?
@@ -630,6 +701,129 @@ mod tests {
     }
 
     #[test]
+    fn checklist_is_host_status_titles_bounded_and_empty_is_absent() {
+        let mut cache = Todos::default();
+        cache.snapshot(snapshot(vec![], 0), &scope()).unwrap();
+        assert!(cache.view(&scope()).checklist.is_empty());
+        let statuses = [
+            TodoStatus::Pending,
+            TodoStatus::InProgress,
+            TodoStatus::Blocked,
+            TodoStatus::Completed,
+            TodoStatus::Cancelled,
+        ];
+        for status in statuses {
+            let mut record = todo(1);
+            record.title = "Real title\nno injected row".into();
+            record.status = status;
+            cache.snapshot(snapshot(vec![record], 1), &scope()).unwrap();
+            let text = cache.view(&scope()).checklist;
+            assert_eq!(text.lines().count(), 2);
+            assert!(text.contains("Real title no injected row"));
+            assert!(!text.contains('%'));
+            assert!(text.contains("not turn-linked"));
+        }
+        cache
+            .snapshot(snapshot((1..=8).map(todo).collect(), 8), &scope())
+            .unwrap();
+        let text = cache.view(&scope()).checklist;
+        assert_eq!(text.lines().count(), 5);
+        assert!(text.contains("Task 3"));
+        assert!(!text.contains("Task 4"));
+        assert!(text.contains("+5 more"));
+    }
+
+    #[test]
+    fn todo_error_is_unknown_not_a_successful_empty_snapshot() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let worker = Worker::default();
+        worker.state.0.lock().unwrap().query = Some(Query::Todos {
+            scope: scope(),
+            cursor: None,
+            turn: Some("selected".into()),
+        });
+        let shared = worker.state.clone();
+        let (out, receiver) = std::sync::mpsc::channel();
+        let connection = Mutex::new(Some(client));
+        let join = std::thread::spawn(move || {
+            run(shared, out, || {
+                connection
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| io::Error::other("offline"))
+            })
+        });
+        let mut reader = BufReader::new(server.try_clone().unwrap());
+        assert!(matches!(
+            read_request(&mut reader).unwrap(),
+            ApiRequest::TodoSnapshot { .. }
+        ));
+        write_response(
+            &mut server,
+            &ApiResponse::TodoError {
+                error: tachyon_api::todo::TodoError::AuthorityDenied,
+            },
+        )
+        .unwrap();
+        receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let view = worker.take().unwrap();
+        assert!(view.stale);
+        assert_eq!(view.todo_revision, None);
+        assert!(!view.rows.contains("No todos"));
+        drop(worker);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn stale_snapshot_cannot_regress_revision_or_watermark() {
+        let mut cache = Todos::default();
+        cache
+            .snapshot(snapshot(vec![todo(1)], 4), &scope())
+            .unwrap();
+        let before = cache.view(&scope()).rows;
+        assert!(cache.snapshot(snapshot(vec![], 3), &scope()).is_err());
+        let mut stale = snapshot(vec![], 5);
+        if let TodoResponse::List { watermark, .. } = &mut stale {
+            watermark.sequence = 2;
+        }
+        assert!(cache.snapshot(stale, &scope()).is_err());
+        assert_eq!(cache.view(&scope()).rows, before);
+    }
+
+    #[test]
+    fn same_scope_different_cell_rejects_pending_generation() {
+        let mut worker = Worker::default();
+        worker.started = true; // exercise selection without contacting a daemon
+        let (out, _) = std::sync::mpsc::channel();
+        let query = |turn: &str| {
+            Some(Query::Todos {
+                scope: scope(),
+                cursor: None,
+                turn: Some(turn.into()),
+            })
+        };
+        worker.select(query("old"), &out);
+        let old = worker.state.0.lock().unwrap().generation;
+        worker.select(query("new"), &out);
+        worker.state.0.lock().unwrap().latest = Some((
+            old,
+            View {
+                query: query("old"),
+                checklist: "Old checklist".into(),
+                ..Default::default()
+            },
+        ));
+        assert!(worker.take().is_none());
+        let generation = worker.state.0.lock().unwrap().generation;
+        worker.select(query("new"), &out);
+        assert_eq!(worker.state.0.lock().unwrap().generation, generation);
+    }
+
+    #[test]
     fn snapshot_race_replay_and_exact_duplicates_keep_daemon_revisions() {
         let mut cache = Todos::default();
         cache
@@ -749,6 +943,7 @@ mod tests {
         let mut worker = Worker::default();
         worker.started = true;
         let next = Query::Todos {
+            turn: None,
             scope: scope(),
             cursor: Some(TodoCursor {
                 version: 1,
@@ -761,6 +956,7 @@ mod tests {
             }),
         };
         let first = Query::Todos {
+            turn: None,
             scope: scope(),
             cursor: None,
         };
@@ -839,6 +1035,7 @@ mod tests {
         // Leave the old result pending, then change both view kind and scope.
         worker.select(
             Some(Query::Todos {
+                turn: None,
                 scope: scope(),
                 cursor: None,
             }),
@@ -952,6 +1149,7 @@ mod tests {
             .unwrap();
         let worker = Worker::default();
         worker.state.0.lock().unwrap().query = Some(Query::Todos {
+            turn: None,
             scope: scope(),
             cursor: None,
         });

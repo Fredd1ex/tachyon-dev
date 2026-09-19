@@ -383,6 +383,18 @@ impl RuntimeStore {
             .insert(key, serde_json::to_vec(next).map_err(error)?.as_slice())
             .map_err(error)?;
         drop(table);
+        if previous.phase != next.phase
+            && matches!(
+                next.phase,
+                ExecutionPhase::AwaitingAcceptance | ExecutionPhase::AwaitingVerification
+            )
+        {
+            super::campaign_oversight::trigger_in(
+                write,
+                &next.policy.funding.admission.campaign_id,
+                "blocked_state",
+            )?;
+        }
         Ok(())
     }
 
@@ -490,6 +502,38 @@ impl RuntimeStore {
                 )?;
             }
             record.settled = true;
+            if let Some(candidate) = &record.candidate {
+                let category = match candidate.outcome {
+                    tachyon_api::WorkOutcome::Failed { .. } => {
+                        Some(tachyon_api::attention::AttentionCategory::WorkFailed)
+                    }
+                    tachyon_api::WorkOutcome::TimedOut { .. } => {
+                        Some(tachyon_api::attention::AttentionCategory::WorkTimedOut)
+                    }
+                    _ => None,
+                };
+                let admission = &record.policy.funding.admission;
+                let revision = Self::latest_instruction_revision_in(write, admission)?;
+                if let Some(category) =
+                    category.filter(|_| candidate.instruction_revision == Some(revision))
+                {
+                    Self::admit_attention_in(
+                        write,
+                        super::attention::AttentionSource {
+                            scope: tachyon_api::todo::TodoScope::Campaign {
+                                campaign_id: campaign.into(),
+                            },
+                            campaign_id: Some(campaign.into()),
+                            work_id: Some(work.into()),
+                            generation: admission.generation,
+                            instruction_revision: revision,
+                            category,
+                            cause_id: format!("terminal:{}", candidate.assignment),
+                        },
+                        crate::unix_now_ms(),
+                    )?;
+                }
+            }
             Self::group_terminal_in(&write, &record.policy.funding)?;
             table
                 .insert(work, serde_json::to_vec(&record).map_err(error)?.as_slice())

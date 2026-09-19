@@ -157,3 +157,52 @@ cargo build --release
 
 The TUI should show the daemon as online. Press `Ctrl+P` to view the current
 keyboard commands.
+
+### Short Development Commands
+
+For an interactive shell, a development alias can point at the checkout's actual
+binary. For example, add a checkout-specific alias to your shell configuration:
+
+```bash
+alias tachyon='/absolute/path/to/tachyon/target/debug/tachyon'
+```
+
+After reloading that shell configuration, run from the repository root:
+
+```bash
+cargo b
+tachyon daemon restart
+tachyon
+```
+
+This virtual workspace builds its runtime binaries with `cargo b`; avoid limiting
+the build to `--bin tachyon` when companion code changed. The alias does not build
+or install anything, preserves your current directory, and follows rebuilt debug
+binaries automatically. `cargo clean` removes its target until the next build.
+Use an absolute executable path in noninteractive scripts, where shell aliases
+are not normally loaded. Moving the checkout requires updating the alias.
+
+### Development Build Size And Cleanup
+
+The workspace's development and test profiles keep limited application debug
+information, omit dependency debug information, and disable incremental caches.
+This reduces disk use; Cargo can still retain old artifacts from earlier profiles,
+features, and compiler versions. Release settings are unchanged.
+
+After stopping builds and any runtime using these binaries, remove debug artifacts:
+
+```bash
+cargo clean --profile dev --target-dir "$PWD/target"
+cargo build --workspace --bins
+```
+
+Run these commands from the repository root, without `sudo`. Cleaning can remove
+companion executables before encountering a permission error. `cargo run --bin
+tachyon` rebuilds only the CLI, not `tachyond`, Ghost, or the interaction hosts;
+rebuild the workspace binaries before restarting.
+
+If cleanup reports permission denied, inspect the reported path with `namei -l`.
+Root-owned compiler files require an ownership repair restricted to those generated
+artifacts. Do not change ownership of the entire filesystem, configuration, or
+runtime databases. Profile changes do not shrink already-built files, and build
+cleanup does not remove Tachyon's separately stored history or research data.

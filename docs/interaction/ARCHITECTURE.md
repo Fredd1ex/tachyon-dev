@@ -1,11 +1,12 @@
 # Interaction Architecture
 
-## Current Phase: Complete
+## Current Implementation
 
 The structural refactor is complete, including bounded capability infrastructure:
 the role registry, host runtime extraction, daemon messaging extraction, durable
 todos and operational feed, read-only monitoring, optional TUI views, and explicit
-campaign assessment. This is not an automated campaign oversight pipeline.
+campaign assessment. Explicitly authorized manifests can now activate the separate
+[budgeted CampaignService oversight pipeline](../tachyon/CAMPAIGN_OVERSIGHT.md).
 
 Foreground and background remain independent executable hosts, each constructing
 its own Tokio runtime in `main.rs`. There is no new shared crate or combined host
@@ -56,14 +57,37 @@ Memory remains the storage service in `crates/memory`, with the existing
 Conversation memory capability. There is no memory inference role or placeholder
 policy directory. Memory storage and its ownership are unchanged.
 
+Conversation policy asks the model to recall relevant stored preferences before
+recommendations or preference-sensitive answers, including format constraints,
+and before delegation when needed. Current explicit instructions override stored
+preferences. Greetings and context-free factual questions do not require recall.
+The existing native `memory` service handles recall; there is no new classifier
+or automatic per-turn lookup. The host limits recall to once per turn and removes
+recall from subsequent schemas. Successful, matching current-request recall items
+also survive worker synthesis as bounded user context, not instructions.
+Accepted-evidence follow-ups expose only memory, not new worker or web work;
+required fresh-work turns can recall before delegation rather than forcing both
+into the same batch. Neither path automatically invokes memory.
+Offline scripted-provider tests verify outbound policy, schemas, service routing,
+and result propagation. They do not prove that a live model will choose recall or
+obey preferences; relevance and answer compliance remain model responsibilities.
+
 Foreground `main.rs` owns argument parsing and startup wiring; the extracted
 modules above own the runtime behavior. `runtime.rs` resolves Conversation,
 Foreground lane, `Primary`, then renders configured identity/persona. Prompt or
 resolution failure disables the model before intake can call it and uses the
 existing configured-error/turn-publication path, without a default prompt fallback.
 Tool selection and each dispatch authorization consult the registry and intersect
-its invocation schemas and descriptor capabilities with the four implemented host
-tools. Contextual narrowing and the existing execution guards remain host policy.
+its invocation schemas and descriptor capabilities with the implemented host
+tools: single/multiple delegation, memory, schedule, todo, campaign, websearch,
+and webfetch. Native web dispatch uses `Client::conversation_web` with original
+turn metadata and stable native call identities, not worker delegation. Host
+`[web].enabled = false` removes schemas and denies dispatch. The daemon owns
+root admission, fixed retrieval engine, credentials, and retained typed evidence.
+The next completion consumes a bounded structured report directly; if worker
+delegation also requires synthesis, only matching native web call/result IDs
+contribute `WebOutcome` evidence to the synthesis brief.
+Contextual narrowing and the existing execution guards remain host policy.
 
 Background review resolves Coordinator, Background lane, `Review`, using the
 configured persona. It exposes exactly the registry's `submit_work_review` schema,
@@ -85,9 +109,46 @@ ownership of presentation and session archive behavior.
 
 ## Implemented Services
 
-- [Daemon messaging](daemon-messaging.md) extracts command envelopes, existing
-  notifications/history projection, and agent/work subscriptions. It adds no bus,
-  campaign notification policy, or new urgent publication path.
+### Foreground Turn Scheduling
+
+Intake owns concurrent turn and modeled-notification tasks in a `JoinSet`.
+Dependency waits do not hold the intake loop or a provider permit. A queued
+`AnswerNow` turn skips the preceding turn's evidence assessment; dependent turns
+may answer from a supported subset before their parent finishes. An insufficient
+assessment waits for changed selected evidence or a terminal parent, not every
+notification. Wait futures are created before state checks, preserving Tokio
+`notify_waiters` delivery even before the future's first poll.
+
+After answerability inference, execution rechecks the selected evidence, parent
+terminal state and context epoch before applying its decision. Changed snapshots
+are rebuilt; terminal turns cannot publish or commit late inference results.
+`CancelConversation` closes outstanding history gaps, preserves already-published
+independent replies, aborts owned tasks and their receipt timers, and checkpoints
+the advanced cursor. Publication is serialized with cancellation separately from
+the conversation-state lock. Campaign advisories deduplicate before publication
+and retain only the newest observed revision per campaign.
+
+Regression tests use a loopback HTTP fake provider with held response sockets,
+not paid inference. They cover partial/subset evidence with a pending parent,
+independent publication, insufficient-evidence wakeups, stale assessments,
+cancellation and late replies, ordered history, and notification ordering.
+
+Limits: routing still identifies dependency by the preceding numeric turn, not
+an explicit classifier-selected parent; intervening notification turns and
+multi-parent dependencies remain unsupported. `InterruptAndReplan` is still a
+dependent routing decision, not an authoritative worker supersession command.
+Conversation cancellation stops foreground futures, not daemon-owned work or
+already-running blocking service calls. Work-result generation/revision authority
+remains a daemon responsibility; foreground does not infer revocation from prose.
+There is no new wire-level per-turn cancellation acknowledgement or persistent
+in-flight task recovery. Conservative routing fallback can still wait when the
+classifier cannot establish independence.
+
+- [Daemon messaging](daemon-messaging.md) owns command envelopes,
+  notifications/history projection, and agent/work subscriptions. Typed campaign
+  advisories and [durable attention](ATTENTION.md) use deterministic host publication,
+  not a second inference or a new bus. Attention can display during active synthesis
+  without aborting the provider request.
 - [Structured todos](TODOS.md) are daemon-owned redb records with exact scope
   authority, revision checks, idempotent receipts, and transactional persistent
   operational events. `Todo`, `TodoSnapshot`, and `OperationalSubscribe` operator
@@ -110,12 +171,26 @@ ownership of presentation and session archive behavior.
   Background/Primary for an explicit `CampaignAssessmentRequest`. The caller
   supplies bounded todo and monitor snapshots. Despite declared read capabilities
   and required host grants, this path passes no tools to the model and executes
-  none: it makes one model call and validates an internal advisory result. It does
-  not fetch or refresh observations, schedule periodic inference, or mutate todos.
+  none: it makes one model call and validates an internal advisory result. This
+  standalone path does not fetch observations or mutate todos. The separate opt-in,
+  budgeted CampaignService automatically assesses durable semantic triggers using
+  canonical host snapshots; campaign oversight is not limited to one-shot callers.
+- Conversation's native `campaign` tool lists, inspects, steers and cancels exact
+  Work branches in explicitly linked authorized campaigns. Accepted, delivered and
+  applied state remain distinct; durable root cancellation intent is polled and
+  signalled to execution, not reported as immediate cleanup.
 
-Normal chat gains no new prompts, default todo/monitor tools, or automatic plan
-injection. Todos are structured records, not user Markdown plan persistence;
-there are no plan-file watchers, export/sync, or automatic completion semantics.
+The base Conversation prompt is unchanged, but selected native `todo` and `campaign`
+schemas are implemented. The todo tool binds only `current_conversation`; campaign
+selectors remain denied even when the campaign tool can read a linked plan.
+There is no default monitor tool or automatic full-plan injection. Todos are
+durable structured records, not Markdown files; no plan-file watchers, export/sync,
+automatic completion or automatic conversation rotation is implemented here.
+
+Strict typed input and host-authored envelopes prevent user `AgentChat` text from
+injecting host commands or metadata. Foreground checkpoints are owner-only (`0600`).
+These are routing and file-permission protections, not universal raw-secret
+redaction of user, tool, evidence or checkpoint content.
 
 ## Characterization Evidence
 
@@ -141,17 +216,20 @@ render-failing registry bindings. A localhost review SSE fixture checks exact
 review-only schema exposure and a successful correlated decision. Foreground
 tests compare ordered primary schemas and memory/schedule contextual narrowing.
 
-Final parent-run verification reported the full default test suite passing and
-all 30 explicitly run ignored tests passing. This records the supplied parent-run
-evidence, not a new test execution by this documentation-only pass; no default-suite
-test count is asserted. Service and UI fixture coverage is documented in the
-linked component contracts.
+Final parent-run evidence reports `cargo test --workspace`,
+`cargo check --workspace --all-targets`, and `cargo build --workspace` (debug)
+passing. The two opt-in process fixtures and the active-root cancellation
+regression were rerun individually according to earlier agent evidence. This is
+supplied verification evidence, not execution by this documentation-only pass;
+it does not claim all ignored tests ran. See [parallel acceptance](PARALLEL_ACCEPTANCE.md)
+for exact commands, replay boundaries and remaining coverage gaps.
 
-## Outstanding Integration
+## Campaign Integration
 
-Campaign assessment lifecycle/caller integration is a separate follow-up, not an
-incomplete structural refactor: a host pipeline still needs to select when to
-gather authorized snapshots, submit assessments, and handle their results. There
-is no automatic campaign-to-Conversation oversight wiring, assessment notification
-policy, or new urgent user-facing path. Existing messaging does not supply those
-decisions merely because an assessment carries an attention classification.
+The optional manifest oversight policy now funds a host-only service allocation
+before root admission. CampaignService owns bounded assessment execution, durable
+semantic triggers and input snapshots, stale-result fencing and an advisory outbox.
+An explicit destination receives `PublishCampaignAssessment` without a second model
+call or fabricated WorkResult. An assessment's attention classification is still
+not authority for the separate PriorityAttn path. See the linked oversight contract
+for the complete schema, supported triggers, retention and recovery boundaries.

@@ -151,6 +151,10 @@ pub struct WorkTiming {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkEvidence {
+    /// Observed tool invocations in this assignment, including errors and omitted results.
+    /// None means the producer did not report a count, not that no calls occurred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_invocations: Option<u64>,
     pub tools: Vec<WorkToolEvidence>,
     /// Results excluded by the evidence budget; absence is not proof of success.
     pub omitted: u64,
@@ -385,6 +389,58 @@ pub struct DaemonInfo {
     /// Independently supervised semantic result reviewer state.
     #[serde(default)]
     pub background: BackgroundCoordinatorInfo,
+    /// Ephemeral catalog and observed status, not persisted agent instances.
+    #[serde(default)]
+    pub orchestrators: Vec<OrchestratorInfo>,
+}
+
+pub const ORCHESTRATOR_ROLE_LIMIT: usize = 64;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorKind {
+    Role,
+    Service,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorHost {
+    Daemon,
+    Foreground,
+    Background,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorVisibility {
+    UserFacing,
+    Internal,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorInvocation {
+    Primary,
+    Review,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrchestratorInfo {
+    pub id: String,
+    pub display_name: String,
+    pub purpose: String,
+    pub kind: OrchestratorKind,
+    pub host: OrchestratorHost,
+    pub visibility: OrchestratorVisibility,
+    pub invocations: Vec<OrchestratorInvocation>,
+    pub runtime_id: Option<String>,
+    /// Only present when controls may act on the owned host process.
+    pub host_target: Option<OrchestratorHost>,
+    pub status: String,
+    /// None means activity/start time has not been observed for this role.
+    pub active: Option<bool>,
+    pub started_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -473,6 +529,16 @@ fn default_research_limit() -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ApiRequest {
+    AttentionList {
+        scope: crate::todo::TodoScope,
+        after: Option<String>,
+        limit: usize,
+    },
+    AttentionAcknowledge {
+        scope: crate::todo::TodoScope,
+        id: String,
+        phase: crate::attention::AttentionAcknowledgement,
+    },
     MonitorGet {
         query: crate::monitor::MonitorQuery,
     },
@@ -480,6 +546,14 @@ pub enum ApiRequest {
     MonitorSubscribe {
         query: crate::monitor::MonitorQuery,
         after: Option<crate::monitor::MonitorVersion>,
+    },
+    ConversationCampaign {
+        origin: crate::InteractionMetadata,
+        request: crate::conversation_campaign::Request,
+    },
+    ConversationWeb {
+        metadata: crate::InteractionMetadata,
+        command: crate::web::WebCommand,
     },
     Todo(crate::todo::TodoRequest),
     /// Paginated consistent scope view; restart pagination on CursorStale.
@@ -540,6 +614,14 @@ pub enum ApiRequest {
     },
     CampaignInspect {
         id: String,
+    },
+    CampaignAssessmentList {
+        id: String,
+    },
+    CampaignAssessmentRequest {
+        id: String,
+        command_id: String,
+        unisolated_development: bool,
     },
     CampaignIntegrationSnapshot {
         id: String,
@@ -858,6 +940,8 @@ pub enum HistoryKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoryEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<crate::attention::AttentionFrameMetadata>,
     pub event_id: String,
     #[serde(default)]
     pub kind: HistoryKind,
@@ -1249,6 +1333,9 @@ pub enum AgentEvent {
         due_at_ms: u64,
         mode: ScheduledTaskMode,
     },
+    /// Turn-scoped provisional status, not answer text. A nonempty `working`
+    /// message replaces the pending text for that turn. Answer publication wins
+    /// over status updates, including delayed updates received after completion.
     Status {
         turn: Option<u64>,
         phase: String,
@@ -1298,11 +1385,16 @@ pub enum AgentEvent {
         id: String,
         name: String,
         arguments: String,
+        /// Assignment fence; absent on persisted legacy and foreground events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<ToolTelemetryIdentity>,
     },
     ToolFinished {
         turn: Option<u64>,
         id: String,
         output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<ToolTelemetryIdentity>,
     },
     ToolTelemetry {
         tool_name: String,
@@ -1367,6 +1459,16 @@ pub struct EventEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApiResponse {
+    ConversationWeb {
+        command: crate::web::WebCommand,
+        result: Result<crate::web::WebResult, String>,
+    },
+    AttentionList {
+        snapshot: crate::attention::AttentionSnapshot,
+    },
+    AttentionAcknowledged {
+        attention: crate::attention::Attention,
+    },
     Monitor {
         snapshot: crate::monitor::MonitorSnapshot,
     },
@@ -1375,6 +1477,9 @@ pub enum ApiResponse {
     },
     Todo {
         response: crate::todo::TodoResponse,
+    },
+    ConversationCampaign {
+        result: Result<serde_json::Value, String>,
     },
     TodoError {
         error: crate::todo::TodoError,
@@ -1400,6 +1505,9 @@ pub enum ApiResponse {
     CampaignInspection {
         campaign: Campaign,
         diagnostics: Vec<String>,
+    },
+    CampaignAssessments {
+        records: Vec<crate::campaign_oversight::AssessmentRecord>,
     },
     CampaignIntegration {
         report: serde_json::Value,
@@ -1839,6 +1947,26 @@ mod tests {
     }
 
     #[test]
+    fn evidence_counts_distinguish_legacy_unknown_from_observed_zero() {
+        let legacy = serde_json::json!({"tools": [], "omitted": 3});
+        let evidence: WorkEvidence = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(evidence.observed_invocations, None);
+        assert_eq!(serde_json::to_value(evidence).unwrap(), legacy);
+        for count in [0, 3, u64::MAX] {
+            let evidence = WorkEvidence {
+                observed_invocations: Some(count),
+                ..Default::default()
+            };
+            let wire = serde_json::to_value(&evidence).unwrap();
+            assert_eq!(wire["observed_invocations"], count);
+            assert_eq!(
+                serde_json::from_value::<WorkEvidence>(wire).unwrap(),
+                evidence
+            );
+        }
+    }
+
+    #[test]
     fn work_subscription_has_a_stable_wire_shape() {
         let request = ApiRequest::WorkSubscribe {
             work_id: "work-1".into(),
@@ -1867,6 +1995,7 @@ mod tests {
                 turn: Some(3),
                 id: "call-7".into(),
                 output: "complete".into(),
+                identity: None,
             },
         };
 
@@ -1876,6 +2005,24 @@ mod tests {
             r#"{"event_id":42,"session_id":"session-1","conversation_id":"conversation-1","turn_id":"turn-3","task_id":"task-child","parent_task_id":"task-parent","tool_call_id":"call-7","actor":{"kind":"worker","id":"worker-1"},"sequence":9,"occurred_at_ms":1725000000123,"kind":"tool_finished","turn":3,"id":"call-7","output":"complete"}"#
         );
         assert_eq!(serde_json::from_str::<EventEnvelope>(&wire).unwrap(), event);
+    }
+
+    #[test]
+    fn tool_lifecycle_legacy_events_and_assignment_identity_round_trip() {
+        for legacy in [
+            serde_json::json!({"kind":"tool_started", "turn":null, "id":"local-call", "name":"read", "arguments":"{}"}),
+            serde_json::json!({"kind":"tool_finished", "turn":null, "id":"local-call", "output":"done"}),
+        ] {
+            let event: AgentEvent = serde_json::from_value(legacy.clone()).unwrap();
+            assert_eq!(serde_json::to_value(event).unwrap(), legacy);
+            let mut fenced = legacy;
+            fenced["identity"] = serde_json::json!({
+                "task_id": null, "work_id": "work", "generation": 3,
+                "assignment": 7, "attempt_id": "retry",
+            });
+            let event: AgentEvent = serde_json::from_value(fenced.clone()).unwrap();
+            assert_eq!(serde_json::to_value(event).unwrap(), fenced);
+        }
     }
 
     #[test]

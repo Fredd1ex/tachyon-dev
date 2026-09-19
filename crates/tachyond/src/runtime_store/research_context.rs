@@ -21,7 +21,8 @@ const MAX_CONTEXT_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024;
 mod stopping;
 pub(crate) mod traces;
 
-const FINDINGS: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("research_findings_v1");
+pub(super) const FINDINGS: TableDefinition<(&str, &str), &[u8]> =
+    TableDefinition::new("research_findings_v1");
 const LINEAGE: TableDefinition<(&str, &str, &str), &[u8]> =
     TableDefinition::new("research_candidate_lineage_v1");
 pub(super) const WORK_INDEX: TableDefinition<(&str, &str), ()> =
@@ -674,6 +675,7 @@ impl RuntimeStore {
                 .insert(key, serde_json::to_vec(&item).map_err(err)?.as_slice())
                 .map_err(err)?;
         }
+        super::campaign_oversight::trigger_in(&tx, campaign, "new_finding")?;
         tx.commit().map_err(err)?;
         Ok(reference)
     }

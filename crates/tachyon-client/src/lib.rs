@@ -53,6 +53,11 @@ pub struct Client {
 }
 
 impl Client {
+    /// Allows an owning worker to interrupt a blocked request during teardown.
+    pub fn shutdown_handle(&self) -> io::Result<std::os::unix::net::UnixStream> {
+        self.conn.shutdown_handle()
+    }
+
     /// Connect to the daemon socket. Returns NoDaemon if nothing is listening.
     pub fn connect() -> Result<Self, ClientError> {
         let path = tachyon_util::daemon::socket_path();
@@ -83,6 +88,34 @@ impl Client {
     }
 
     // ---- Mirrored API methods -----------------------------------------
+
+    /// Bounded host retrieval; use a dedicated connection for parallel calls.
+    pub fn conversation_web(
+        &mut self,
+        metadata: tachyon_api::InteractionMetadata,
+        command: tachyon_api::web::WebCommand,
+    ) -> Result<tachyon_api::web::WebResult, ClientError> {
+        command.validate().map_err(|e| ClientError::Api(e.into()))?;
+        match self.request(
+            &ApiRequest::ConversationWeb {
+                metadata,
+                command: command.clone(),
+            },
+            Duration::from_secs(125),
+        )? {
+            ApiResponse::ConversationWeb {
+                command: returned,
+                result,
+            } if returned == command => {
+                let result = result.map_err(ClientError::Api)?;
+                if !result.usage.valid() {
+                    return Err(ClientError::Api("invalid web usage receipt".into()));
+                }
+                Ok(result)
+            }
+            _ => Err(ClientError::Api("unexpected web response".into())),
+        }
+    }
 
     pub fn monitor_get(
         &mut self,

@@ -16,6 +16,7 @@ fn fake_tools() -> Vec<ToolSchema> {
 const FAKE: RoleDescriptor = RoleDescriptor {
     id: RoleId::Custom("test-role"),
     stable_id: "test-role",
+    display_name: "Test Role",
     purpose: "Prove registration needs no kernel dispatch changes.",
     capabilities: &[],
     host_lane: HostLane::Background,
@@ -202,7 +203,16 @@ fn invocation_tools_match_original_schema_snapshots() {
             InvocationKind::Primary,
             OutputVisibility::UserFacing,
             "conversation",
-            vec!["spawn_agent", "spawn_agents", "memory", "schedule"],
+            vec![
+                "spawn_agent",
+                "spawn_agents",
+                "memory",
+                "schedule",
+                "todo",
+                "campaign",
+                "websearch",
+                "webfetch",
+            ],
         ),
         (
             RoleId::Coordinator,
@@ -244,7 +254,30 @@ fn invocation_tools_match_original_schema_snapshots() {
                 .collect::<Vec<_>>(),
             names
         );
-        let schemas: Vec<_> = rendered.tools.iter().map(|tool| serde_json::json!({
+        // Conversation appends Todo and linked campaign contracts; preserve the original
+        // frozen schemas and prompt bytes rather than rewriting legacy goldens.
+        let legacy_tools = if id == RoleId::Conversation {
+            assert_eq!(
+                &rendered.tools[5],
+                &tachyon_orchestrator::conversation::tools::campaign()
+            );
+            assert_eq!(
+                rendered.tools[6],
+                tachyon_orchestrator::conversation::tools::web(false)
+            );
+            assert_eq!(
+                rendered.tools[7],
+                tachyon_orchestrator::conversation::tools::web(true)
+            );
+            assert_eq!(
+                rendered.tools[4],
+                tachyon_orchestrator::conversation::tools::todo()
+            );
+            &rendered.tools[..4]
+        } else {
+            &rendered.tools[..]
+        };
+        let schemas: Vec<_> = legacy_tools.iter().map(|tool| serde_json::json!({
             "name": tool.name, "description": tool.description, "parameters": tool.parameters,
         })).collect();
         let actual = format!("{}\n", serde_json::to_string_pretty(&schemas).unwrap());

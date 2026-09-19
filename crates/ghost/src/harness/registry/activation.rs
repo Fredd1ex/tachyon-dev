@@ -158,6 +158,8 @@ impl ToolRegistry {
                 let method = match tool {
                     "agent_browser" => "run",
                     "artifact" => "register",
+                    "websearch" => "search",
+                    "webfetch" => "fetch",
                     _ => tool,
                 };
                 methods.insert(

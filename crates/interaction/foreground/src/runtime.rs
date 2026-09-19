@@ -48,18 +48,38 @@ impl AgentRole {
         rendered.tools.retain(|tool| {
             matches!(
                 tool.name.as_str(),
-                "spawn_agent" | "spawn_agents" | "memory" | "schedule"
-            ) && resolved
-                .descriptor()
-                .capabilities
-                .iter()
-                .any(|cap| cap.tool_name() == tool.name)
+                "spawn_agent"
+                    | "spawn_agents"
+                    | "memory"
+                    | "schedule"
+                    | "todo"
+                    | "campaign"
+                    | "websearch"
+                    | "webfetch"
+            ) && (cfg.web.enabled || !matches!(tool.name.as_str(), "websearch" | "webfetch"))
+                && resolved
+                    .descriptor()
+                    .capabilities
+                    .iter()
+                    .any(|cap| cap.tool_name() == tool.name)
         });
         Ok(rendered)
     }
 
-    pub(super) fn tools(self, _force_delegation: bool) -> Result<Vec<ToolSpec>, String> {
-        self.registered_tools().map(<[ToolSpec]>::to_vec)
+    pub(super) fn tools(
+        self,
+        _force_delegation: bool,
+        metadata: Option<&tachyon_api::InteractionMetadata>,
+    ) -> Result<Vec<ToolSpec>, String> {
+        Ok(self
+            .registered_tools()?
+            .iter()
+            .filter(|tool| {
+                metadata.is_some_and(|m| m.web_available())
+                    || !matches!(tool.name.as_str(), "websearch" | "webfetch")
+            })
+            .cloned()
+            .collect())
     }
 
     fn registered_tools(self) -> Result<&'static [ToolSpec], String> {
@@ -83,7 +103,15 @@ impl AgentRole {
             .map_err(Clone::clone)
     }
 
-    pub(super) fn allows_tool(self, name: &str) -> Result<bool, String> {
+    pub(super) fn allows_tool(
+        self,
+        name: &str,
+        metadata: Option<&tachyon_api::InteractionMetadata>,
+    ) -> Result<bool, String> {
+        if matches!(name, "websearch" | "webfetch") && !metadata.is_some_and(|m| m.web_available())
+        {
+            return Ok(false);
+        }
         Ok(self
             .registered_tools()?
             .iter()
@@ -125,16 +153,42 @@ mod tests {
     use tachyon_orchestrator::registry::{InvocationBinding, RegistryError};
 
     #[test]
+    fn web_readiness_is_per_turn_fail_closed_and_matches_dispatch() {
+        let role = AgentRole::Conversation;
+        let mut metadata =
+            tachyon_api::InteractionMetadata::new("message", "root", "foreground", 1);
+        for available in [None, Some(true), Some(false), None, Some(true)] {
+            metadata.web_availability = available.map(|available| tachyon_api::WebAvailability {
+                available,
+                reason: (!available).then(|| "Host service unavailable".into()),
+            });
+            let tools = role.tools(false, Some(&metadata)).unwrap();
+            for name in ["websearch", "webfetch"] {
+                assert_eq!(
+                    tools.iter().any(|t| t.name == name),
+                    available == Some(true)
+                );
+                assert_eq!(
+                    role.allows_tool(name, Some(&metadata)).unwrap(),
+                    available == Some(true)
+                );
+            }
+            assert!(tools.iter().any(|t| t.name == "memory"));
+        }
+        assert!(!role.allows_tool("websearch", None).unwrap());
+    }
+
+    #[test]
     fn authorization_reuses_selection_and_does_not_share_mutable_turn_schemas() {
         let role = AgentRole::Conversation;
         assert!(std::ptr::eq(
             role.registered_tools().unwrap(),
             role.registered_tools().unwrap()
         ));
-        let mut tools = role.tools(false).unwrap();
+        let mut tools = role.tools(false, None).unwrap();
         tools.clear();
         for name in ["spawn_agent", "spawn_agents", "memory", "schedule"] {
-            assert!(role.allows_tool(name).unwrap());
+            assert!(role.allows_tool(name, None).unwrap());
         }
         for name in [
             "agent_release",
@@ -144,7 +198,7 @@ mod tests {
             "respond",
             "Memory",
         ] {
-            assert!(!role.allows_tool(name).unwrap());
+            assert!(!role.allows_tool(name, None).unwrap());
         }
     }
 
@@ -211,7 +265,7 @@ mod tests {
             ["memory"]
         );
         assert!(!AgentRole::Conversation
-            .allows_tool("agent_release")
+            .allows_tool("agent_release", None)
             .unwrap());
 
         use tachyon_orchestrator::capabilities::Capability;

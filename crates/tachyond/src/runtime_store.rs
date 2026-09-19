@@ -1,8 +1,11 @@
 use std::path::Path;
 
 pub(crate) mod admission;
+pub(crate) mod attention;
 pub(crate) mod campaign_launch;
 pub(crate) mod campaign_ledger;
+pub(crate) mod campaign_oversight;
+mod conversation_campaign;
 pub(crate) mod coordination;
 #[cfg(target_os = "linux")]
 pub(crate) mod execution;
@@ -17,6 +20,7 @@ pub(crate) mod research_context;
 #[cfg(target_os = "linux")]
 pub(crate) mod scheduler;
 pub(crate) mod todo;
+pub(crate) mod web;
 
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -43,6 +47,8 @@ const SCHEDULED_TASKS: TableDefinition<&str, &[u8]> = TableDefinition::new("sche
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct HistoryProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<tachyon_api::attention::AttentionFrameMetadata>,
     pub schema_version: u32,
     pub event_id: String,
     #[serde(default)]
@@ -133,8 +139,6 @@ pub(crate) struct RuntimeStore {
     host_capacity: host_capacity::HostCapacity,
     trace_root: std::path::PathBuf,
     trace_limits: research_context::traces::TraceLimits,
-    pub(crate) attention_notifications:
-        std::sync::Mutex<std::collections::VecDeque<tachyon_api::work::Attention>>,
     database: std::sync::Arc<Database>,
     model_permits: std::sync::Mutex<model_accounting::PermitState>,
     #[cfg(target_os = "linux")]
@@ -172,7 +176,6 @@ impl RuntimeStore {
             )?,
             trace_root: path.with_extension("traces"),
             trace_limits: research_context::traces::TraceLimits::configured()?,
-            attention_notifications: Default::default(),
             database,
             model_permits: Default::default(),
             #[cfg(target_os = "linux")]
@@ -246,10 +249,12 @@ impl RuntimeStore {
                 .open_table(campaign_launch::LAUNCHES)
                 .map_err(|e| e.to_string())?;
             campaign_ledger::initialize(&write)?;
+            campaign_oversight::initialize(&write)?;
             admission::initialize(&write)?;
             groups::initialize(&write)?;
             coordination::initialize(&write)?;
             operational_events::initialize(&write)?;
+            attention::initialize(&write)?;
             todo::initialize(&write)?;
             #[cfg(target_os = "linux")]
             execution::initialize(&write)?;
@@ -315,6 +320,7 @@ impl RuntimeStore {
         let event_bytes = serde_json::to_vec(&event)
             .map_err(|error| format!("encode runtime task event: {error}"))?;
         let history_projection = HistoryProjection {
+            attention: None,
             schema_version: SCHEMA_VERSION as u32,
             event_id: format!("runtime-task-transition-{sequence:020}"),
             kind: HistoryKind::Task,
@@ -1193,6 +1199,7 @@ mod tests {
 
     fn history(event_id: &str) -> HistoryProjection {
         HistoryProjection {
+            attention: None,
             schema_version: 1,
             event_id: event_id.into(),
             kind: HistoryKind::Conversation,

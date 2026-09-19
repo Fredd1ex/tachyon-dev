@@ -10,6 +10,7 @@ name = "tachyon"
 path = "src/main.rs"
 
 [dependencies]
+serde_json.workspace = true
 rpassword.workspace = true
 clap = { version = "4", features = ["derive"] }
 anstyle = "1"

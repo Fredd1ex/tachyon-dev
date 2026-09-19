@@ -59,7 +59,9 @@ impl Launch {
             return Err("immutable manifest digest mismatch".into());
         }
         if (self.manifest.children.is_some()
+            || self.manifest.web.is_some()
             || self.manifest.compute.is_some()
+            || self.manifest.oversight.is_some()
             || self.manifest.retained_storage_bytes.is_some())
             && self.manifest_sha256.is_none()
         {
@@ -71,6 +73,7 @@ impl Launch {
 
 struct Active {
     id: String,
+    oversight: bool,
     cancel: watch::Sender<bool>,
     task: JoinHandle<()>,
 }
@@ -292,6 +295,27 @@ impl CampaignService {
         authorized: bool,
     ) -> Result<ApiResponse, String> {
         self.activate(manifest, authorized, false)
+    }
+
+    pub(crate) fn request_assessment(
+        &self,
+        id: &str,
+        command: &str,
+        authorized: bool,
+    ) -> Result<ApiResponse, String> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| "campaign registry unavailable")?;
+        let live = active
+            .get(id)
+            .is_some_and(|a| a.oversight && !a.task.is_finished());
+        drop(active);
+        if !live && !self.store.assessment_request_known(id, command)? {
+            return Err("campaign has no active oversight owner".into());
+        }
+        self.store
+            .request_campaign_assessment(id, command, authorized)
     }
 
     pub(crate) fn resume(&self, id: &str, authorized: bool) -> Result<ApiResponse, String> {
@@ -775,6 +799,7 @@ impl CampaignService {
             &manifest.campaign_id,
             manifest.retained_storage_bytes,
         )?;
+        super::campaign_oversight::initialize_campaign_in(&tx, manifest)?;
         let campaign = RuntimeStore::set_campaign_status_in(
             &tx,
             &manifest.campaign_id,
@@ -829,6 +854,7 @@ impl CampaignService {
             manifest.campaign_id.clone(),
             Active {
                 id: manifest.campaign_id.clone(),
+                oversight: manifest.oversight.is_some() && !resume,
                 cancel,
                 task,
             },
@@ -946,6 +972,9 @@ impl CampaignService {
         let entries = std::mem::take(&mut *self.active.lock().unwrap());
         for active in entries.values() {
             if !active.task.is_finished() {
+                let _ = self
+                    .store
+                    .local_campaign_status(&active.id, CampaignStatus::Cancelling);
                 active.cancel.send_replace(true);
                 if let Err(error) = self.cancel_admitted(&active.id) {
                     eprintln!("tachyond: campaign cancellation: {error}");
@@ -1118,7 +1147,7 @@ fn child_template(
 }
 
 #[cfg(test)]
-async fn execute(
+pub(in crate::runtime_store) async fn execute(
     store: Arc<RuntimeStore>,
     storage_root: PathBuf,
     launch: Launch,
@@ -1182,6 +1211,62 @@ async fn execute_prepared(
         work: work_units,
         verification: verification_units,
         max_active_inferences: u64::from(m.max_active_inferences),
+    };
+    let oversight_permit = if let Some(o) = &m.oversight {
+        work_units.tokens = work_units
+            .tokens
+            .checked_sub(o.tokens)
+            .ok_or("oversight token allowance")?;
+        work_units.cost_micro_usd = work_units
+            .cost_micro_usd
+            .checked_sub(o.cost_micro_usd)
+            .ok_or("oversight cost allowance")?;
+        if store.campaign_command_gate(&c, &work)?.is_none() {
+            use super::model_accounting::services::{ServicePolicy, ServicePurpose};
+            store.host_authorize_campaign_envelope(
+                &format!("{c}-authorize"),
+                &c,
+                envelope.clone(),
+            )?;
+            let policy = ServicePolicy {
+                purpose: ServicePurpose::CampaignOversight,
+                allowance: Units {
+                    tokens: o.tokens,
+                    cost_micro_usd: o.cost_micro_usd,
+                },
+                estimate: RequestEstimate {
+                    base_url: launch.base_url.clone(),
+                    model: m.model.clone(),
+                    provider: m
+                        .web
+                        .as_ref()
+                        .map(|w| w.inference_provider.clone())
+                        .unwrap_or_else(|| "openrouter".into()),
+                    pricing_revision: m.pricing_revision.clone(),
+                    max_request_bytes: m.max_request_bytes,
+                    input_tokens: m.input_tokens,
+                    output_tokens: m.output_tokens,
+                    input_micro_usd_per_million: m.input_micro_usd_per_million,
+                    output_micro_usd_per_million: m.output_micro_usd_per_million,
+                    other_micro_usd: m.other_micro_usd,
+                },
+                max_requests: o.max_assessments,
+                timeout_ms: o.timeout_ms,
+            };
+            let campaign = c.clone();
+            Some(
+                store
+                    .storage(move |s| {
+                        s.host_authorize_service(&campaign, "oversight", policy, None)
+                            .map_err(err)
+                    })
+                    .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
     };
     if let Some(children) = &m.children {
         for s in children
@@ -1273,7 +1358,11 @@ async fn execute_prepared(
                 estimate: RequestEstimate {
                     base_url: launch.base_url,
                     model: m.model.clone(),
-                    provider: "openrouter".into(),
+                    provider: m
+                        .web
+                        .as_ref()
+                        .map(|w| w.inference_provider.clone())
+                        .unwrap_or_else(|| "openrouter".into()),
                     pricing_revision: m.pricing_revision.clone(),
                     max_request_bytes: m.max_request_bytes,
                     input_tokens: m.input_tokens,
@@ -1308,211 +1397,277 @@ async fn execute_prepared(
         controls.push(tachyon_api::agents::Control::Resource);
     }
     let mut broker = ModelBroker::new(store.clone(), model).with_controls(controls);
+    if let Some(web) = m.web.clone() {
+        broker = broker.with_web(
+            web,
+            tachyon_util::config::Config::try_load_from(
+                &tachyon_util::config::Config::default_path(),
+            )
+            .map_err(err)?
+            .web,
+        )?;
+    }
     if history {
         broker = broker.with_research_artifacts(artifacts.clone());
     }
     let broker = Arc::new(broker);
-    let (root_cancel, _) = watch::channel(*cancel.borrow());
-    broker
-        .launches
-        .lock()
-        .map_err(|_| "launch registry unavailable")?
-        .insert((c.clone(), work.clone(), 1), root_cancel.clone());
-    let deadline =
+    let oversight_broker = broker.clone();
+    let oversight_manifest = m.clone();
+    let oversight_cancel = cancel.subscribe();
+    let oversight_deadline =
         tokio::time::Instant::now() + Duration::from_millis(m.deadline_ms.saturating_sub(now()));
-    let mut scheduler = {
-        let m = m.clone();
-        let c = c.clone();
-        let policy = policy.clone();
-        let broker = broker.clone();
-        let artifacts = artifacts.clone();
-        let staging = staging.clone();
-        let config = config.clone();
-        tokio::task::spawn_blocking(move || -> Result<_, String> {
-            if let Some(children) = m.children.as_ref().filter(|_| !prepared) {
-                use super::scheduler::HostScheduler;
-                let mut scheduler =
-                    HostScheduler::command_children(broker.clone(), children.max_resident)?;
-                scheduler.select_allocation(&c, m.allocation.clone())?;
-                for t in &children.execution_templates(&c) {
-                    let profile = children
-                        .dynamic
-                        .iter()
-                        .flat_map(|d| &d.profiles)
-                        .find(|p| p.template_id(&c) == t.template_id);
-                    let template =
-                        child_template(&m, t, &policy, Some(artifacts.clone()), &staging, &config)?;
-                    if let Some(profile) = profile {
-                        scheduler.approve_profile(template, profile.clone())?;
-                    } else {
-                        scheduler.approve(template)?;
-                    }
-                }
-                scheduler.restore_proposals()?;
-                Ok(Some(scheduler))
-            } else {
-                Ok(None)
-            }
-        })
-        .await
-        .map_err(err)??
-    };
-    let execution = broker.execute_campaign_command_loop_prepared(
-        &m.executable,
-        &m.workspace,
-        &m.home,
-        policy.clone(),
-        deadline,
-        artifacts.clone(),
-        staging.clone(),
-        config.clone(),
-        prepared,
-    );
-    tokio::pin!(execution);
-    let mut scheduler_error = None;
-    let mut cancellation = cancel.subscribe();
-    root_cancel.send_replace(*cancellation.borrow_and_update());
-    let mut result = loop {
-        tokio::select! {
-            result = &mut execution => break result,
-            _ = cancellation.changed() => { root_cancel.send_replace(*cancellation.borrow()); }
-            _ = tokio::time::sleep(Duration::from_millis(10)), if scheduler.is_some() && scheduler_error.is_none() => {
-                if *cancel.borrow() { continue; }
-                if let Err(e) = scheduler.as_mut().unwrap().tick().await {
-                    scheduler_error = Some(e);
-                    root_cancel.send_replace(true);
-                }
-            }
-        }
-    };
-    // A stopped root awaiting human input retains only its owner/deadline monitor.
-    // No worker, evaluator process, model request, or host capacity permit is held.
-    while result
-        .as_ref()
-        .is_ok_and(|r| r.phase == ExecutionPhase::AwaitingAcceptance)
-    {
-        let campaign = c.clone();
-        let cancelled = *cancel.borrow();
-        result = store
-            .storage(move |s| {
-                s.poll_human_acceptance(&campaign, cancelled)?
-                    .ok_or("missing human acceptance execution".into())
-            })
-            .await;
-        if result
-            .as_ref()
-            .is_ok_and(|r| r.phase == ExecutionPhase::AwaitingAcceptance)
-        {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-    // Root completion stops admission before draining every child owner. Never
-    // detach a worker or publish success while cleanup is uncertain.
-    let mut cleanup_error = None;
-    let mut admitted_children = Vec::new();
-    if let Some(scheduler) = &mut scheduler {
-        for work_id in child_work_ids {
-            for id in [work_id.clone(), format!("{work_id}-verification")] {
-                match store.local_work_status(&c, &id) {
-                    Ok(Some(status)) => {
-                        if !status.terminal {
-                            if let Err(e) = store.host_cancel_work(&c, &id, 1) {
-                                cleanup_error = Some(e);
-                            }
+    let (finished, completion) = watch::channel(false);
+    let work_execution = async {
+        let (root_cancel, _) = watch::channel(*cancel.borrow());
+        broker
+            .launches
+            .lock()
+            .map_err(|_| "launch registry unavailable")?
+            .insert((c.clone(), work.clone(), 1), root_cancel.clone());
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(m.deadline_ms.saturating_sub(now()));
+        let mut scheduler = {
+            let m = m.clone();
+            let c = c.clone();
+            let policy = policy.clone();
+            let broker = broker.clone();
+            let artifacts = artifacts.clone();
+            let staging = staging.clone();
+            let config = config.clone();
+            tokio::task::spawn_blocking(move || -> Result<_, String> {
+                if let Some(children) = m.children.as_ref().filter(|_| !prepared) {
+                    use super::scheduler::HostScheduler;
+                    let mut scheduler =
+                        HostScheduler::command_children(broker.clone(), children.max_resident)?;
+                    scheduler.select_allocation(&c, m.allocation.clone())?;
+                    for t in &children.execution_templates(&c) {
+                        let profile = children
+                            .dynamic
+                            .iter()
+                            .flat_map(|d| &d.profiles)
+                            .find(|p| p.template_id(&c) == t.template_id);
+                        let template = child_template(
+                            &m,
+                            t,
+                            &policy,
+                            Some(artifacts.clone()),
+                            &staging,
+                            &config,
+                        )?;
+                        if let Some(profile) = profile {
+                            scheduler.approve_profile(template, profile.clone())?;
+                        } else {
+                            scheduler.approve(template)?;
                         }
-                        admitted_children.push(id);
                     }
-                    Ok(None) => {}
-                    Err(e) => cleanup_error = Some(e),
+                    scheduler.restore_proposals()?;
+                    Ok(Some(scheduler))
+                } else {
+                    Ok(None)
                 }
-            }
-        }
-        if let Err(e) = scheduler.shutdown().await {
-            cleanup_error = Some(e);
-        }
-        let ledger = store.campaign_ledger(&c)?;
-        for id in admitted_children {
-            match store.local_work_status(&c, &id) {
-                Ok(Some(status)) if status.terminal => {
-                    // Terminal leases prove neither final usage nor allocation closure.
-                    let dispatch = &status.work.dispatch_id;
-                    if !ledger.as_ref().is_some_and(|l| {
-                        l.allocations.get(dispatch) == Some(&true)
-                            || l.reservations.get(dispatch).is_some_and(|r| {
-                                matches!(r.usage, super::campaign_ledger::Usage::Final(_))
-                            })
-                    }) {
-                        cleanup_error = Some("child accounting remains uncertain".into());
-                    }
-                }
-                _ => cleanup_error = Some("child termination remains uncertain".into()),
-            }
-        }
-    }
-    drop(scheduler.take());
-    if scheduler_error.is_none()
-        && cleanup_error.is_none()
-        && !*cancel.borrow()
-        && tokio::time::Instant::now() < deadline
-        && result.as_ref().is_ok_and(|r| {
-            matches!(
-                r.phase,
-                ExecutionPhase::EvidenceReady | ExecutionPhase::AwaitingVerification
-            )
-        })
-    {
-        // Children may have occupied the verifier slot when the root finished.
-        // Resume the evidence gate under the original root retry policy. Child
-        // admission stays withdrawn even if verification authorizes root repair.
-        let review = broker.execute_campaign_command_loop(
+            })
+            .await
+            .map_err(err)??
+        };
+        let execution = Box::pin(broker.execute_campaign_command_loop_prepared(
             &m.executable,
             &m.workspace,
             &m.home,
-            policy,
+            policy.clone(),
             deadline,
-            artifacts,
-            staging,
-            config,
-        );
-        tokio::pin!(review);
-        result = loop {
+            artifacts.clone(),
+            staging.clone(),
+            config.clone(),
+            prepared,
+        ));
+        tokio::pin!(execution);
+        let mut scheduler_error = None;
+        let mut cancellation = cancel.subscribe();
+        root_cancel.send_replace(*cancellation.borrow_and_update());
+        let mut result = loop {
             tokio::select! {
-                result = &mut review => break result,
+                result = &mut execution => break result,
                 _ = cancellation.changed() => { root_cancel.send_replace(*cancellation.borrow()); }
+                _ = tokio::time::sleep(Duration::from_millis(10)), if scheduler.is_some() && scheduler_error.is_none() => {
+                    if *cancel.borrow() { continue; }
+                    if let Err(e) = scheduler.as_mut().unwrap().tick().await {
+                        scheduler_error = Some(e);
+                        root_cancel.send_replace(true);
+                    }
+                }
             }
         };
-    }
-    broker
-        .launches
-        .lock()
-        .map_err(|_| "launch registry unavailable")?
-        .remove(&(c.clone(), work.clone(), 1));
-    if let Some(e) = scheduler_error.or(cleanup_error) {
-        return Err(e);
-    }
-    if tokio::time::Instant::now() >= deadline {
-        return Err("campaign cleanup exceeded deadline".into());
-    }
-    if *cancel.borrow() && store.campaign_work_status(&c, &work)?.terminal {
-        return Ok(ExecutionPhase::Reviewed(Evaluation::Unverified));
-    }
-    Ok(result?.phase)
+        // A stopped root awaiting human input retains only its owner/deadline monitor.
+        // No worker, evaluator process, model request, or host capacity permit is held.
+        while result
+            .as_ref()
+            .is_ok_and(|r| r.phase == ExecutionPhase::AwaitingAcceptance)
+        {
+            let campaign = c.clone();
+            let cancelled = *cancel.borrow();
+            result = store
+                .storage(move |s| {
+                    s.poll_human_acceptance(&campaign, cancelled)?
+                        .ok_or("missing human acceptance execution".into())
+                })
+                .await;
+            if result
+                .as_ref()
+                .is_ok_and(|r| r.phase == ExecutionPhase::AwaitingAcceptance)
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        // Root completion stops admission before draining every child owner. Never
+        // detach a worker or publish success while cleanup is uncertain.
+        let mut cleanup_error = None;
+        let mut admitted_children = Vec::new();
+        if let Some(scheduler) = &mut scheduler {
+            for work_id in child_work_ids {
+                for id in [work_id.clone(), format!("{work_id}-verification")] {
+                    match store.local_work_status(&c, &id) {
+                        Ok(Some(status)) => {
+                            if !status.terminal {
+                                if let Err(e) = store.host_cancel_work(&c, &id, 1) {
+                                    cleanup_error = Some(e);
+                                }
+                            }
+                            admitted_children.push(id);
+                        }
+                        Ok(None) => {}
+                        Err(e) => cleanup_error = Some(e),
+                    }
+                }
+            }
+            if let Err(e) = scheduler.shutdown().await {
+                cleanup_error = Some(e);
+            }
+            let ledger = store.campaign_ledger(&c)?;
+            for id in admitted_children {
+                match store.local_work_status(&c, &id) {
+                    Ok(Some(status)) if status.terminal => {
+                        // Terminal leases prove neither final usage nor allocation closure.
+                        let dispatch = &status.work.dispatch_id;
+                        if !ledger.as_ref().is_some_and(|l| {
+                            l.allocations.get(dispatch) == Some(&true)
+                                || l.reservations.get(dispatch).is_some_and(|r| {
+                                    matches!(r.usage, super::campaign_ledger::Usage::Final(_))
+                                })
+                        }) {
+                            cleanup_error = Some("child accounting remains uncertain".into());
+                        }
+                    }
+                    _ => cleanup_error = Some("child termination remains uncertain".into()),
+                }
+            }
+        }
+        drop(scheduler.take());
+        if scheduler_error.is_none()
+            && cleanup_error.is_none()
+            && !*cancel.borrow()
+            && tokio::time::Instant::now() < deadline
+            && result.as_ref().is_ok_and(|r| {
+                matches!(
+                    r.phase,
+                    ExecutionPhase::EvidenceReady | ExecutionPhase::AwaitingVerification
+                )
+            })
+        {
+            // Children may have occupied the verifier slot when the root finished.
+            // Resume the evidence gate under the original root retry policy. Child
+            // admission stays withdrawn even if verification authorizes root repair.
+            let review = Box::pin(broker.execute_campaign_command_loop(
+                &m.executable,
+                &m.workspace,
+                &m.home,
+                policy,
+                deadline,
+                artifacts,
+                staging,
+                config,
+            ));
+            tokio::pin!(review);
+            result = loop {
+                tokio::select! {
+                    result = &mut review => break result,
+                    _ = cancellation.changed() => { root_cancel.send_replace(*cancellation.borrow()); }
+                }
+            };
+        }
+        broker
+            .launches
+            .lock()
+            .map_err(|_| "launch registry unavailable")?
+            .remove(&(c.clone(), work.clone(), 1));
+        if let Some(e) = scheduler_error.or(cleanup_error) {
+            return Err(e);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("campaign cleanup exceeded deadline".into());
+        }
+        if *cancel.borrow() && store.campaign_work_status(&c, &work)?.terminal {
+            return Ok(ExecutionPhase::Reviewed(Evaluation::Unverified));
+        }
+        Ok(result?.phase)
+    };
+    let mut work_execution = Box::pin(work_execution);
+    let work_execution = async {
+        let result = loop {
+            tokio::select! {
+                result = &mut work_execution => break result,
+                _ = tokio::time::sleep(Duration::from_millis(25)), if !*cancel.borrow() => {
+                    let campaign = c.clone();
+                    let root = work.clone();
+                    let state = store.storage(move |s| s.campaign_work_status(&campaign, &root)).await;
+                    // Conversation controls persist intent, not task handles. The
+                    // existing owner must signal execution, review and human waits.
+                    match state {
+                        Ok(state) if state.cancellation_requested => { cancel.send_replace(true); }
+                        Err(error) => {
+                            eprintln!("tachyond: campaign cancellation polling: {error}");
+                            cancel.send_replace(true);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        };
+        finished.send_replace(true);
+        result
+    };
+    let oversight = async {
+        if let Some(permit) = oversight_permit {
+            super::campaign_oversight::run(
+                oversight_broker,
+                oversight_manifest,
+                permit,
+                oversight_cancel,
+                completion,
+                oversight_deadline,
+            )
+            .await;
+        }
+    };
+    let (result, ()) = tokio::join!(work_execution, oversight);
+    result
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     mod acceptance;
     mod compute;
     use super::*;
     mod concurrency;
     mod continuation;
     mod human;
+    mod parallel_acceptance;
     mod reconciliation;
     mod retention;
     mod swarm;
     mod work;
 
-    fn fixture() -> (tempfile::TempDir, Arc<RuntimeStore>, CampaignManifest) {
+    pub(in crate::runtime_store) fn fixture(
+    ) -> (tempfile::TempDir, Arc<RuntimeStore>, CampaignManifest) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(RuntimeStore::open(&dir.path().join("runtime.redb")).unwrap());
         let ApiResponse::Research { research } = store
@@ -1537,6 +1692,8 @@ mod tests {
             panic!()
         };
         let m = CampaignManifest {
+            web: None,
+            oversight: None,
             retained_storage_bytes: None,
             compute: None,
             allocation: None,

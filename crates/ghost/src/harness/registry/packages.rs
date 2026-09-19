@@ -22,6 +22,9 @@ pub struct Packages {
 }
 
 impl Packages {
+    pub fn from_registry(registry: ToolRegistry) -> Self {
+        Self { registry }
+    }
     /// Rejection leaves both manifests and registered tools unchanged.
     /// Operation names are global, not namespaced by package or version.
     pub fn register(&mut self, package: Package) -> Result<(), PackageError> {

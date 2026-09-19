@@ -50,6 +50,7 @@ fn needs_ipc(cmd: &Command) -> bool {
         cmd,
         Command::Daemon(_) | Command::Memory(_) | Command::Providers(_)
     ) && !matches!(cmd, Command::Restart(args) if args.id == "daemon")
+        && !matches!(cmd, Command::Cat(args) if args.result)
 }
 
 /// All CLI commands are thin mirrors of `ApiRequest`s (one-to-one mapping).
@@ -105,6 +106,12 @@ fn dispatch(cmd: Command, p: &tachyon::style::Palette) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if let Command::Cat(args) = &cmd {
+        if args.result {
+            return print_work_result(&mut client, &args.id);
+        }
+    }
 
     // Convert the CLI command to its ApiRequest twin, then run it.
     let req: ApiRequest = match cmd {
@@ -306,6 +313,65 @@ fn print_response(resp: ApiResponse, p: &tachyon::style::Palette) {
         Attach { output, .. } => println!("{output}"),
         _ => {}
     }
+}
+
+fn print_work_result(client: &mut tachyon_client::Client, id: &str) -> ExitCode {
+    let result = (|| -> Result<(), String> {
+        let info = client
+            .agent_cat(id.to_string())
+            .map_err(|e| e.to_string())?;
+        if matches!(
+            info.state,
+            AgentState::Starting | AgentState::Running | AgentState::Waiting
+        ) {
+            return Err("work is not terminal; no retained result available yet".into());
+        }
+        let work_id = info.logical_task_id.ok_or("agent has no logical work ID")?;
+        let response = client
+            .request(
+                &ApiRequest::WorkSubscribe {
+                    work_id: work_id.clone(),
+                },
+                std::time::Duration::from_secs(5),
+            )
+            .map_err(|e| e.to_string())?;
+        let result = retained_work_result(&work_id, response)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("tachyon: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn retained_work_result(
+    work_id: &str,
+    response: ApiResponse,
+) -> Result<tachyon_api::WorkResult, String> {
+    let data = match response {
+        ApiResponse::Event {
+            stream: tachyon_api::EventStream::Stdout,
+            data,
+        } => data,
+        ApiResponse::Error { message, .. } => return Err(message),
+        _ => return Err("daemon returned no retained work result".into()),
+    };
+    let envelope: tachyon_api::EventEnvelope = serde_json::from_str(&data)
+        .map_err(|_| "daemon returned an invalid work event".to_string())?;
+    let tachyon_api::AgentEvent::WorkResult { result } = envelope.kind else {
+        return Err("daemon returned a non-terminal work event".into());
+    };
+    if result.work_id != work_id {
+        return Err("daemon returned a result for a different work ID".into());
+    }
+    Ok(result)
 }
 
 fn print_agent(a: &tachyon_client::api::AgentInfo, p: &tachyon::style::Palette) {
@@ -575,4 +641,64 @@ fn providers_cmd(cmd: Command, p: &tachyon::style::Palette) -> ExitCode {
 fn list_providers(_cfg: &tachyon::config::Config, _p: &tachyon::style::Palette) -> ExitCode {
     tachyon::providers::list();
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_result_replies_are_typed_scoped_and_do_not_fabricate_evidence() {
+        let result: tachyon_api::WorkResult = serde_json::from_value(serde_json::json!({
+            "work_id": "work-1", "objective": "lookup", "generation": 4, "assignment": 7,
+            "outcome": "timed_out", "deadline_ms": 100
+        }))
+        .unwrap();
+        let envelope = tachyon_api::EventEnvelope {
+            event_id: 1,
+            session_id: "worker".into(),
+            conversation_id: None,
+            turn_id: None,
+            task_id: Some("work-1".into()),
+            parent_task_id: None,
+            tool_call_id: None,
+            actor: tachyon_api::Actor::System,
+            sequence: 1,
+            occurred_at_ms: 100,
+            kind: tachyon_api::AgentEvent::WorkResult {
+                result: result.clone(),
+            },
+        };
+        let reply = || ApiResponse::Event {
+            stream: tachyon_api::EventStream::Stdout,
+            data: serde_json::to_string(&envelope).unwrap(),
+        };
+        assert_eq!(retained_work_result("work-1", reply()).unwrap(), result);
+        assert!(retained_work_result("other-work", reply()).is_err());
+        for response in [
+            ApiResponse::error("unsupported command"),
+            ApiResponse::Ok { message: None },
+            ApiResponse::Event {
+                stream: tachyon_api::EventStream::Stdout,
+                data: "not JSON".into(),
+            },
+            ApiResponse::Event {
+                stream: tachyon_api::EventStream::Stderr,
+                data: serde_json::to_string(&envelope).unwrap(),
+            },
+        ] {
+            assert!(retained_work_result("work-1", response).is_err());
+        }
+    }
+
+    #[test]
+    fn terminal_result_inspection_and_daemon_status_never_auto_start() {
+        for args in [
+            vec!["tachyon", "cat", "worker", "--result"],
+            vec!["tachyon", "daemon", "status"],
+        ] {
+            let command = Cli::try_parse_from(args).unwrap().command.unwrap();
+            assert!(!needs_ipc(&command));
+        }
+    }
 }

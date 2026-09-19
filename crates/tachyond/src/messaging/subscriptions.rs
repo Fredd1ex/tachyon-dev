@@ -135,6 +135,8 @@ mod tests {
             reg.works.insert(
                 request.work_id.clone(),
                 WorkRecord {
+                    observed_calls: Default::default(),
+                    partial_evidence: Default::default(),
                     request: request.clone(),
                     fingerprint: "fingerprint".into(),
                     worker_id: "worker".into(),

@@ -10,9 +10,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub use tachyon_model::{ProviderRouting, Reasoning, RoutingPreferences, RoutingProfile};
+mod web;
+pub use web::WebPolicy;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    #[serde(default)]
+    pub web: WebPolicy,
     #[serde(default)]
     pub campaign_resources: ResourceLimits,
     /// Managed worker root; defaults to the user's home directory / Agents.

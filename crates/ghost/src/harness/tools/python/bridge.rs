@@ -35,6 +35,8 @@ pub(crate) const PACKAGES: &[(&str, &[&str])] = &[
     ("work", &["work"]),
     ("todo", &["todo"]),
     ("monitor", &["monitor"]),
+    ("websearch", &["websearch"]),
+    ("webfetch", &["webfetch"]),
     ("browser", &["agent_browser"]),
     ("artifact", &["artifact"]),
 ];
@@ -381,7 +383,10 @@ mod tests {
         .for_work(&policy, &[], &Default::default())
         .unwrap();
         for (package, _) in PACKAGES {
-            if matches!(*package, "agents" | "history" | "work" | "todo" | "monitor") {
+            if matches!(
+                *package,
+                "agents" | "history" | "work" | "todo" | "monitor" | "websearch" | "webfetch"
+            ) {
                 assert!(registry.python_require(package, &policy).is_err());
                 assert!(!policy.enabled_tools.contains(*package));
                 continue;

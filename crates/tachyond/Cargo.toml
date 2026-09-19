@@ -17,6 +17,7 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tachyon-api.workspace = true
+tachyon-orchestrator.workspace = true
 tachyon-util.workspace = true
 tachyon-model.workspace = true
 tokio.workspace = true

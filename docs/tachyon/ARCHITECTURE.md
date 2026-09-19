@@ -1,5 +1,8 @@
 # Current Architecture
 
+For terminal UI ownership, input controls, offline profiling results, and remaining
+refactor work, see [TUI Refactor](TUI_REFACTOR.md).
+
 ## Measured Stage Timing
 
 Existing `work_candidate` and terminal `work_result` events carry optional

@@ -256,12 +256,21 @@ pub trait ToolEventSink: Send + Sync {
     fn register_artifact(&self, artifact: ArtifactRegistration) -> Result<(), String>;
 }
 
-#[derive(Default)]
 pub struct WorkEvidenceCollector(Mutex<tachyon_api::types::WorkEvidence>);
+
+impl Default for WorkEvidenceCollector {
+    fn default() -> Self {
+        Self(Mutex::new(tachyon_api::types::WorkEvidence {
+            observed_invocations: Some(0),
+            ..Default::default()
+        }))
+    }
+}
 
 impl WorkEvidenceCollector {
     pub fn record(&self, name: &str, context: &ToolContext, input: &Value, result: &ToolResult) {
         let mut evidence = self.0.lock().expect("evidence lock poisoned");
+        evidence.observed_invocations = evidence.observed_invocations.map(|n| n.saturating_add(1));
         let arguments = if input.to_string().len() <= 2048 {
             input.clone()
         } else {
@@ -272,7 +281,7 @@ impl WorkEvidenceCollector {
             parent_call_id: context.identity.parent_call_id.clone(),
             tool_name: name.into(),
             arguments,
-            output: serde_json::from_str(&result.to_json(8192)).expect("ToolResult JSON"),
+            output: serde_json::from_str(&result.to_json(2048)).expect("ToolResult JSON"),
         };
         // Bound the serialized bundle too: escaping and metadata can exceed content limits.
         evidence.tools.push(entry);
@@ -476,16 +485,15 @@ impl ToolResult {
         bounded.metadata = json!({"omitted": "metadata exceeded output budget"});
         bounded.truncated = true;
         bounded.output_ref = None;
-        let empty_len = {
-            let content = std::mem::take(&mut bounded.content);
-            let len = serde_json::to_string(&bounded).map_or(512, |value| value.len());
-            bounded.content = content;
-            len
-        };
-        bounded.content = bound_utf8(&bounded.content, max_bytes.saturating_sub(empty_len)).0;
-        serde_json::to_string(&bounded).unwrap_or_else(|_| {
-            r#"{"content":"tool result encoding failed","is_error":true,"metadata":{},"truncated":false,"continuation":null,"output_ref":null}"#.into()
-        })
+        bounded.continuation = None;
+        // Bound encoded bytes, not raw text: control characters can expand sixfold.
+        loop {
+            let encoded = serde_json::to_string(&bounded).expect("ToolResult JSON");
+            if encoded.len() <= max_bytes || bounded.content.is_empty() {
+                return encoded;
+            }
+            bounded.content = bound_utf8(&bounded.content, bounded.content.len() / 2).0;
+        }
     }
 }
 
@@ -606,6 +614,14 @@ mod tests {
         assert!(encoded.len() <= 1_000, "encoded {} bytes", encoded.len());
         let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded["truncated"], true);
+        for content in ["\u{0000}", "\"", "\\", "\u{00e9}"] {
+            let result = super::ToolError::invalid(content.repeat(16_384)).into_result();
+            let encoded = result.to_json(2048);
+            assert!(encoded.len() <= 2048);
+            let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded["is_error"], true);
+            assert_eq!(decoded["truncated"], true);
+        }
     }
 
     #[tokio::test]

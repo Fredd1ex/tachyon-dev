@@ -9,12 +9,228 @@ use std::path::{Path, PathBuf};
 const TURNS_PER_PAGE: usize = 32;
 const MAGIC: &[u8; 8] = b"TUIVIS01";
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct SessionThread {
+    pub(super) id: String,
+    pub(super) parent: Option<String>,
+    pub(super) task: Option<String>,
+    pub(super) is_foreground: bool,
+    pub(super) items: Vec<SessionItem>,
+    #[serde(default)]
+    pub(super) completed_turns: BTreeSet<String>,
+    #[serde(default)]
+    pub(super) unread_turns: BTreeSet<String>,
+    #[serde(default)]
+    pub(super) metrics: HashMap<String, TurnMetrics>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct SessionItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) attention: Option<attention::Notice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) work: Option<WorkDetail>,
+    pub(super) kind: String,
+    pub(super) text: String,
+    #[serde(default)]
+    pub(super) hidden: bool,
+    #[serde(default)]
+    pub(super) output: Option<String>,
+    #[serde(default)]
+    pub(super) tool_id: Option<String>,
+    #[serde(default)]
+    pub(super) turn: Option<String>,
+    #[serde(default)]
+    pub(super) timestamp: u64,
+}
+
+fn kind_str(k: &ItemKind) -> &'static str {
+    match k {
+        ItemKind::User => "user",
+        ItemKind::PendingReply => "pending_reply",
+        ItemKind::Reply => "reply",
+        ItemKind::Tool => "tool",
+        ItemKind::ToolResult => "tool_result",
+        ItemKind::System => "system",
+        ItemKind::Spawn => "spawn",
+        ItemKind::SpawnResult => "spawn_result",
+        ItemKind::Error => "error",
+    }
+}
+
+fn kind_from_str(s: &str) -> ItemKind {
+    match s {
+        "user" => ItemKind::User,
+        "pending_reply" => ItemKind::PendingReply,
+        "reply" => ItemKind::Reply,
+        "tool" => ItemKind::Tool,
+        "tool_result" => ItemKind::ToolResult,
+        "spawn" => ItemKind::Spawn,
+        "spawn_result" => ItemKind::SpawnResult,
+        "error" => ItemKind::Error,
+        _ => ItemKind::System,
+    }
+}
+
+pub(super) fn session_snapshot(threads: &[Thread]) -> Vec<SessionThread> {
+    threads
+        .iter()
+        .filter(|t| !t.id.starts_with("visit:"))
+        .map(|t| SessionThread {
+            id: t.id.clone(),
+            parent: t.parent.clone(),
+            task: t.task.clone(),
+            is_foreground: t.is_foreground,
+            completed_turns: t
+                .completed_turns
+                .iter()
+                .filter(|id| !id.starts_with("visit:"))
+                .cloned()
+                .collect(),
+            unread_turns: t.unread_turns.clone(),
+            metrics: t
+                .metrics
+                .iter()
+                .filter(|(id, _)| !id.starts_with("visit:"))
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
+            items: t
+                .items
+                .iter()
+                .skip(t.history_len)
+                .map(|i| SessionItem {
+                    attention: i.attention.clone(),
+                    work: i.work.clone(),
+                    kind: kind_str(&i.kind).to_string(),
+                    text: if i.kind == ItemKind::Reply {
+                        sanitize_reply_text(&i.text)
+                    } else {
+                        i.text.clone()
+                    },
+                    hidden: i.hidden,
+                    output: i.output.clone(),
+                    tool_id: i.tool_id.clone(),
+                    turn: i.turn.clone(),
+                    timestamp: i.timestamp,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+pub(super) fn restore_session(list: Vec<SessionThread>) -> Vec<Thread> {
+    let threads: Vec<Thread> = list
+        .into_iter()
+        .map(|t| {
+            let revision = t.items.len() as u64;
+            let mut completed_turns = t.completed_turns;
+            completed_turns.extend(t.metrics.iter().filter_map(|(turn, metrics)| {
+                metrics.completed_ms.is_some().then(|| turn.clone())
+            }));
+            Thread {
+                history_len: 0,
+                history_label: None,
+                session_started: now_seconds(),
+                hide_history: false,
+                id: t.id,
+                parent: t.parent,
+                task: t.task,
+                is_foreground: t.is_foreground,
+                collapsed: !t.is_foreground,
+                streaming: false,
+                last_activity: Instant::now(),
+                revision,
+                structure_revision: 1,
+                items: t
+                    .items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, i)| {
+                        let kind = kind_from_str(&i.kind);
+                        let hidden =
+                            i.hidden || kind == ItemKind::Tool || kind == ItemKind::ToolResult;
+                        let text = if kind == ItemKind::Reply {
+                            sanitize_reply_text(&i.text)
+                        } else {
+                            i.text
+                        };
+                        Item {
+                            attention: i.attention,
+                            work: i.work,
+                            kind,
+                            text,
+                            hidden,
+                            output: i.output,
+                            tool_id: i.tool_id,
+                            turn: i.turn,
+                            timestamp: i.timestamp,
+                            revision: index as u64 + 1,
+                        }
+                    })
+                    .collect(),
+                completed_turns,
+                unread_turns: t.unread_turns,
+                usage: HashMap::new(),
+                metrics: t.metrics,
+                metric_revisions: HashMap::new(),
+                activity: turn_activity::Activity::default(),
+                checklist: None,
+            }
+        })
+        .collect();
+    if threads.is_empty() {
+        vec![Thread::new_foreground()]
+    } else {
+        threads
+    }
+}
+
 pub(super) struct Visits {
     root: PathBuf,
     own: String,
     selected: Option<(String, u64)>,
     saved: Vec<(String, u64)>,
     pending: HashMap<String, u64>,
+    completed: BTreeSet<String>,
+}
+
+pub(super) struct Snapshot {
+    path: PathBuf,
+    list: Vec<SessionThread>,
+    pending: HashMap<String, u64>,
+    completed: BTreeSet<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Recovery {
+    version: u32,
+    pending: HashMap<String, u64>,
+    completed: BTreeSet<String>,
+}
+
+pub(super) struct PageRequest {
+    root: PathBuf,
+    own: String,
+    selected: Option<(String, u64)>,
+    older: bool,
+}
+
+pub(super) struct LoadedPage {
+    selected: (String, u64),
+    list: Vec<SessionThread>,
+    label: String,
+}
+
+impl Snapshot {
+    pub(super) fn save(&self) -> io::Result<()> {
+        write_snapshot_pending(
+            &self.path,
+            self.list.clone(),
+            &self.pending,
+            &self.completed,
+        )
+    }
 }
 
 impl Visits {
@@ -56,22 +272,35 @@ impl Visits {
             selected: None,
             saved: Vec::new(),
             pending: HashMap::new(),
+            completed: BTreeSet::new(),
         };
-        // An older, still-open TUI may have checkpointed after a newer visit
-        // closed. Inherit recovery state by checkpoint time, not open time.
-        let mut checkpoint = None;
+        // Visits are independent writers, not revisions of one global snapshot.
+        // Absence is not completion; explicit terminal evidence wins any merge.
         for entry in fs::read_dir(&visits.root)? {
             let entry = entry?;
             if entry.file_name().to_string_lossy().ends_with(".visit") {
-                let candidate = (entry.metadata()?.modified()?, entry.path());
-                if checkpoint.as_ref().is_none_or(|best| candidate > *best) {
-                    checkpoint = Some(candidate);
+                let recovery = read_recovery(&entry.path()).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot reconcile recovery in {}: {error}",
+                            entry.path().display()
+                        ),
+                    )
+                })?;
+                for (key, time) in recovery.pending {
+                    visits
+                        .pending
+                        .entry(key)
+                        .and_modify(|old| *old = (*old).min(time))
+                        .or_insert(time);
                 }
+                visits.completed.extend(recovery.completed);
             }
         }
-        if let Some((_, previous)) = checkpoint {
-            visits.pending = read_pending(&previous)?;
-        }
+        visits
+            .pending
+            .retain(|key, _| !visits.completed.contains(key));
         visits.save(&[Thread::new_foreground()])?;
         Ok(visits)
     }
@@ -87,10 +316,31 @@ impl Visits {
                 &self.root.join(&self.own),
                 session_snapshot(threads),
                 &self.pending,
+                &self.completed,
             )?;
             self.saved = revisions;
         }
         Ok(())
+    }
+
+    // `saved` is the capture watermark in async use. The service retains failed
+    // captures until committed or superseded by a complete newer snapshot.
+    pub(super) fn capture(&mut self, threads: &[Thread], force: bool) -> Option<Snapshot> {
+        let revisions: Vec<_> = threads
+            .iter()
+            .filter(|t| !t.id.starts_with("visit:"))
+            .map(|t| (t.id.clone(), t.revision))
+            .collect();
+        if !force && revisions == self.saved {
+            return None;
+        }
+        self.saved = revisions;
+        Some(Snapshot {
+            path: self.root.join(&self.own),
+            list: session_snapshot(threads),
+            pending: self.pending.clone(),
+            completed: self.completed.clone(),
+        })
     }
 
     pub(super) fn recovery(&self) -> Vec<(String, u64)> {
@@ -107,7 +357,7 @@ impl Visits {
         let key = conversation_turn(&event.metadata.conversation_id, turn);
         match event.event {
             InteractionEvent::UserTurnAccepted { .. } => {
-                if !self.pending.contains_key(&key) {
+                if !self.completed.contains(&key) && !self.pending.contains_key(&key) {
                     self.pending.insert(key, event.metadata.occurred_at_ms);
                     self.saved.clear();
                 }
@@ -118,40 +368,37 @@ impl Visits {
     }
 
     pub(super) fn recovered(&mut self, key: &str) {
-        if self.pending.remove(key).is_some() {
+        let removed = self.pending.remove(key).is_some();
+        // A completion may arrive in a visit that never saw its acceptance.
+        let completed = self.completed.insert(key.to_owned());
+        if removed || completed {
             self.saved.clear();
         }
     }
 
-    // Bounded memory directory-index traversal. No archive contents are opened
-    // here, and no ever-growing in-memory list of visit metadata is retained.
-    fn neighbor(&self, key: &str, older: bool) -> io::Result<Option<String>> {
-        let mut best: Option<String> = None;
-        for entry in fs::read_dir(&self.root)? {
-            let name = entry?.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".visit") || name == self.own || name.as_str() >= self.own.as_str() {
-                continue;
-            }
-            if (older && name.as_str() < key && best.as_ref().is_none_or(|b| name > *b))
-                || (!older && name.as_str() > key && best.as_ref().is_none_or(|b| name < *b))
-            {
-                best = Some(name);
-            }
+    pub(super) fn request(&self, latest: bool, older: bool) -> PageRequest {
+        PageRequest {
+            root: self.root.clone(),
+            own: self.own.clone(),
+            selected: if latest { None } else { self.selected.clone() },
+            older,
         }
-        Ok(best)
+    }
+
+    // Only the UI accepts a loaded page and advances the displayed cursor.
+    pub(super) fn install(&mut self, page: LoadedPage, threads: &mut Vec<Thread>) {
+        install_page(threads, page.list, &page.selected.0, page.label);
+        self.selected = Some(page.selected);
     }
 
     pub(super) fn latest(&mut self, threads: &mut Vec<Thread>) -> io::Result<()> {
-        let previous = self.selected.take();
-        match self.page(threads, true) {
-            Ok(true) => Ok(()),
-            result => {
-                self.selected = previous;
-                result.map(|_| ())
-            }
+        if let Some(page) = self.request(true, true).load()? {
+            self.install(page, threads);
         }
+        Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn toggle(&mut self, threads: &mut Vec<Thread>) -> io::Result<()> {
         toggle_history(threads);
         if foreground_thread(threads).is_some_and(|(_, thread)| !thread.hide_history) {
@@ -160,6 +407,9 @@ impl Visits {
         Ok(())
     }
 
+    // Synchronous reference policy for the existing archive navigation tests.
+    // Production navigation lives in services/history/loading.rs.
+    #[cfg(test)]
     pub(super) fn select(
         &mut self,
         threads: &mut Vec<Thread>,
@@ -211,7 +461,37 @@ impl Visits {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn page(&mut self, threads: &mut Vec<Thread>, older: bool) -> io::Result<bool> {
+        if let Some(page) = self.request(false, older).load()? {
+            self.install(page, threads);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+impl PageRequest {
+    // Bounded-memory directory traversal; the current visit is never a candidate.
+    fn neighbor(&self, key: &str, older: bool) -> io::Result<Option<String>> {
+        let mut best: Option<String> = None;
+        for entry in fs::read_dir(&self.root)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".visit") || name.as_str() >= self.own.as_str() {
+                continue;
+            }
+            if (older && name.as_str() < key && best.as_ref().is_none_or(|b| name > *b))
+                || (!older && name.as_str() > key && best.as_ref().is_none_or(|b| name < *b))
+            {
+                best = Some(name);
+            }
+        }
+        Ok(best)
+    }
+
+    pub(super) fn load(self) -> io::Result<Option<LoadedPage>> {
+        let older = self.older;
         let mut selected = self.selected.clone();
         loop {
             let (mut key, mut page) = selected.clone().unwrap_or((self.own.clone(), 0));
@@ -223,7 +503,7 @@ impl Visits {
             } else {
                 loop {
                     let Some(next) = self.neighbor(&key, older)? else {
-                        return Ok(false);
+                        return Ok(None);
                     };
                     key = next;
                     let count = page_count(&self.root.join(&key))?;
@@ -263,22 +543,40 @@ impl Visits {
                 }
             }
             let label = format!("Previous session {}", date_label(timestamp));
-            install_page(threads, list, &key, label);
-            self.selected = Some((key, page));
-            return Ok(true);
+            return Ok(Some(LoadedPage {
+                selected: (key, page),
+                list,
+                label,
+            }));
         }
     }
 }
 
 fn write_snapshot(path: &Path, list: Vec<SessionThread>) -> io::Result<()> {
-    write_snapshot_pending(path, list, &HashMap::new())
+    write_snapshot_pending(path, list, &HashMap::new(), &BTreeSet::new())
 }
 
 fn write_snapshot_pending(
     path: &Path,
     list: Vec<SessionThread>,
     pending: &HashMap<String, u64>,
+    completed: &BTreeSet<String>,
 ) -> io::Result<()> {
+    let mut recovery = Recovery {
+        version: 2,
+        pending: pending.clone(),
+        completed: completed.clone(),
+    };
+    recovery.completed.extend(
+        list.iter()
+            .filter(|t| t.is_foreground)
+            .flat_map(|t| &t.completed_turns)
+            .filter(|key| key.starts_with("conversation:"))
+            .cloned(),
+    );
+    recovery
+        .pending
+        .retain(|key, _| !recovery.completed.contains(key));
     // A page is bounded in conversation turns, not bytes: one large response or
     // trace still costs its actual size. Partition once per changed active save.
     let foreground = list.iter().find(|t| t.is_foreground);
@@ -387,7 +685,7 @@ fn write_snapshot_pending(
             file.write_all(b"\n")?;
         }
         offsets.push(file.stream_position()?);
-        serde_json::to_writer(&mut file, pending)?;
+        serde_json::to_writer(&mut file, &recovery)?;
         for offset in offsets {
             file.write_all(&offset.to_le_bytes())?;
         }
@@ -428,7 +726,12 @@ fn page_count(path: &Path) -> io::Result<u64> {
     index(&mut File::open(path)?).map(|(count, _)| count)
 }
 
+#[cfg(test)]
 fn read_pending(path: &Path) -> io::Result<HashMap<String, u64>> {
+    Ok(read_recovery(path)?.pending)
+}
+
+fn read_recovery(path: &Path) -> io::Result<Recovery> {
     let mut file = File::open(path)?;
     let (count, start) = index(&mut file)?;
     file.seek(SeekFrom::Start(start + count * 8))?;
@@ -439,12 +742,44 @@ fn read_pending(path: &Path) -> io::Result<HashMap<String, u64>> {
         return Err(io::Error::other("invalid continuation metadata offset"));
     }
     file.seek(SeekFrom::Start(offset))?;
-    Ok(serde_json::from_reader(file.take(start - offset))?)
+    let metadata: serde_json::Value = serde_json::from_reader((&mut file).take(start - offset))?;
+    if metadata.get("version").is_some() {
+        let recovery: Recovery = serde_json::from_value(metadata)?;
+        if recovery.version != 2 {
+            return Err(io::Error::other("unknown visit recovery metadata version"));
+        }
+        Ok(recovery)
+    } else {
+        let pending = serde_json::from_value(metadata)?;
+        let mut completed = BTreeSet::new();
+        // Legacy deletion has no tombstone. Read all pages through the same
+        // file handle as the metadata so an atomic replacement cannot mix revisions.
+        for page in 0..count {
+            for thread in read_page_file(&mut file, page)? {
+                if thread.is_foreground {
+                    completed.extend(
+                        thread
+                            .completed_turns
+                            .into_iter()
+                            .filter(|key| key.starts_with("conversation:")),
+                    );
+                }
+            }
+        }
+        Ok(Recovery {
+            version: 2,
+            pending,
+            completed,
+        })
+    }
 }
 
 fn read_page(path: &Path, page: u64) -> io::Result<Vec<SessionThread>> {
-    let mut file = File::open(path)?;
-    let (count, start) = index(&mut file)?;
+    read_page_file(&mut File::open(path)?, page)
+}
+
+fn read_page_file(file: &mut File, page: u64) -> io::Result<Vec<SessionThread>> {
+    let (count, start) = index(file)?;
     if page >= count {
         return Err(io::Error::other("visit page out of range"));
     }
@@ -480,6 +815,11 @@ fn install_page(threads: &mut Vec<Thread>, list: Vec<SessionThread>, key: &str, 
         let prefix = format!("visit:{key}:");
         let mut uncorrelated = 0;
         for item in &mut old.items {
+            if item.attention.is_some() {
+                // A notice is not the preceding uncorrelated user/model turn.
+                item.turn = None;
+                continue;
+            }
             if item.kind == ItemKind::User {
                 uncorrelated += 1;
             }
@@ -567,10 +907,10 @@ fn pending_continuations(threads: &[Thread]) -> Vec<(String, u64)> {
 
 pub(super) fn recover_continuations(
     pending: &[(String, u64)],
-    to_ui: &mpsc::Sender<TuiEvent>,
+    client: &mut Client,
+    publish: impl FnMut(tachyon_api::types::HistoryEntry) -> Result<(), String>,
 ) -> Result<(), String> {
     use tachyon_api::types::ApiRequest;
-    let mut client = Client::connect().map_err(|e| e.to_string())?;
     recover_pages(
         pending,
         now_seconds().saturating_add(1),
@@ -590,18 +930,14 @@ pub(super) fn recover_continuations(
             };
             Ok(entries)
         },
-        |entry| {
-            to_ui
-                .send(TuiEvent::Recovered(entry))
-                .map_err(|e| e.to_string())
-        },
+        publish,
     )
 }
 
 fn recover_pages(
     pending: &[(String, u64)],
     until: u64,
-    mut query: impl FnMut(u64, u64, u32) -> Result<Vec<tachyon_api::types::HistoryEntry>, String>,
+    query: impl FnMut(u64, u64, u32) -> Result<Vec<tachyon_api::types::HistoryEntry>, String>,
     mut publish: impl FnMut(tachyon_api::types::HistoryEntry) -> Result<(), String>,
 ) -> Result<(), String> {
     use tachyon_api::types::{HistoryKind, HistoryRole};
@@ -611,6 +947,25 @@ fn recover_pages(
         .min()
         .unwrap_or(now_seconds())
         .saturating_sub(60_000);
+    history_pages(since, until, query, |entry| {
+        if entry.kind == HistoryKind::Conversation && entry.role == HistoryRole::Assistant {
+            if let Some(turn) = entry.turn_id.as_deref() {
+                let key = conversation_turn(&entry.conversation_id, turn);
+                if pending.iter().any(|(wanted, _)| *wanted == key) {
+                    publish(entry)?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+pub(super) fn history_pages(
+    since: u64,
+    until: u64,
+    mut query: impl FnMut(u64, u64, u32) -> Result<Vec<tachyon_api::types::HistoryEntry>, String>,
+    mut publish: impl FnMut(tachyon_api::types::HistoryEntry) -> Result<(), String>,
+) -> Result<(), String> {
     let mut windows = vec![(since, until)];
     while let Some((since_ms, until_ms)) = windows.pop() {
         let limit = if until_ms.saturating_sub(since_ms) <= 1 {
@@ -629,16 +984,7 @@ fn recover_pages(
             continue;
         }
         for entry in entries {
-            if entry.kind != HistoryKind::Conversation || entry.role != HistoryRole::Assistant {
-                continue;
-            }
-            let Some(turn) = entry.turn_id.as_deref() else {
-                continue;
-            };
-            let key = conversation_turn(&entry.conversation_id, turn);
-            if pending.iter().any(|(wanted, _)| *wanted == key) {
-                publish(entry)?;
-            }
+            publish(entry)?;
         }
     }
     Ok(())
@@ -1141,10 +1487,94 @@ mod tests {
     }
 
     #[test]
+    fn older_page_preserves_worker_identity_and_persisted_evidence() {
+        let directory = Directory::new();
+        let path = directory.0.join("evidence.visit");
+        let mut saved = conversation(40);
+        let turn = saved[0].items[0].turn.clone();
+        saved[0].add_turn(
+            ItemKind::Spawn,
+            "worker stable-worker: archived task".into(),
+            turn.clone(),
+        );
+        let worker = find_or_create_thread(&mut saved, "stable-worker", false, None);
+        saved[worker].add_tool("read_file".into(), "call-old-page".into(), turn.clone());
+        saved[worker].items.last_mut().unwrap().work = Some(WorkDetail {
+            raw_open: false,
+            key: AssignmentKey {
+                work_id: "work-old-page".into(),
+                generation: 7,
+                assignment: 3,
+            },
+            slot: Some(0),
+            timing: None,
+            omitted: 0,
+            tool: Some(tachyon_api::types::WorkToolEvidence {
+                call_id: Some("call-old-page".into()),
+                parent_call_id: None,
+                tool_name: "read_file".into(),
+                arguments: serde_json::json!({"path": "proof.txt"}),
+                output: serde_json::json!({"text": "persisted proof", "is_error": false}),
+            }),
+        });
+        write_snapshot(&path, session_snapshot(&saved)).unwrap();
+        let mut threads = conversation(1);
+        let live = find_or_create_thread(&mut threads, "stable-worker", false, None);
+        threads[live].add_tool("live_only".into(), "call-old-page".into(), turn);
+        for page in [1, 0] {
+            install_page(
+                &mut threads,
+                read_page(&path, page).unwrap(),
+                "evidence",
+                "Previous session".into(),
+            );
+        }
+        let cells = build_turn_cells(&threads[0]);
+        let layout = turn_cell_layout(
+            0,
+            0,
+            &threads,
+            &cells[0],
+            100,
+            0,
+            false,
+            "",
+            true,
+            Some("stable-worker"),
+        );
+        let workers = layout
+            .hits
+            .iter()
+            .filter(|hit| matches!(hit, Some(ClickTarget::Worker(_, id)) if id == "stable-worker"))
+            .count();
+        assert_eq!(workers, 1);
+        assert!(layout
+            .lines
+            .iter()
+            .any(|line| line.to_string().contains("read_file")));
+        assert!(!layout
+            .lines
+            .iter()
+            .any(|line| line.to_string().contains("live_only")));
+        let evidence = threads
+            .iter()
+            .flat_map(|thread| &thread.items)
+            .find_map(|item| item.work.as_ref())
+            .unwrap();
+        assert_eq!(evidence.key.work_id, "work-old-page");
+        assert_eq!(evidence.key.generation, 7);
+        assert_eq!(evidence.key.assignment, 3);
+        assert_eq!(
+            evidence.tool.as_ref().unwrap().call_id.as_deref(),
+            Some("call-old-page")
+        );
+    }
+
+    #[test]
     fn two_turn_protocol_pending_checkpoint_and_paged_copy() {
         let directory = Directory::new();
         let mut first = Visits::open(&directory.0).unwrap();
-        let events = crate::tests::two_turn_fixture();
+        let events = crate::app::tests::two_turn_fixture();
         // Put the two fixture turns on opposite sides of a real archive page boundary.
         let mut threads = conversation(TURNS_PER_PAGE - 1);
         for (step, event) in events.iter().enumerate() {
@@ -1246,7 +1676,7 @@ mod tests {
     #[test]
     fn pending_history_publishes_independent_finals_without_foreground_events() {
         use tachyon_api::types::{HistoryEntry, HistoryKind, HistoryRole};
-        let events = crate::tests::two_turn_fixture();
+        let events = crate::app::tests::two_turn_fixture();
         let entries: Vec<_> = events
             .iter()
             .filter_map(|event| {
@@ -1254,6 +1684,7 @@ mod tests {
                     return None;
                 };
                 Some(HistoryEntry {
+                    attention: None,
                     event_id: event.metadata.message_id.clone(),
                     kind: HistoryKind::Conversation,
                     conversation_id: event.metadata.conversation_id.clone(),
@@ -1602,12 +2033,11 @@ mod tests {
     fn indexed_pages_bound_old_turns_and_reach_the_oldest_of_thousand_visits() {
         let directory = Directory::new();
         let visits = Visits::open(&directory.0).unwrap();
-        // An unreadable oldest archive proves startup does not deserialize it.
-        fs::write(
-            visits.root.join("00000000000000000000-broken.visit"),
-            b"bad",
-        )
-        .unwrap();
+        // An unreadable recovery index now fails closed, even in an old visit.
+        let broken = visits.root.join("00000000000000000000-broken.visit");
+        fs::write(&broken, b"bad").unwrap();
+        assert!(Visits::open(&directory.0).is_err());
+        fs::remove_file(broken).unwrap();
         let source = directory.0.join("source");
         write_snapshot(&source, session_snapshot(&conversation(100))).unwrap();
         assert_eq!(page_count(&source).unwrap(), 4);
@@ -1782,7 +2212,11 @@ mod tests {
         let directory = Directory::new();
         let mut first = Visits::open(&directory.0).unwrap();
         first.pending.insert(conversation_turn("test", "0"), 123);
-        first.save(&conversation(100)).unwrap();
+        let mut unfinished = conversation(100);
+        unfinished[0]
+            .completed_turns
+            .remove(&conversation_turn("test", "0"));
+        first.save(&unfinished).unwrap();
         let second = Visits::open(&directory.0).unwrap();
         assert_eq!(
             second.recovery(),
@@ -1799,11 +2233,170 @@ mod tests {
         assert!(fourth.recovery().is_empty());
     }
 
+    fn recovery_event(conversation: &str, finished: bool) -> InteractionEventEnvelope {
+        let mut metadata =
+            tachyon_api::InteractionMetadata::new("event", "correlation", conversation, 123);
+        metadata.turn_id = Some("7".into());
+        InteractionEventEnvelope {
+            metadata,
+            event: if finished {
+                InteractionEvent::ConversationFinished {
+                    text: "final".into(),
+                }
+            } else {
+                InteractionEvent::UserTurnAccepted {
+                    text: "question".into(),
+                }
+            },
+        }
+    }
+
+    #[test]
+    fn concurrent_stale_empty_checkpoint_cannot_hide_another_visits_pending_turn() {
+        let directory = Directory::new();
+        let mut a = Visits::open(&directory.0).unwrap();
+        let mut b = Visits::open(&directory.0).unwrap();
+        let blank = vec![Thread::new_foreground()];
+        let stale = b.capture(&blank, true).unwrap();
+        let accepted = recovery_event("concurrent", false);
+        a.observe(&accepted);
+        let mut threads = vec![Thread::new_foreground()];
+        threads[0].add_turn(
+            ItemKind::User,
+            "question".into(),
+            Some(conversation_turn("concurrent", "7")),
+        );
+        a.capture(&threads, false).unwrap().save().unwrap();
+        // A queued snapshot from B can commit after A, including with a newer mtime.
+        stale.save().unwrap();
+        File::open(b.root.join(&b.own))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(Visits::open(&directory.0).unwrap().recovery(), a.recovery());
+        assert_eq!(
+            Visits::open(&directory.0).unwrap().recovery(),
+            vec![(conversation_turn("concurrent", "7"), 123)]
+        );
+    }
+
+    #[test]
+    fn completion_without_local_acceptance_beats_later_stale_pending_and_replayed_acceptance() {
+        let directory = Directory::new();
+        let mut a = Visits::open(&directory.0).unwrap();
+        let mut b = Visits::open(&directory.0).unwrap();
+        let blank = vec![Thread::new_foreground()];
+        a.observe(&recovery_event("concurrent", false));
+        a.save(&blank).unwrap();
+        let stale = a.capture(&blank, true).unwrap();
+        // B never saw acceptance; its terminal record must still be durable on
+        // a metadata-only/zero-page checkpoint and survive subsequent opens.
+        b.observe(&recovery_event("concurrent", true));
+        b.capture(&blank, false).unwrap().save().unwrap();
+        assert_eq!(page_count(&b.root.join(&b.own)).unwrap(), 0);
+        stale.save().unwrap();
+        File::open(a.root.join(&a.own))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let mut reopened = Visits::open(&directory.0).unwrap();
+        assert!(reopened.recovery().is_empty());
+        reopened.observe(&recovery_event("concurrent", false));
+        assert!(reopened.recovery().is_empty());
+        reopened.observe(&recovery_event("different-conversation", false));
+        reopened.save(&blank).unwrap();
+        assert_eq!(
+            Visits::open(&directory.0).unwrap().recovery(),
+            vec![(conversation_turn("different-conversation", "7"), 123)]
+        );
+        // Even the stale visit can learn completion via recovered history.
+        a.recovered(&conversation_turn("concurrent", "7"));
+        a.save(&blank).unwrap();
+        assert!(read_pending(&a.root.join(&a.own)).unwrap().is_empty());
+    }
+
+    fn write_legacy_recovery(
+        path: &Path,
+        list: Vec<SessionThread>,
+        pending: &HashMap<String, u64>,
+    ) {
+        write_snapshot(path, list).unwrap();
+        let mut file = File::open(path).unwrap();
+        let (count, start) = index(&mut file).unwrap();
+        file.seek(SeekFrom::Start(start + count * 8)).unwrap();
+        let mut offset = [0; 8];
+        file.read_exact(&mut offset).unwrap();
+        let mut bytes = fs::read(path).unwrap();
+        let footer = bytes[start as usize..].to_vec();
+        bytes.truncate(u64::from_le_bytes(offset) as usize);
+        bytes.extend(serde_json::to_vec(pending).unwrap());
+        bytes.extend(footer);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn legacy_pending_maps_merge_with_correlated_foreground_completions_on_all_pages() {
+        let directory = Directory::new();
+        let root = directory.0.join("tui-visits");
+        fs::create_dir(&root).unwrap();
+        let completed = conversation_turn("test", "0");
+        let unresolved = conversation_turn("other", "0");
+        let pending = HashMap::from([(completed.clone(), 99), (unresolved.clone(), 123)]);
+        write_legacy_recovery(&root.join("01-pending.visit"), vec![], &pending);
+        let mut threads = conversation(40);
+        let worker = find_or_create_thread(&mut threads, "worker", false, None);
+        threads[worker].completed_turns.insert(unresolved.clone());
+        threads[worker].add_turn(
+            ItemKind::Reply,
+            "worker is not conversation final".into(),
+            Some(unresolved.clone()),
+        );
+        let final_path = root.join("02-final.visit");
+        write_legacy_recovery(&final_path, session_snapshot(&threads), &HashMap::new());
+        let original = fs::read(&final_path).unwrap();
+        // A final in page zero must be found even if navigation loads only the last page.
+        assert_eq!(page_count(&final_path).unwrap(), 2);
+        write_legacy_recovery(&root.join("03-stale.visit"), vec![], &pending);
+        let visits = Visits::open(&directory.0).unwrap();
+        assert_eq!(visits.recovery(), vec![(unresolved.clone(), 123)]);
+        assert!(visits.completed.contains(&completed));
+        assert!(!visits.completed.contains(&unresolved));
+        assert_eq!(fs::read(final_path).unwrap(), original);
+        let metadata = read_recovery(&visits.root.join(&visits.own)).unwrap();
+        assert_eq!(metadata.version, 2);
+        assert!(metadata.completed.contains(&completed));
+        assert_eq!(
+            Visits::open(&directory.0).unwrap().recovery(),
+            visits.recovery()
+        );
+    }
+
+    #[test]
+    fn legacy_recovery_corruption_fails_closed_without_writing_a_replacement_visit() {
+        let directory = Directory::new();
+        let root = directory.0.join("tui-visits");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("01-legacy.visit");
+        write_legacy_recovery(&path, session_snapshot(&conversation(40)), &HashMap::new());
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"!")
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        let error = Visits::open(&directory.0).err().unwrap();
+        assert!(error.to_string().contains("cannot reconcile recovery"));
+        assert_eq!(fs::read_dir(root).unwrap().count(), 1);
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
     #[test]
     fn typed_recovery_splits_full_pages_and_matches_conversation_not_turn_number() {
         use tachyon_api::types::{HistoryEntry, HistoryKind, HistoryRole};
         let entries: Vec<_> = (0..600)
             .map(|n| HistoryEntry {
+                attention: None,
                 event_id: format!("event-{n}"),
                 kind: HistoryKind::Conversation,
                 conversation_id: if n == 555 { "wanted" } else { "other" }.into(),

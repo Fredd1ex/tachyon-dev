@@ -67,6 +67,8 @@ struct Root {
     members: BTreeMap<String, Member>,
     messages: Vec<Message>,
     #[serde(default)]
+    cancellations: BTreeMap<String, (WorkAddress, u64)>,
+    #[serde(default)]
     deliveries: BTreeMap<String, Delivery>,
 }
 
@@ -97,6 +99,24 @@ fn save(tx: &WriteTransaction, campaign: &str, root: &Root) -> Result<(), String
         .insert(campaign, serde_json::to_vec(root).map_err(err)?.as_slice())
         .map_err(err)?;
     Ok(())
+}
+
+pub(super) fn accepted_revisions_in(
+    tx: &redb::ReadTransaction,
+    campaign: &str,
+) -> Result<BTreeMap<String, u64>, String> {
+    let table = tx.open_table(ROOTS).map_err(err)?;
+    let root: Root = table
+        .get(campaign)
+        .map_err(err)?
+        .map(|v| serde_json::from_slice(v.value()).map_err(err))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(root
+        .members
+        .into_iter()
+        .map(|(id, m)| (id, m.accepted_revision))
+        .collect())
 }
 
 fn related(root: &Root, actor: &str, target: &str) -> Result<(), String> {
@@ -164,6 +184,7 @@ pub(crate) enum ResultSelection {
 pub(crate) struct HostAgentControl<'a> {
     store: &'a RuntimeStore,
     actor: WorkAddress,
+    operator: bool,
 }
 
 impl RuntimeStore {
@@ -531,7 +552,33 @@ impl RuntimeStore {
         let tx = self.database.begin_write().map_err(err)?;
         let root = load(&tx, &actor.campaign_id)?;
         related(&root, &actor.work_id, &actor.work_id)?;
-        Ok(HostAgentControl { store: self, actor })
+        Ok(HostAgentControl {
+            store: self,
+            actor,
+            operator: false,
+        })
+    }
+
+    /// Same-user conversation service only, after validating the persisted link
+    /// and the launch's authoritative root enrollment. Never issued to workers.
+    pub(crate) fn conversation_agent_control(
+        &self,
+        actor: WorkAddress,
+    ) -> Result<HostAgentControl<'_>, String> {
+        let tx = self.database.begin_write().map_err(err)?;
+        let root = load(&tx, &actor.campaign_id)?;
+        if root
+            .members
+            .get(&actor.work_id)
+            .is_none_or(|m| m.parent.is_some())
+        {
+            return Err(err("authoritative root enrollment required"));
+        }
+        Ok(HostAgentControl {
+            store: self,
+            actor,
+            operator: true,
+        })
     }
 
     /// Host has stopped delivery at a safe boundary and applied these instructions
@@ -563,6 +610,73 @@ impl RuntimeStore {
 }
 
 impl HostAgentControl<'_> {
+    fn authorize(&self, root: &Root, target: &str) -> Result<(), String> {
+        if !self.operator {
+            return related(root, &self.actor.work_id, target);
+        }
+        let mut current = target;
+        for _ in 0..=MAX_WORK {
+            let member = root
+                .members
+                .get(current)
+                .ok_or_else(|| err("unknown target"))?;
+            if current == self.actor.work_id {
+                return Ok(());
+            }
+            current = member
+                .parent
+                .as_deref()
+                .ok_or_else(|| err("root scope denied"))?;
+        }
+        Err(err("work parent cycle"))
+    }
+
+    pub(crate) fn cancel(
+        &self,
+        target: &WorkAddress,
+        command_id: &str,
+        generation: u64,
+    ) -> Result<(), String> {
+        if !self.operator
+            || target.campaign_id != self.actor.campaign_id
+            || command_id.is_empty()
+            || command_id.len() > 256
+        {
+            return Err(err("operator cancellation denied"));
+        }
+        let tx = self.store.database.begin_write().map_err(err)?;
+        let mut root = load(&tx, &target.campaign_id)?;
+        self.authorize(&root, &target.work_id)?;
+        if root.messages.iter().any(|m| m.command_id == command_id) {
+            return Err(err("command ID payload conflict"));
+        }
+        if let Some(old) = root.cancellations.get(command_id) {
+            return if old == &(target.clone(), generation) {
+                Ok(())
+            } else {
+                Err(err("command ID payload conflict"))
+            };
+        }
+        if root.cancellations.len() >= MAX_COMMANDS {
+            return Err(err("command capacity full"));
+        }
+        let work = RuntimeStore::admitted_work_in(&tx, &target.work_id)?;
+        if work.admission.campaign_id != target.campaign_id
+            || work.admission.generation != generation
+        {
+            return Err(err("cancellation identity conflict"));
+        }
+        let mut ids =
+            RuntimeStore::agent_descendants_in(&tx, &target.campaign_id, &target.work_id)?;
+        ids.push(target.work_id.clone());
+        for id in ids {
+            RuntimeStore::cancel_work_in(&tx, &target.campaign_id, &id)?;
+        }
+        root.cancellations
+            .insert(command_id.into(), (target.clone(), generation));
+        save(&tx, &target.campaign_id, &root)?;
+        tx.commit().map_err(err)
+    }
     /// Current never falls back to historical evidence after steering.
     #[cfg(target_os = "linux")]
     pub(crate) fn result(
@@ -612,15 +726,39 @@ impl HostAgentControl<'_> {
         }
         let tx = self.store.database.begin_write().map_err(err)?;
         let mut root = load(&tx, &self.actor.campaign_id)?;
-        related(&root, &self.actor.work_id, &target.work_id)?;
-        if self.actor == *target {
+        self.authorize(&root, &target.work_id)?;
+        if self.actor == *target && !self.operator {
             return Err(err("self messaging denied"));
+        }
+        if root.cancellations.contains_key(command_id) {
+            return Err(err("command ID payload conflict"));
         }
         if let Some(old) = root.messages.iter().find(|m| m.command_id == command_id) {
             if old.sender != self.actor || old.recipient != *target || old.command != command {
                 return Err(err("command ID payload conflict"));
             }
             return Ok(old.clone());
+        }
+        if self.operator {
+            let work = RuntimeStore::admitted_work_in(&tx, &target.work_id)?;
+            if matches!(
+                work.state,
+                DispatchState::Cancelled | DispatchState::ConfirmedUnspent
+            ) || RuntimeStore::group_cancelled_in(&tx, &work)?
+            {
+                return Err(err("work is cancelled or terminal"));
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(row) = tx
+                .open_table(super::execution::EXECUTIONS)
+                .map_err(err)?
+                .get(target.work_id.as_str())
+                .map_err(err)?
+            {
+                if super::execution::decode_record(row.value(), &target.work_id)?.settled {
+                    return Err(err("work is terminal"));
+                }
+            }
         }
         if root.messages.len() >= MAX_COMMANDS
             || [&self.actor.work_id, &target.work_id]
@@ -634,7 +772,7 @@ impl HostAgentControl<'_> {
             expected_revision, ..
         } = &command
         {
-            if member.parent.as_deref() != Some(&self.actor.work_id) {
+            if !self.operator && member.parent.as_deref() != Some(&self.actor.work_id) {
                 return Err(err("only direct parent may steer"));
             }
             if *expected_revision != member.accepted_revision {
@@ -689,7 +827,7 @@ impl HostAgentControl<'_> {
         let tx = self.store.database.begin_write().map_err(err)?;
         let root = load(&tx, &self.actor.campaign_id)?;
         let mut ids = root.members.keys().filter(|id| {
-            after.is_none_or(|a| id.as_str() > a) && related(&root, &self.actor.work_id, id).is_ok()
+            after.is_none_or(|a| id.as_str() > a) && self.authorize(&root, id).is_ok()
         });
         let items: Vec<_> = ids
             .by_ref()
@@ -713,7 +851,7 @@ impl HostAgentControl<'_> {
         }
         let tx = self.store.database.begin_write().map_err(err)?;
         let root = load(&tx, &target.campaign_id)?;
-        related(&root, &self.actor.work_id, &target.work_id)?;
+        self.authorize(&root, &target.work_id)?;
         let member = &root.members[&target.work_id];
         let work = RuntimeStore::admitted_work_in(&tx, &target.work_id)?;
         #[cfg(target_os = "linux")]
@@ -952,6 +1090,103 @@ mod tests {
         ControlCommand::Send {
             text: "hello".into(),
         }
+    }
+
+    #[test]
+    fn conversation_operator_controls_exact_root_and_descendants_without_worker_escalation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.redb");
+        let store = RuntimeStore::open(&path).unwrap();
+        let c = campaign_with_depth(&store, "operator", 2);
+        for (id, parent) in [
+            ("root", None),
+            ("child", Some("root")),
+            ("leaf", Some("child")),
+            ("separate-root", None),
+        ] {
+            store
+                .host_admit_agent_work(admission(&c, id), parent.map(|p| address(&c, p)))
+                .unwrap();
+        }
+        let normal = store.host_agent_control(address(&c, "root")).unwrap();
+        let steer = ControlCommand::Steer {
+            expected_revision: 1,
+            instructions: "Keep the checked candidate".into(),
+        };
+        assert!(normal
+            .command(&address(&c, "root"), "self", steer.clone())
+            .is_err());
+        assert!(normal
+            .command(&address(&c, "leaf"), "deep", steer.clone())
+            .is_err());
+        assert!(store
+            .conversation_agent_control(address(&c, "child"))
+            .is_err());
+        let control = store
+            .conversation_agent_control(address(&c, "root"))
+            .unwrap();
+        let before = store.campaign_ledger(&c).unwrap();
+        for id in ["root", "leaf"] {
+            let receipt = control
+                .command(&address(&c, id), id, steer.clone())
+                .unwrap();
+            assert_eq!(receipt.accepted_revision, 2);
+            assert_eq!(
+                control
+                    .command(&address(&c, id), id, steer.clone())
+                    .unwrap(),
+                receipt
+            );
+            assert!(control
+                .command(&address(&c, id), &format!("stale-{id}"), steer.clone())
+                .is_err());
+            assert!(control
+                .command(
+                    &address(&c, id),
+                    id,
+                    ControlCommand::Steer {
+                        expected_revision: 2,
+                        instructions: "Keep the checked candidate".into()
+                    }
+                )
+                .is_err());
+            assert_eq!(
+                control
+                    .status(&address(&c, id))
+                    .unwrap()
+                    .acknowledged_revision,
+                1
+            );
+        }
+        assert_eq!(store.campaign_ledger(&c).unwrap(), before);
+        assert!(control.status(&address(&c, "separate-root")).is_err());
+        assert!(control
+            .command(&address(&c, "separate-root"), "foreign", steer)
+            .is_err());
+        assert!(control.cancel(&address(&c, "child"), "cancel", 2).is_err());
+        control.cancel(&address(&c, "child"), "cancel", 1).unwrap();
+        control.cancel(&address(&c, "child"), "cancel", 1).unwrap();
+        assert!(control.cancel(&address(&c, "leaf"), "cancel", 1).is_err());
+        assert!(control.cancel(&address(&c, "root"), "root", 1).is_err());
+        assert!(
+            store
+                .campaign_work_status(&c, "leaf")
+                .unwrap()
+                .cancellation_requested
+        );
+        assert!(
+            !store
+                .campaign_work_status(&c, "root")
+                .unwrap()
+                .cancellation_requested
+        );
+        drop(store);
+        let store = RuntimeStore::open(&path).unwrap();
+        store
+            .conversation_agent_control(address(&c, "root"))
+            .unwrap()
+            .cancel(&address(&c, "child"), "cancel", 1)
+            .unwrap();
     }
 
     #[test]

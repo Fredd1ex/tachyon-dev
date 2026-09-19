@@ -7,8 +7,8 @@ mod subscriptions;
 
 pub(super) use commands::encode_interaction_command;
 pub(super) use notifications::{
-    acknowledge_reminder_notification, emit_schedule_event, encode_reminder_notification,
-    encode_scheduled_task_notification, persist_interaction_history, project_pending_history,
-    work_attention_notification,
+    acknowledge_reminder_notification, deliver_attention, emit_schedule_event,
+    encode_reminder_notification, encode_scheduled_task_notification, persist_interaction_history,
+    project_pending_history,
 };
 pub(super) use subscriptions::{stream_agent, stream_work};

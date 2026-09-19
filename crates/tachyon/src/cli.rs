@@ -138,6 +138,18 @@ pub enum CampaignAction {
     Inspect {
         id: String,
     },
+    /// Read retained advisory assessments and attempt statuses; starts no model.
+    Assessments {
+        id: String,
+    },
+    /// Coalesce an explicit assessment request into an already enabled campaign.
+    Assess {
+        id: String,
+        #[arg(long)]
+        command_id: String,
+        #[arg(long, required = true)]
+        unisolated_development: bool,
+    },
     /// Read root file versions for host inputs and operator approval. Starts no models.
     IntegrationSnapshot {
         id: String,
@@ -250,6 +262,9 @@ pub struct StatusArgs {
 pub struct CatArgs {
     /// The agent id to inspect.
     pub id: String,
+    /// Read the retained terminal WorkResult. Requires a running daemon.
+    #[arg(long)]
+    pub result: bool,
 }
 
 #[derive(Args, Debug)]

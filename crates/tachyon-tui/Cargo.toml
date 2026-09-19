@@ -14,3 +14,7 @@ serde_json = "1"
 tachyon-api.workspace = true
 tachyon-client.workspace = true
 tachyon-util.workspace = true
+
+[dev-dependencies]
+nix = { workspace = true, features = ["term"] }
+tempfile.workspace = true

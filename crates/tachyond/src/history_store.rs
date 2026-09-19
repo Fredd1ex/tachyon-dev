@@ -27,6 +27,8 @@ struct ConversationRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct HistoryMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<tachyon_api::attention::AttentionFrameMetadata>,
     pub schema_version: u32,
     pub event_id: String,
     #[serde(default)]
@@ -112,6 +114,7 @@ impl HistoryStore {
 
     pub(crate) fn apply(&self, projection: &HistoryProjection) -> Result<bool, String> {
         let message = HistoryMessage {
+            attention: projection.attention.clone(),
             schema_version: SCHEMA_VERSION as u32,
             event_id: projection.event_id.clone(),
             kind: projection.kind,
@@ -223,6 +226,7 @@ impl HistoryStore {
             )?;
             let summary = interval_summary(&messages);
             self.apply(&HistoryProjection {
+                attention: None,
                 schema_version: SCHEMA_VERSION as u32,
                 event_id: format!(
                     "conversation-summary-{}-{:020}",
@@ -313,6 +317,7 @@ impl HistoryStore {
             let message: HistoryMessage = serde_json::from_slice(value.value())
                 .map_err(|error| format!("decode history message: {error}"))?;
             result.push(HistoryEntry {
+                attention: message.attention,
                 event_id: message.event_id,
                 kind: message.kind,
                 conversation_id: message.conversation_id,
@@ -384,6 +389,7 @@ impl HistoryStore {
             .into_iter()
             .take(limit)
             .map(|(_, message)| HistoryEntry {
+                attention: message.attention,
                 event_id: message.event_id,
                 kind: message.kind,
                 conversation_id: message.conversation_id,
@@ -456,6 +462,7 @@ mod tests {
 
     fn projection(event_id: &str, occurred_at_ms: u64, text: &str) -> HistoryProjection {
         HistoryProjection {
+            attention: None,
             schema_version: 1,
             event_id: event_id.into(),
             kind: HistoryKind::Conversation,

@@ -5,6 +5,8 @@ pub mod services;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Control {
+    WebSearch,
+    WebFetch,
     Templates,
     Resource,
     Todo,
@@ -30,6 +32,12 @@ pub enum Control {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    WebSearch {
+        command: crate::web::WebCommand,
+    },
+    WebFetch {
+        command: crate::web::WebCommand,
+    },
     Todo {
         request: services::TodoRequest,
     },
@@ -137,6 +145,8 @@ impl Proposal {
 impl Request {
     pub fn control(&self) -> Control {
         match self {
+            Self::WebSearch { .. } => Control::WebSearch,
+            Self::WebFetch { .. } => Control::WebFetch,
             Self::Todo { request } => match request.scope() {
                 services::Scope::CurrentWork => Control::Todo,
                 services::Scope::CurrentCampaign => Control::TodoCampaign,
@@ -164,6 +174,14 @@ impl Request {
         let id = |s: &str| !s.trim().is_empty() && s.len() <= 256;
         let text = |s: &str| !s.is_empty() && s.len() <= 4096;
         let valid = match self {
+            Self::WebSearch { command } => {
+                command.validate().is_ok()
+                    && matches!(command.request, crate::web::WebRequest::Search { .. })
+            }
+            Self::WebFetch { command } => {
+                command.validate().is_ok()
+                    && matches!(command.request, crate::web::WebRequest::Fetch { .. })
+            }
             Self::Todo {
                 request: services::TodoRequest::List { limit, .. },
             } => limit.is_none_or(|n| (1..=8).contains(&n)),
@@ -407,6 +425,18 @@ pub enum ResultPhase {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
+    WebError {
+        command: crate::web::WebCommand,
+        message: String,
+    },
+    WebSearch {
+        command: crate::web::WebCommand,
+        result: crate::web::WebResult,
+    },
+    WebFetch {
+        command: crate::web::WebCommand,
+        result: crate::web::WebResult,
+    },
     Todo {
         scope: crate::todo::TodoScope,
         result: Result<crate::todo::TodoResponse, crate::todo::TodoError>,

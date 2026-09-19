@@ -22,6 +22,12 @@ pub(super) async fn recall_for_turn(
     query: &str,
     include_history: bool,
 ) -> Result<(Vec<MemoryRecallItem>, bool), String> {
+    #[cfg(test)]
+    if let Ok(result) =
+        MEMORY_SERVICE.try_with(|service| service(conversation_id, turn, query, include_history))
+    {
+        return result;
+    }
     let conversation_id = conversation_id.to_string();
     let query = query.to_string();
     tokio::task::spawn_blocking(move || {
@@ -45,6 +51,104 @@ pub(super) async fn recall_for_turn(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static MEMORY_SERVICE: std::sync::Arc<dyn Fn(&str, u64, &str, bool) -> Result<(Vec<MemoryRecallItem>, bool), String> + Send + Sync>;
+    pub(super) static WEB_SERVICE: std::sync::Arc<dyn Fn(InteractionMetadata, tachyon_api::web::WebCommand) -> Result<tachyon_api::web::WebResult, String> + Send + Sync>;
+    pub(super) static TODO_SERVICE: std::sync::Arc<dyn Fn(tachyon_api::todo::TodoRequest) -> Result<tachyon_api::todo::TodoResponse, tachyon_api::todo::TodoError> + Send + Sync>;
+    pub(super) static CAMPAIGN_SERVICE: std::sync::Arc<dyn Fn(InteractionMetadata, tachyon_api::conversation_campaign::Request) -> Result<serde_json::Value, String> + Send + Sync>;
+}
+
+pub(super) async fn web_for_turn(
+    metadata: InteractionMetadata,
+    command: tachyon_api::web::WebCommand,
+) -> Result<tachyon_api::web::WebResult, String> {
+    // Capture the task-local override before crossing the blocking IPC boundary.
+    #[cfg(test)]
+    let service = WEB_SERVICE
+        .try_with(Clone::clone)
+        .expect("Web tests require a task-local typed service");
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        {
+            service(metadata, command)
+        }
+        #[cfg(not(test))]
+        {
+            let mut client = tachyon_client::Client::connect().map_err(|e| e.to_string())?;
+            client
+                .conversation_web(metadata, command)
+                .map_err(|e| e.to_string())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub(super) async fn campaign_for_turn(
+    origin: InteractionMetadata,
+    request: tachyon_api::conversation_campaign::Request,
+) -> Result<serde_json::Value, String> {
+    #[cfg(test)]
+    {
+        return CAMPAIGN_SERVICE
+            .try_with(|service| service(origin, request))
+            .expect("Campaign tests require a task-local typed service");
+    }
+    #[cfg(not(test))]
+    tokio::task::spawn_blocking(move || {
+        let mut client =
+            Connection::connect(&tachyon_util::daemon::socket_path()).map_err(|e| e.to_string())?;
+        match client
+            .exchange(&ApiRequest::ConversationCampaign { origin, request })
+            .map_err(|e| e.to_string())?
+        {
+            ApiResponse::ConversationCampaign { result } => result,
+            _ => Err("unexpected conversation campaign response".into()),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub(super) async fn todo_for_turn(
+    request: tachyon_api::todo::TodoRequest,
+) -> Result<tachyon_api::todo::TodoResponse, tachyon_api::todo::TodoError> {
+    #[cfg(not(test))]
+    use tachyon_api::todo::TodoError;
+    #[cfg(test)]
+    {
+        // Never let a test without an injected service reach the user's daemon.
+        return TODO_SERVICE
+            .try_with(|service| service(request))
+            .expect("Todo tests require a task-local typed service");
+    }
+    #[cfg(not(test))]
+    tokio::task::spawn_blocking(move || {
+        let mut client =
+            Connection::connect(&tachyon_util::daemon::socket_path()).map_err(|error| {
+                TodoError::Storage {
+                    message: error.to_string(),
+                }
+            })?;
+        match client
+            .exchange(&ApiRequest::Todo(request))
+            .map_err(|error| TodoError::Storage {
+                message: error.to_string(),
+            })? {
+            ApiResponse::Todo { response } => Ok(response),
+            ApiResponse::TodoError { error } => Err(error),
+            _ => Err(TodoError::Storage {
+                message: "unexpected todo response".into(),
+            }),
+        }
+    })
+    .await
+    .map_err(|error| TodoError::Storage {
+        message: error.to_string(),
+    })?
 }
 
 pub(super) async fn mutate_memory_for_turn(
@@ -217,7 +321,7 @@ fn delegation_correlation(
             origin_turn_id.as_deref().unwrap_or("task"),
             tool_call.id
         ),
-        origin_turn_id,
+        origin_turn_id: origin_turn_id.map(|turn| format!("conversation:{session_id}:{turn}")),
         parent_task_id: None,
         tool_call_id: (!tool_call.id.is_empty()).then(|| tool_call.id.clone()),
     }
@@ -281,7 +385,7 @@ pub(super) fn delegation_requests(
 
 /// Ask Tachyond to create a worker and wait for its terminal result.
 /// The worker's live output remains available to TUI subscribers by its ID.
-pub(super) fn spawn_via_daemon(request: ApiRequest) -> Result<String, String> {
+pub(super) fn spawn_via_daemon(request: ApiRequest) -> Result<tachyon_api::WorkResult, String> {
     let ApiRequest::BackgroundDelegate {
         task,
         logical_task_id: Some(work_id),
@@ -293,12 +397,12 @@ pub(super) fn spawn_via_daemon(request: ApiRequest) -> Result<String, String> {
     };
     let origin_turn = origin_turn_id
         .as_deref()
-        .and_then(|turn| turn.parse::<u64>().ok());
+        .and_then(|turn| turn.rsplit(':').next()?.parse::<u64>().ok());
     let socket = tachyon_util::daemon::socket_path();
     let mut client = Connection::connect(&socket).map_err(|e| e.to_string())?;
     let response = client.exchange(&request).map_err(|e| e.to_string())?;
-    let id = match response {
-        ApiResponse::Agent { info } => info.id,
+    let (id, created_secs) = match response {
+        ApiResponse::Agent { info } => (info.id, info.created_secs),
         ApiResponse::Error { message, .. } => return Err(message),
         other => return Err(format!("unexpected spawn response: {other:?}")),
     };
@@ -321,14 +425,26 @@ pub(super) fn spawn_via_daemon(request: ApiRequest) -> Result<String, String> {
                 data,
             } => {
                 if let Some(AgentEvent::WorkResult { result }) = decode_event(&data) {
-                    return match result.outcome {
-                        WorkOutcome::Completed { result, .. } => {
-                            println!("[worker:result] {id} {result}");
+                    eprintln!(
+                        "[work-evidence] {}",
+                        serde_json::json!({
+                            "stage": "terminal_to_foreground", "worker_id": id,
+                            "origin_turn_id": origin_turn_id, "work_id": result.work_id,
+                            "generation": result.generation, "assignment": result.assignment,
+                            "observed_invocations": result.evidence.observed_invocations,
+                            "retained_results": result.evidence.tools.len(), "omitted": result.evidence.omitted,
+                        })
+                    );
+                    return match &result.outcome {
+                        WorkOutcome::Completed { result: text, .. } => {
+                            println!("[worker:result] {id} {text}");
                             Ok(result)
                         }
-                        WorkOutcome::TimedOut { .. } => {
-                            Err(format!("worker {id} timed out waiting for a result"))
-                        }
+                        WorkOutcome::TimedOut { deadline_ms } => Err(timeout_limitation(
+                            &result,
+                            (created_secs > 0)
+                                .then(|| (deadline_ms / 1000).saturating_sub(created_secs)),
+                        )),
                         WorkOutcome::Failed { message } => Err(format!("worker {id}: {message}")),
                         WorkOutcome::Blocked { reason } => {
                             Err(format!("worker {id} blocked: {reason}"))
@@ -347,6 +463,59 @@ pub(super) fn spawn_via_daemon(request: ApiRequest) -> Result<String, String> {
             }
             ApiResponse::Error { message, .. } => return Err(message),
             _ => {}
+        }
+    }
+}
+
+fn timeout_limitation(result: &tachyon_api::WorkResult, elapsed_secs: Option<u64>) -> String {
+    let count = match result.evidence.observed_invocations {
+        Some(count) => format!(" The worker reported {count} tool invocations."),
+        None => " The total invocation count is unknown.".into(),
+    };
+    let limit = elapsed_secs.filter(|seconds| *seconds > 0).map_or_else(
+        || "The lookup exceeded its time limit.".to_string(),
+        |seconds| format!("The lookup exceeded {seconds} seconds."),
+    );
+    format!(
+        "{limit} No verified result was available.{count} Partial observations do not establish the answer or the cause of the timeout; provider timing may be unknown."
+    )
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn timeout_reports_a_limitation_without_internal_diagnostics_or_a_verdict() {
+        let mut result: tachyon_api::WorkResult = serde_json::from_value(serde_json::json!({
+            "work_id": "private-work", "objective": "lookup", "generation": 4, "assignment": 7,
+            "outcome": "timed_out", "deadline_ms": 100,
+            "evidence": {"tools": [], "omitted": 0}
+        }))
+        .unwrap();
+        let text = timeout_limitation(&result, None);
+        assert!(text.contains("time limit"));
+        assert!(text.contains("unknown"));
+        assert!(!text.contains("browser operations failed"));
+        assert!(!text.contains("private-work"));
+        assert!(!text.contains("work-evidence"));
+        result.evidence.tools.push(tachyon_api::WorkToolEvidence {
+            call_id: None,
+            parent_call_id: None,
+            tool_name: "agent_browser".into(),
+            arguments: serde_json::Value::Null,
+            output: serde_json::json!({"is_error": true, "content": "private diagnostic"}),
+        });
+        let text = timeout_limitation(&result, Some(120));
+        assert!(text.starts_with("The lookup exceeded 120 seconds."));
+        assert!(!text.contains("browser operations failed"));
+        assert!(!text.contains("private diagnostic"));
+        assert!(text.contains("do not establish the answer"));
+        for count in [0, 28] {
+            result.evidence.observed_invocations = Some(count);
+            let text = timeout_limitation(&result, None);
+            assert!(text.contains(&format!("reported {count} tool invocations")));
+            assert!(!text.contains("invocation count is unknown"));
         }
     }
 }

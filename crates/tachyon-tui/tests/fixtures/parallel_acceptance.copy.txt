@@ -1,0 +1,72 @@
+User:
+Investigate benchmark; this campaign is already host-authorized.
+
+Assistant:
+Command verification passed; candidate 42 and its evidence are retained.
+
+---
+
+User:
+What is WorkerState?
+
+Assistant:
+WorkerState describes the worker lifecycle.
+
+---
+
+User:
+Remind me at 3 PM to review the benchmark.
+
+Assistant:
+Scheduled.
+
+---
+
+User:
+Update my review plan.
+
+Assistant:
+pending
+
+---
+
+User:
+Update my review plan.
+
+Assistant:
+in_progress
+
+---
+
+User:
+Update my review plan.
+
+Assistant:
+blocked
+
+---
+
+User:
+Update my review plan.
+
+Assistant:
+completed
+
+---
+
+Assistant:
+Campaign campaign-fixture advisory (unverified background assessment, revision 2): A candidate is ready; independent verification is still required
+Sources: finding:benchmark-candidate:fixture-hash
+
+---
+
+Assistant:
+Work needs your input (1 item). Review attention for details.
+
+---
+
+User:
+Stop the speculative branch; retain this candidate and complete verification. Cancel the unrelated queued branch.
+
+Assistant:
+Steering applied; the unrelated queued branch is cancelled.

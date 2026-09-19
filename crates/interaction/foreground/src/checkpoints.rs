@@ -1,5 +1,7 @@
 //! Conversation checkpoint wire format and ordered background writer.
 
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use tachyon_model::ChatMessage;
 
@@ -10,6 +12,8 @@ use super::{
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct ConversationCheckpoint {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) assessments: Vec<tachyon_api::campaign_oversight::PublishedCampaignAssessment>,
     pub(super) messages: Vec<ChatMessage>,
     #[serde(default)]
     pub(super) evidence: Vec<EvidenceRecord>,
@@ -31,6 +35,7 @@ pub(super) fn load_checkpoint(path: &std::path::Path) -> Option<ConversationChec
 
 pub(super) fn checkpoint_snapshot(conversation: &ConversationState) -> ConversationCheckpoint {
     ConversationCheckpoint {
+        assessments: conversation.assessments.clone(),
         messages: conversation.messages.clone(),
         evidence: conversation.evidence.clone(),
         next_commit: conversation.next_commit,
@@ -58,7 +63,19 @@ fn write_checkpoint(path: &std::path::Path, checkpoint: &ConversationCheckpoint)
         let _ = std::fs::create_dir_all(parent);
     }
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, data).is_ok() {
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        // Also restrict a temporary file left by an older writer.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(&data)?;
+        file.sync_all()
+    })();
+    if written.is_ok() {
         let _ = std::fs::rename(tmp, path);
     }
 }
@@ -80,6 +97,7 @@ mod tests {
     #[test]
     fn checkpoint_wire_bytes_and_legacy_defaults_are_stable() {
         let checkpoint = ConversationCheckpoint {
+            assessments: vec![],
             messages: vec![ChatMessage::new(Role::User, "first\nsecond")],
             evidence: Vec::new(),
             next_commit: 7,
@@ -103,6 +121,7 @@ mod tests {
             std::process::id()
         ));
         let conversation = ConversationState {
+            assessments: vec![],
             messages: vec![
                 ChatMessage::new(Role::System, "system"),
                 ChatMessage::new(Role::User, "remember this"),
@@ -117,6 +136,10 @@ mod tests {
         assert_eq!(restored.next_commit, 3);
         assert_eq!(restored.messages.len(), 2);
         assert_eq!(restored.messages[1].plain(), "remember this");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = std::fs::remove_file(path);
     }
 }

@@ -82,4 +82,34 @@ impl Connection {
     pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> io::Result<()> {
         self.stream.set_read_timeout(dur)
     }
+
+    /// Clone only for cancellation via `shutdown`; do not read/write this handle.
+    pub fn shutdown_handle(&self) -> io::Result<std::os::unix::net::UnixStream> {
+        self.stream.try_clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{net::Shutdown, os::unix::net::UnixStream, sync::mpsc, time::Duration};
+
+    #[test]
+    fn shutdown_handle_interrupts_a_partial_response_without_read_timeout() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            stream,
+        };
+        let shutdown = connection.shutdown_handle().unwrap();
+        peer.write_all(b"{\"event\":").unwrap();
+        let (done, completed) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            done.send(connection.recv().is_err()).unwrap();
+        });
+        assert!(completed.recv_timeout(Duration::from_millis(30)).is_err());
+        shutdown.shutdown(Shutdown::Both).unwrap();
+        assert!(completed.recv_timeout(Duration::from_secs(2)).unwrap());
+        reader.join().unwrap();
+    }
 }

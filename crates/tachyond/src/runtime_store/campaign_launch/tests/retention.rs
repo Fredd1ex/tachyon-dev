@@ -126,6 +126,7 @@ fn retention_refuses_live_and_last_known_active_campaigns() {
     service.active.lock().unwrap().insert(
         m.campaign_id.clone(),
         Active {
+            oversight: false,
             id: m.campaign_id.clone(),
             cancel: watch::channel(false).0,
             task: std::thread::spawn(move || {

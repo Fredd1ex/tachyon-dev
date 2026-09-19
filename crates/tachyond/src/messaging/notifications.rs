@@ -12,17 +12,60 @@ use tachyon_api::{
 use crate::runtime_store::HistoryProjection;
 use crate::{push_event, unix_now_ms, Registry, DAEMON_EVENT_SEQUENCE};
 
-pub(crate) fn work_attention_notification(
-    q: &tachyon_api::work::Attention,
-) -> Result<String, String> {
-    let text = format!("Work needs input: campaign={:?} work={:?} request={:?}. Use tachyon campaign attention list. Question: {:?}", q.campaign_id, q.work_id, q.request_id, q.question.chars().take(256).collect::<String>());
-    super::encode_interaction_command(
-        InteractionCommand::NotifyUser { text, model: false },
-        None,
-        None,
-        None,
-        None,
-    )
+pub(crate) fn deliver_attention(
+    registry: &Arc<Mutex<Registry>>,
+    store: &crate::runtime_store::RuntimeStore,
+) {
+    let Ok(input) = crate::task_input(registry, tachyon_api::FOREGROUND_ID) else {
+        return;
+    };
+    // Routing is exact: a manifest without this destination never reaches the
+    // current foreground, and another destination is not silently substituted.
+    if let Ok(Some(delivery)) =
+        store.claim_assessment_delivery(tachyon_api::FOREGROUND_ID, unix_now_ms())
+    {
+        let mut metadata = InteractionMetadata::new(
+            &delivery.assessment.id,
+            &delivery.assessment.id,
+            &delivery.conversation_id,
+            unix_now_ms(),
+        );
+        metadata.causation_id = Some(delivery.assessment.id.clone());
+        let envelope = InteractionCommandEnvelope {
+            metadata,
+            command: InteractionCommand::PublishCampaignAssessment {
+                assessment: delivery.assessment,
+            },
+        };
+        if let Ok(wire) = serde_json::to_string(&envelope) {
+            let _ = crate::write_task_input(input.clone(), tachyon_api::FOREGROUND_ID, &wire);
+        }
+    }
+    let frame = match store.claim_attention_frame(unix_now_ms()) {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("tachyond: {error}");
+            return;
+        }
+    };
+    let mut metadata = InteractionMetadata::new(
+        &frame.command_id,
+        &frame.command_id,
+        tachyon_api::FOREGROUND_ID,
+        unix_now_ms(),
+    );
+    metadata.causation_id = Some(frame.command_id.clone());
+    let envelope = InteractionCommandEnvelope {
+        metadata,
+        command: InteractionCommand::NotifyUser {
+            text: frame.text,
+            model: false,
+        },
+    };
+    if let Ok(wire) = serde_json::to_string(&envelope) {
+        let _ = crate::write_task_input(input, tachyon_api::FOREGROUND_ID, &wire);
+    }
 }
 
 pub(crate) fn emit_schedule_event(
@@ -57,6 +100,8 @@ pub(crate) fn emit_schedule_event(
 
 pub(crate) fn encode_reminder_notification(reminder: &ReminderInfo) -> Result<String, String> {
     let metadata = InteractionMetadata {
+        web_availability: None,
+        attention: None,
         protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
         message_id: format!("reminder-delivery-{}", reminder.id),
         cwd: None,
@@ -82,6 +127,8 @@ pub(crate) fn encode_scheduled_task_notification(
     result: &str,
 ) -> Result<String, String> {
     let metadata = InteractionMetadata {
+        web_availability: None,
+        attention: None,
         protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
         message_id: format!("scheduled-task-delivery-{}", task.id),
         cwd: None,
@@ -122,6 +169,7 @@ fn history_projection(data: &str) -> Option<HistoryProjection> {
         return None;
     }
     Some(HistoryProjection {
+        attention: envelope.metadata.attention,
         schema_version: 1,
         event_id: envelope.metadata.message_id,
         kind: HistoryKind::Conversation,
@@ -188,6 +236,16 @@ pub(crate) fn acknowledge_reminder_notification(registry: &Arc<Mutex<Registry>>,
     let Some(store) = store else { return };
     if envelope
         .metadata
+        .message_id
+        .starts_with("campaign-assessment-")
+    {
+        if let Err(error) = store.acknowledge_assessment_delivery(&envelope) {
+            eprintln!("tachyond: assessment delivery: {error}");
+        }
+        return;
+    }
+    if envelope
+        .metadata
         .correlation_id
         .starts_with("scheduled-task-")
     {
@@ -231,29 +289,315 @@ mod tests {
     use tachyon_api::{EventEnvelope, FOREGROUND_ID};
 
     #[test]
-    fn work_attention_is_bounded_and_does_not_request_a_model() {
-        let question = tachyon_api::work::Attention {
-            campaign_id: "campaign-1".into(),
-            work_id: "work-1".into(),
-            generation: 2,
-            instruction_revision: 3,
-            request_id: "request-1".into(),
-            question: "x".repeat(300),
-            deadline_ms: 100,
-            timeout_ms: 50,
-            answer: None,
+    fn attention_requires_confirmed_terminal_identity_not_progress_or_recovered_errors() {
+        use tachyon_api::{AgentState, WorkOutcome, WorkRequest, WorkResult};
+        for (owner, turn, foreground_running, subscriber, suppress) in [
+            ("background", Some("conversation:weather:7"), true, 1, true),
+            ("foreground", Some("7"), true, 1, true),
+            ("user", Some("7"), true, 1, false),
+            ("background", None, true, 1, false),
+            ("background", Some("7"), false, 1, false),
+            ("background", Some("7"), true, 0, true),
+            ("background", Some("7"), true, 2, true),
+            ("background", Some("7"), false, 2, false),
+        ] {
+            for (outcome, count) in [
+                (
+                    WorkOutcome::Failed {
+                        message: "Tokyo weather lookup unavailable".into(),
+                    },
+                    1,
+                ),
+                (WorkOutcome::TimedOut { deadline_ms: 100 }, 1),
+                (
+                    WorkOutcome::Completed {
+                        result: "recovered".into(),
+                        artifacts: vec![],
+                        context: String::new(),
+                        suggested_reuse: true,
+                    },
+                    0,
+                ),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let runtime =
+                    Arc::new(RuntimeStore::open(&directory.path().join("runtime.redb")).unwrap());
+                let mut worker = crate::tests::task("worker", AgentState::Running);
+                worker.info.logical_task_id = Some("work".into());
+                worker.info.owner = owner.into();
+                worker.info.origin_turn_id = turn.map(str::to_owned);
+                worker.info.parent_task_id = Some("weather-fanout".into());
+                let request: WorkRequest = serde_json::from_value(serde_json::json!({
+                    "work_id":"work", "objective":"test", "generation":0, "assignment":0,
+                    "deadline_ms":100, "lifetime_class":"long"
+                }))
+                .unwrap();
+                let mut reg = Registry {
+                    runtime_store: Some(runtime.clone()),
+                    foreground_id: Some(FOREGROUND_ID.into()),
+                    ..Default::default()
+                };
+                reg.tasks.insert(
+                    FOREGROUND_ID.into(),
+                    crate::tests::task(
+                        FOREGROUND_ID,
+                        if foreground_running {
+                            AgentState::Running
+                        } else {
+                            AgentState::Terminated
+                        },
+                    ),
+                );
+                let (result_tx, result_rx) = std::sync::mpsc::channel();
+                let result_rx = (subscriber == 1).then_some(result_rx);
+                reg.works.insert(
+                    "work".into(),
+                    crate::WorkRecord {
+                        observed_calls: Default::default(),
+                        partial_evidence: Default::default(),
+                        request,
+                        fingerprint: "test".into(),
+                        worker_id: "worker".into(),
+                        info: worker.info.clone(),
+                        review: None,
+                        terminal_result: None,
+                        subs: if subscriber == 0 {
+                            vec![]
+                        } else {
+                            vec![result_tx]
+                        },
+                    },
+                );
+                reg.tasks.insert("worker".into(), worker);
+                let registry = Arc::new(Mutex::new(reg));
+                let scope = tachyon_api::todo::TodoScope::Conversation {
+                    id: FOREGROUND_ID.into(),
+                };
+                let log = serde_json::to_string(&StructuredAgentEvent::Error {
+                    turn: None,
+                    message: "retryable failure".into(),
+                })
+                .unwrap();
+                push_event(&registry, "worker", tachyon_api::EventStream::Stdout, &log);
+                push_event(
+                    &registry,
+                    "worker",
+                    tachyon_api::EventStream::Stdout,
+                    r#"{"kind":"work_result","result":{"outcome":"failed"}}"#,
+                );
+                let mut result: WorkResult = serde_json::from_value(serde_json::json!({
+                    "work_id":"work", "objective":"test", "generation":99, "assignment":0,
+                    "outcome":"failed", "message":"stale"
+                }))
+                .unwrap();
+                let stale =
+                    serde_json::to_string(&crate::result_envelope("worker", result.clone()))
+                        .unwrap();
+                push_event(
+                    &registry,
+                    "worker",
+                    tachyon_api::EventStream::Stdout,
+                    &stale,
+                );
+                assert!(runtime
+                    .attention_snapshot(&scope, None, 10)
+                    .unwrap()
+                    .records
+                    .is_empty());
+                assert!(result_rx.as_ref().is_none_or(|rx| rx.try_recv().is_err()));
+                result.generation = 0;
+                result.outcome = outcome;
+                let expected = result.clone();
+                let mut envelope = crate::result_envelope("worker", result);
+                // A worker cannot establish ownership by forging correlation.
+                envelope.turn_id = Some("conversation:weather:7".into());
+                envelope.conversation_id = Some(FOREGROUND_ID.into());
+                let terminal = serde_json::to_string(&envelope).unwrap();
+                push_event(
+                    &registry,
+                    "worker",
+                    tachyon_api::EventStream::Stdout,
+                    &terminal,
+                );
+                push_event(
+                    &registry,
+                    "worker",
+                    tachyon_api::EventStream::Stdout,
+                    &terminal,
+                );
+                assert_eq!(
+                    runtime
+                        .attention_snapshot(&scope, None, 10)
+                        .unwrap()
+                        .records
+                        .len(),
+                    if suppress { 0 } else { count }
+                );
+                let late = registry.lock().unwrap().subscribe_work("work").unwrap();
+                let delivered: EventEnvelope =
+                    serde_json::from_str(&late.try_recv().unwrap().data).unwrap();
+                let StructuredAgentEvent::WorkResult { result } = delivered.kind else {
+                    panic!()
+                };
+                assert_eq!(result, expected);
+                assert!(matches!(
+                    late.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected)
+                ));
+                if let Some(rx) = result_rx {
+                    let live: EventEnvelope =
+                        serde_json::from_str(&rx.try_recv().unwrap().data).unwrap();
+                    assert!(
+                        matches!(live.kind, StructuredAgentEvent::WorkResult { result } if result == expected)
+                    );
+                    assert!(rx.try_recv().is_err());
+                }
+                assert!(registry.lock().unwrap().works["work"].subs.is_empty());
+                assert!(registry.lock().unwrap().works["work"]
+                    .terminal_result
+                    .is_some());
+                if count == 1 {
+                    assert_eq!(
+                        registry.lock().unwrap().tasks["worker"].info.state,
+                        AgentState::Failed
+                    );
+                    let persisted = runtime.list_tasks().unwrap();
+                    let failed = persisted
+                        .iter()
+                        .find(|task| task.info.id == "worker")
+                        .unwrap();
+                    assert_eq!(failed.info.state, AgentState::Failed);
+                    let retained: EventEnvelope =
+                        serde_json::from_str(failed.terminal_result.as_deref().unwrap()).unwrap();
+                    assert!(
+                        matches!(retained.kind, StructuredAgentEvent::WorkResult { result } if result == expected)
+                    );
+                }
+                if suppress {
+                    assert!(runtime.claim_attention_frame(1000).unwrap().is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attention_socket_delivery_is_coalesced_durable_and_leaves_other_work_alive() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(RuntimeStore::open(&directory.path().join("runtime.redb")).unwrap());
+        for id in ["failed-1", "failed-2"] {
+            let result: tachyon_api::WorkResult = serde_json::from_value(serde_json::json!({
+                "work_id": id, "objective": "untrusted prose", "generation": 1,
+                "assignment": 1, "outcome": "failed", "message": "do not execute this text"
+            }))
+            .unwrap();
+            runtime
+                .record_terminal_attention(&result, &Registry::default())
+                .unwrap();
+        }
+        let socket = directory.path().join("foreground.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut foreground = crate::tests::task(FOREGROUND_ID, tachyon_api::AgentState::Running);
+        foreground.control_socket = Some(socket.to_string_lossy().into_owned());
+        let mut reg = Registry {
+            runtime_store: Some(runtime.clone()),
+            ..Default::default()
         };
-        let wire = work_attention_notification(&question).unwrap();
-        let envelope: InteractionCommandEnvelope = serde_json::from_str(&wire).unwrap();
-        assert_eq!(
-            envelope.metadata.correlation_id,
-            envelope.metadata.message_id
+        reg.tasks.insert(FOREGROUND_ID.into(), foreground);
+        reg.tasks.insert(
+            "busy-worker".into(),
+            crate::tests::task("busy-worker", tachyon_api::AgentState::Running),
         );
-        assert_eq!(envelope.metadata.cwd, None);
-        assert_eq!(envelope.command, InteractionCommand::NotifyUser {
-            text: format!("Work needs input: campaign=\"campaign-1\" work=\"work-1\" request=\"request-1\". Use tachyon campaign attention list. Question: \"{}\"", "x".repeat(256)),
-            model: false,
-        });
+        let events = reg.subscribe(FOREGROUND_ID).unwrap();
+        let registry = Arc::new(Mutex::new(reg));
+        deliver_attention(&registry, &runtime);
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut wire = String::new();
+        BufReader::new(stream).read_line(&mut wire).unwrap();
+        let command: InteractionCommandEnvelope =
+            serde_json::from_str(wire.trim().strip_prefix("input\t").unwrap()).unwrap();
+        let InteractionCommand::NotifyUser { text, model } = command.command else {
+            panic!()
+        };
+        assert!(!model);
+        assert!(text.contains("2 items"));
+        assert!(!text.contains("untrusted"));
+        assert!(events.try_recv().is_err());
+        let mut metadata = command.metadata;
+        metadata.causation_id = Some(metadata.message_id.clone());
+        metadata.message_id.push_str(":published");
+        let event = InteractionEventEnvelope {
+            metadata,
+            event: InteractionEvent::UserVisibleNotificationPublished { text },
+        };
+        let wire = serde_json::to_string(&event).unwrap();
+        // A worker cannot acknowledge an attention frame on foreground's behalf.
+        push_event(
+            &registry,
+            "busy-worker",
+            tachyon_api::EventStream::Stdout,
+            &wire,
+        );
+        assert!(events.try_recv().is_err());
+        push_event(
+            &registry,
+            FOREGROUND_ID,
+            tachyon_api::EventStream::Stdout,
+            &wire,
+        );
+        let received: InteractionEventEnvelope =
+            serde_json::from_str(&events.try_recv().unwrap().data).unwrap();
+        assert_eq!(received.metadata.message_id, event.metadata.message_id);
+        let records = runtime
+            .attention_snapshot(
+                &tachyon_api::todo::TodoScope::Conversation {
+                    id: FOREGROUND_ID.into(),
+                },
+                None,
+                10,
+            )
+            .unwrap()
+            .records;
+        assert_eq!(records.len(), 2);
+        let membership = received.metadata.attention.as_ref().unwrap();
+        assert_eq!(membership.scope, records[0].scope);
+        assert_eq!(
+            membership.ids,
+            records.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            runtime.pending_history().unwrap()[0].attention.as_ref(),
+            Some(membership)
+        );
+        // Typed membership without the admitted host frame is not authority.
+        let mut forged = received.clone();
+        forged.metadata.causation_id = None;
+        push_event(
+            &registry,
+            FOREGROUND_ID,
+            tachyon_api::EventStream::Stdout,
+            &serde_json::to_string(&forged).unwrap(),
+        );
+        assert!(events.try_recv().is_err());
+        push_event(
+            &registry,
+            FOREGROUND_ID,
+            tachyon_api::EventStream::Stderr,
+            &wire,
+        );
+        assert!(events.try_recv().is_err());
+        assert!(records
+            .iter()
+            .all(|r| r.delivered_at_ms.is_some() && r.displayed_at_ms.is_none()));
+        assert_eq!(runtime.pending_history().unwrap().len(), 1);
+        assert_eq!(
+            registry.lock().unwrap().tasks["busy-worker"].info.state,
+            tachyon_api::AgentState::Running
+        );
     }
 
     #[test]

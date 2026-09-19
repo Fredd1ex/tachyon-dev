@@ -15,6 +15,7 @@ mod cpu_jobs;
 mod service_tests;
 #[cfg(target_os = "linux")]
 mod subprocess;
+mod web;
 mod work;
 
 const DISPATCHES: TableDefinition<&str, &[u8]> = TableDefinition::new("campaign_model_dispatches");
@@ -57,6 +58,7 @@ impl Drop for PermitLease {
 
 #[derive(Default)]
 pub(in crate::runtime_store) struct PermitState {
+    pub(super) services: super::services::ServiceState,
     grants: HashMap<uuid::Uuid, Grant>,
     current: HashMap<String, uuid::Uuid>,
     #[cfg(test)]
@@ -83,12 +85,16 @@ pub(crate) struct PermitAccounting<'a> {
 /// Host-owned inference service. Neither the model (and its credentials) nor the
 /// store is exposed to a worker. This is not an authenticated transport.
 pub(crate) struct ModelBroker {
+    web: Option<(
+        tachyon_api::campaign::CampaignWeb,
+        tachyon_util::config::WebPolicy,
+    )>,
     /// Scheduler task capacity includes parked resident workers.
     pub(in crate::runtime_store) resident_capacity: std::sync::atomic::AtomicUsize,
     #[cfg(target_os = "linux")]
     pub(in crate::runtime_store) launches: crate::runtime_store::scheduler::LaunchRegistry,
     pub(in crate::runtime_store) store: Arc<RuntimeStore>,
-    model: Model,
+    pub(super) model: Model,
     allowed_controls: std::collections::BTreeSet<tachyon_api::agents::Control>,
     #[cfg(target_os = "linux")]
     research_artifacts: Option<Arc<tachyond::artifact_store::ArtifactStore>>,
@@ -337,6 +343,19 @@ impl ModelBroker {
                     continue;
                 }
                 if let FrameRequest::Control(request) = frame {
+                    if matches!(
+                        request,
+                        tachyon_api::agents::Request::WebSearch { .. }
+                            | tachyon_api::agents::Request::WebFetch { .. }
+                    ) {
+                        let reply = tokio::select! {
+                            biased;
+                            _ = stream.read(&mut unexpected) => return Err(protocol_error()),
+                            result = self.web_private(&permit, &reservation, request, deadline) => result,
+                        };
+                        write_frame(&mut stream, &FrameReply::Control(reply)).await?;
+                        continue;
+                    }
                     #[cfg(target_os = "linux")]
                     if matches!(request, tachyon_api::agents::Request::Wait { .. }) {
                         let operation = self.wait_private_admitted(
@@ -598,6 +617,7 @@ impl ModelBroker {
 
     pub(crate) fn new(store: Arc<RuntimeStore>, model: Model) -> Self {
         Self {
+            web: None,
             resident_capacity: std::sync::atomic::AtomicUsize::new(64),
             #[cfg(target_os = "linux")]
             launches: Default::default(),
@@ -1183,6 +1203,23 @@ mod tests {
         setup_with_group(false)
     }
 
+    pub(super) fn setup_web() -> (
+        tempfile::TempDir,
+        RuntimeStore,
+        AdmittedWork,
+        RequestReservation,
+    ) {
+        setup_with_units(
+            false,
+            3,
+            false,
+            Units {
+                tokens: 1_000_000,
+                cost_micro_usd: 1_000_000,
+            },
+        )
+    }
+
     pub(super) fn setup_with_group(
         grouped: bool,
     ) -> (
@@ -1225,6 +1262,28 @@ mod tests {
         AdmittedWork,
         RequestReservation,
     ) {
+        setup_with_units(
+            grouped,
+            max_running,
+            agents,
+            Units {
+                tokens: 100,
+                cost_micro_usd: 100,
+            },
+        )
+    }
+
+    fn setup_with_units(
+        grouped: bool,
+        max_running: usize,
+        agents: bool,
+        units: Units,
+    ) -> (
+        tempfile::TempDir,
+        RuntimeStore,
+        AdmittedWork,
+        RequestReservation,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let store = RuntimeStore::open(&dir.path().join("runtime.redb")).unwrap();
         let ApiResponse::Research { research } = store
@@ -1247,10 +1306,6 @@ mod tests {
             .unwrap()
         else {
             panic!()
-        };
-        let units = Units {
-            tokens: 100,
-            cost_micro_usd: 100,
         };
         store
             .host_authorize_campaign_envelope(

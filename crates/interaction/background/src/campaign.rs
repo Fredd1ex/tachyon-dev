@@ -1,117 +1,10 @@
-use tachyon_api::{
-    campaign_oversight::*,
-    monitor::{MonitorScope, Observed},
-    todo::{TodoResponse, TodoScope, TodoStatus as ApiStatus},
-};
+use tachyon_api::campaign_oversight::*;
 use tachyon_model::{ChatMessage, Model, Role};
 use tachyon_orchestrator::{
-    agents::campaign::progress::*,
+    agents::campaign::assessment::{prepare, validate_completion},
     capabilities::Capability,
-    registry::{
-        self, HostLane, InvocationContext, InvocationKind, OutputVisibility, Registry, RoleId,
-    },
+    registry::{self, Registry},
 };
-
-fn snapshot(
-    request: &CampaignAssessmentRequest,
-) -> Result<CampaignSnapshot, CampaignAssessmentError> {
-    let invalid = || CampaignAssessmentError::InvalidRequest;
-    if request.request_id.trim().is_empty()
-        || request.request_id.len() > 256
-        || request.todo_scope
-            != (TodoScope::Campaign {
-                campaign_id: request.campaign_id.clone(),
-            })
-        || serde_json::to_vec(request).map_err(|_| invalid())?.len() > 64_000
-        || request.monitor.query.scope
-            != (MonitorScope::Campaign {
-                campaign_id: request.campaign_id.clone(),
-            })
-        || request.monitor.query.validate().is_err()
-    {
-        return Err(invalid());
-    }
-    let TodoResponse::List {
-        todos,
-        scope_revision,
-        next_cursor,
-        watermark,
-    } = &request.todos
-    else {
-        return Err(invalid());
-    };
-    if watermark.instance_id.is_empty()
-        || request.monitor.version.epoch.is_empty()
-        || todos.len() > 20
-        || todos
-            .iter()
-            .map(|t| &t.id)
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            != todos.len()
-        || todos
-            .windows(2)
-            .any(|pair| (pair[0].order_key, &pair[0].id) >= (pair[1].order_key, &pair[1].id))
-        || next_cursor.as_ref().is_some_and(|cursor| {
-            cursor.version != 1
-                || cursor.scope != request.todo_scope
-                || cursor.instance_id != watermark.instance_id
-                || cursor.scope_revision != *scope_revision
-                || cursor.filter != Default::default()
-                || todos.last().is_none_or(|t| {
-                    cursor.after_order_key != t.order_key || cursor.after_id != t.id
-                })
-        })
-        || todos.iter().any(|t| {
-            t.schema_version != 1
-                || t.revision == 0
-                || t.revision > *scope_revision
-                || t.title.trim().is_empty()
-                || t.id.chars().any(char::is_control)
-                || t.scope
-                    != (TodoScope::Campaign {
-                        campaign_id: request.campaign_id.clone(),
-                    })
-        })
-    {
-        return Err(invalid());
-    }
-    let durable = request.monitor.payload.as_ref().map(|p| &p.durable);
-    let inference = durable.and_then(|d| match &d.inference {
-        Observed::Known(i) => Some(i),
-        Observed::Unknown => None,
-    });
-    let snapshot = CampaignSnapshot {
-        id: request.campaign_id.clone(),
-        revision: request.revision,
-        objective_summary: request.objective_summary.clone(),
-        todo_revision: *scope_revision,
-        todos_partial: next_cursor.is_some(),
-        todos: todos
-            .iter()
-            .map(|t| TodoSummary {
-                id: t.id.clone(),
-                title: t.title.clone(),
-                status: match t.status {
-                    ApiStatus::Pending => TodoStatus::Pending,
-                    ApiStatus::InProgress => TodoStatus::InProgress,
-                    ApiStatus::Blocked => TodoStatus::Blocked,
-                    ApiStatus::Completed => TodoStatus::Completed,
-                    ApiStatus::Cancelled => TodoStatus::Cancelled,
-                },
-            })
-            .collect(),
-        resources: ResourceSnapshot {
-            sampled_at_ms: durable.map(|d| d.sampled_at_ms),
-            stale: request.monitor.stale.is_some() || request.monitor.payload.is_none(),
-            final_tokens: inference.map(|i| i.final_usage.tokens.0.to_string()),
-            final_cost_micro_usd: inference.map(|i| i.final_usage.cost_micro_usd.0.to_string()),
-            unresolved_native_jobs: durable.map(|d| d.native_jobs.unresolved.0.to_string()),
-        },
-    };
-    snapshot.render().map_err(|_| invalid())?;
-    Ok(snapshot)
-}
 
 /// Grants are host policy, never fields decoded from the request. No executable
 /// tools are passed to the model, even when the read capabilities are granted.
@@ -122,42 +15,11 @@ pub(super) async fn assess_campaign(
     registry: &Registry<'_>,
 ) -> CampaignAssessmentResponse {
     let result = async {
-        let snapshot = snapshot(request)?;
-        let resolved = registry
-            .resolve(
-                RoleId::Campaign,
-                HostLane::Background,
-                InvocationKind::Primary,
-            )
-            .map_err(|_| CampaignAssessmentError::RegistryUnavailable)?;
-        if ![Capability::Todo, Capability::Monitor]
-            .iter()
-            .all(|cap| grants.contains(cap) && resolved.descriptor().capabilities.contains(cap))
-            || resolved
-                .descriptor()
-                .capabilities
-                .iter()
-                .any(|cap| !grants.contains(cap))
-        {
-            return Err(CampaignAssessmentError::MissingCapabilities);
-        }
-        let rendered = resolved
-            .render(InvocationContext::default())
-            .map_err(|_| CampaignAssessmentError::RegistryUnavailable)?;
-        if rendered.output_visibility != OutputVisibility::Internal
-            || rendered.tools != tachyon_orchestrator::agents::campaign::tools::primary()
-        {
-            return Err(CampaignAssessmentError::RegistryUnavailable);
-        }
+        let prepared = prepare(request, grants, registry)?;
         let model = model.ok_or(CampaignAssessmentError::ModelUnavailable)?;
         let messages = [
-            ChatMessage::new(Role::System, rendered.prompt),
-            ChatMessage::new(
-                Role::User,
-                snapshot
-                    .render()
-                    .map_err(|_| CampaignAssessmentError::InvalidRequest)?,
-            ),
+            ChatMessage::new(Role::System, prepared.system),
+            ChatMessage::new(Role::User, prepared.input),
         ];
         let completion = tokio::time::timeout(
             std::time::Duration::from_secs(20),
@@ -166,16 +28,12 @@ pub(super) async fn assess_campaign(
         .await
         .map_err(|_| CampaignAssessmentError::TimedOut)?
         .map_err(|_| CampaignAssessmentError::ProviderError)?;
-        if !completion.tool_calls.is_empty()
-            || completion
-                .finish_reason
-                .as_deref()
-                .is_some_and(|r| r != "stop")
-            || completion.text.len() > 64_000
-        {
-            return Err(CampaignAssessmentError::MalformedOutput);
-        }
-        validate_assessment(&completion.text, &snapshot)
+        validate_completion(
+            &completion.text,
+            !completion.tool_calls.is_empty(),
+            completion.finish_reason.as_deref(),
+            &prepared.snapshot,
+        )
     }
     .await;
     CampaignAssessmentResponse {
@@ -184,27 +42,6 @@ pub(super) async fn assess_campaign(
         revision: request.revision,
         result,
     }
-}
-
-fn validate_assessment(
-    text: &str,
-    snapshot: &CampaignSnapshot,
-) -> Result<CampaignAssessment, CampaignAssessmentError> {
-    let assessment: CampaignAssessment =
-        serde_json::from_str(text).map_err(|_| CampaignAssessmentError::MalformedOutput)?;
-    if assessment.summary.trim().is_empty()
-        || assessment.summary.len() > 2048
-        || [&assessment.findings, &assessment.refs, &assessment.blockers]
-            .iter()
-            .any(|v| v.len() > 20 || v.iter().any(|s| s.trim().is_empty() || s.len() > 2048))
-        || assessment
-            .refs
-            .iter()
-            .any(|id| !snapshot.todos.iter().any(|t| &t.id == id))
-    {
-        return Err(CampaignAssessmentError::MalformedOutput);
-    }
-    Ok(assessment)
 }
 
 pub(super) async fn dispatch(
@@ -224,12 +61,20 @@ pub(super) async fn dispatch(
 mod tests {
     use super::*;
     use tachyon_api::{
-        monitor::{MonitorQuery, MonitorSnapshot, MonitorVersion},
+        monitor::{MonitorQuery, MonitorScope, MonitorSnapshot, MonitorVersion},
         operational_events::OperationalWatermark,
+        todo::{TodoResponse, TodoScope, TodoStatus as ApiStatus},
+    };
+    use tachyon_orchestrator::{
+        agents::campaign::assessment::{snapshot, validate_assessment},
+        registry::{HostLane, InvocationContext, InvocationKind, RoleId},
     };
 
     fn request() -> CampaignAssessmentRequest {
         CampaignAssessmentRequest {
+            triggers: vec![],
+            evidence_total: 0,
+            evidence: vec![],
             kind: CampaignRequestKind::CampaignAssessment,
             request_id: "assessment-1".into(),
             campaign_id: "c".into(),
@@ -306,6 +151,18 @@ mod tests {
         assert!(projected.resources.final_tokens.is_none());
         let valid = r#"{"summary":"Evidence missing","findings":[],"refs":[],"blockers":[],"attention":"insufficient_evidence"}"#;
         assert!(validate_assessment(valid, &projected).is_ok());
+        assert!(validate_completion(valid, false, Some("stop"), &projected).is_ok());
+        assert!(validate_completion(valid, false, None, &projected).is_ok());
+        for (tools, finish) in [
+            (true, Some("stop")),
+            (false, Some("length")),
+            (false, Some("tool_calls")),
+        ] {
+            assert!(matches!(
+                validate_completion(valid, tools, finish, &projected),
+                Err(CampaignAssessmentError::MalformedOutput)
+            ));
+        }
         assert!(validate_assessment(
             &valid.replace("\"refs\":[]", "\"refs\":[\"invented\"]"),
             &projected
@@ -318,6 +175,58 @@ mod tests {
         .is_err());
         request.objective_summary = "x".repeat(4097);
         assert!(snapshot(&request).is_err());
+    }
+
+    #[test]
+    fn full_bounded_page_is_valid_when_the_plan_has_more_todos() {
+        use tachyon_api::todo::{Todo, TodoActor, TodoCursor};
+        let mut request = request();
+        let actor = TodoActor {
+            source: "operator".into(),
+            actor: "fixture".into(),
+        };
+        request.todos = TodoResponse::List {
+            todos: (1..=20)
+                .map(|i| Todo {
+                    schema_version: 1,
+                    id: format!("todo-{i:02}"),
+                    scope: request.todo_scope.clone(),
+                    title: format!("Task {i}"),
+                    description: String::new(),
+                    status: ApiStatus::Pending,
+                    order_key: i,
+                    revision: 1,
+                    created_ms: 1,
+                    updated_ms: 1,
+                    created_by: actor.clone(),
+                    updated_by: actor.clone(),
+                })
+                .collect(),
+            scope_revision: 100,
+            watermark: OperationalWatermark {
+                instance_id: "epoch".into(),
+                sequence: 100,
+            },
+            next_cursor: Some(TodoCursor {
+                version: 1,
+                instance_id: "epoch".into(),
+                scope: request.todo_scope.clone(),
+                filter: Default::default(),
+                scope_revision: 100,
+                after_order_key: 20,
+                after_id: "todo-20".into(),
+            }),
+        };
+        let prepared = prepare(
+            &request,
+            &[Capability::Todo, Capability::Monitor],
+            &registry::builtin(),
+        )
+        .unwrap();
+        assert!(prepared.snapshot.todos_partial);
+        assert_eq!(prepared.snapshot.todos.len(), 20);
+        assert_eq!(prepared.snapshot.todo_revision, 100);
+        assert!(prepared.input.contains("\"todos_partial\":true"));
     }
 
     #[test]

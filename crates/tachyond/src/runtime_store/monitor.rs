@@ -41,6 +41,31 @@ impl RuntimeStore {
         queries: &[MonitorQuery],
     ) -> Result<Vec<Result<MonitorPayload, MonitorError>>, String> {
         let tx = self.database.begin_read().map_err(|e| e.to_string())?;
+        let mut output = self.monitor_sample_in(&tx, queries)?;
+        drop(tx);
+        if queries
+            .iter()
+            .any(|q| matches!(q.scope, MonitorScope::Host))
+        {
+            let capacities = self.monitor_capacities();
+            for (query, result) in queries.iter().zip(&mut output) {
+                if matches!(query.scope, MonitorScope::Host) {
+                    match (&capacities, result.as_mut()) {
+                        (Ok(capacities), Ok(payload)) => payload.capacities = capacities.clone(),
+                        (Err(_), _) => *result = Err(MonitorError::Unavailable),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    pub(super) fn monitor_sample_in(
+        &self,
+        tx: &redb::ReadTransaction,
+        queries: &[MonitorQuery],
+    ) -> Result<Vec<Result<MonitorPayload, MonitorError>>, String> {
         let sampled_at_ms = now_ms();
         let campaigns = tx
             .open_table(research::CAMPAIGNS)
@@ -91,23 +116,6 @@ impl RuntimeStore {
                 payload.durable.retained_storage = storage;
                 if !matches!(query.scope, MonitorScope::Host) {
                     finish_page(&mut payload.registered, query);
-                }
-            }
-        }
-        drop(tx);
-        // These clocks deliberately follow the read snapshot; no global atomicity is claimed.
-        if queries
-            .iter()
-            .any(|q| matches!(q.scope, MonitorScope::Host))
-        {
-            let capacities = self.monitor_capacities();
-            for (query, result) in queries.iter().zip(&mut output) {
-                if matches!(query.scope, MonitorScope::Host) {
-                    match (&capacities, result.as_mut()) {
-                        (Ok(capacities), Ok(payload)) => payload.capacities = capacities.clone(),
-                        (Err(_), _) => *result = Err(MonitorError::Unavailable),
-                        _ => {}
-                    }
                 }
             }
         }

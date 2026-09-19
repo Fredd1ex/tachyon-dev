@@ -12,6 +12,7 @@ use super::{
 };
 
 mod permits;
+pub(crate) mod services;
 pub(super) use permits::PermitState;
 #[allow(unused_imports)] // Internal host API; worker transport remains gated.
 pub(crate) use permits::{ModelBroker, ModelBrokerRequest, ModelPermit};

@@ -16,6 +16,7 @@ use crate::registry::{
 pub const fn definition() -> RoleDescriptor {
     RoleDescriptor {
         id: RoleId::Conversation,
+        display_name: "Conversation",
         stable_id: RoleId::Conversation.stable_id(),
         purpose: "Answer user dialogue and delegate requests requiring fresh work.",
         capabilities: CAPABILITIES,

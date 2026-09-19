@@ -211,7 +211,7 @@ fn main() -> ExitCode {
             if client
                 .controls
                 .iter()
-                .any(|c| !matches!(c, tachyon_api::agents::Control::Resource | tachyon_api::agents::Control::Todo | tachyon_api::agents::Control::TodoCampaign | tachyon_api::agents::Control::Monitor | tachyon_api::agents::Control::MonitorCampaign | tachyon_api::agents::Control::MonitorAvailability))
+                .any(|c| !matches!(c, tachyon_api::agents::Control::Resource | tachyon_api::agents::Control::Todo | tachyon_api::agents::Control::TodoCampaign | tachyon_api::agents::Control::Monitor | tachyon_api::agents::Control::MonitorCampaign | tachyon_api::agents::Control::MonitorAvailability | tachyon_api::agents::Control::WebSearch | tachyon_api::agents::Control::WebFetch))
             {
                 packages
                     .register(ghost::harness::tools::agents::package(client.clone()))
@@ -235,6 +235,20 @@ fn main() -> ExitCode {
                     packages.register(ghost::harness::tools::services::package(client.clone(), todo)).expect("unique broker service package");
                     policy.enabled_tools.insert(name.into());
                 }
+            }
+        }
+        if let Some((client, _)) = &broker_work {
+            for package in [
+                ghost::harness::tools::websearch::package(client.clone()),
+                ghost::harness::tools::webfetch::package(client.clone()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                policy.enabled_tools.insert(package.manifest.name.into());
+                packages
+                    .register(package)
+                    .expect("unique broker web package");
             }
         }
         if let Some((_, request)) = &broker_work {
@@ -464,23 +478,85 @@ async fn run_chat(
     workspace: &std::path::Path,
 ) -> ExitCode {
     let cfg = tachyon_util::config::Config::load();
-    let model = match from_agent_config(&role.config(&cfg)) {
-        Ok(model) => model,
-        Err(error) => {
-            println!("[ghost:error] model not ready: {error}");
-            return ExitCode::FAILURE;
-        }
+    // Resolve credentials only for a plain local assignment. Managed Work uses
+    // the host's private model channel and never needs a provider key here.
+    let model = ChatFallback {
+        config: role.config(&cfg),
+        model: tokio::sync::OnceCell::new(),
     };
+    run_chat_model(
+        &model,
+        role.config(&cfg).persona.as_deref(),
+        tokio::io::BufReader::new(tokio::io::stdin()),
+        registry,
+        policy,
+        output_store,
+        role,
+        agent_id,
+        workspace,
+    )
+    .await
+}
+
+struct ChatFallback {
+    config: tachyon_util::config::AgentConfig,
+    model: tokio::sync::OnceCell<tachyon_model::Model>,
+}
+impl ghost::harness::agent::AgentModel for ChatFallback {
+    fn chat<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [tachyon_model::ToolSpec],
+    ) -> ghost::harness::agent::ModelFuture<'a> {
+        Box::pin(async move {
+            let model = self
+                .model
+                .get_or_try_init(|| async {
+                    from_agent_config(&self.config).map_err(|_| {
+                        tachyon_model::ModelError::Api("local model unavailable".into())
+                    })
+                })
+                .await?;
+            model.chat(messages, Some(tools), &mut |_| {}).await
+        })
+    }
+}
+
+// Ordinary output remains in its workspace store, not campaign artifact export.
+struct ManagedChat<'a>(&'a tachyon_model::broker::BrokerClient);
+impl ghost::harness::agent::AgentModel for ManagedChat<'_> {
+    fn chat<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [tachyon_model::ToolSpec],
+    ) -> ghost::harness::agent::ModelFuture<'a> {
+        Box::pin(self.0.chat(messages, tools))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_chat_model<
+    M: ghost::harness::agent::AgentModel,
+    R: tokio::io::AsyncBufRead + Unpin,
+>(
+    model: &M,
+    persona: Option<&str>,
+    input: R,
+    registry: &ToolRegistry,
+    policy: Arc<ToolPolicy>,
+    output_store: Arc<dyn ToolOutputStore>,
+    role: AgentRole,
+    agent_id: Option<String>,
+    workspace: &std::path::Path,
+) -> ExitCode {
     let checkpoint_path = chat_checkpoint_path(workspace, role);
     let checkpoint = load_chat_checkpoint(&checkpoint_path);
     let mut messages = checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.messages.clone())
         .unwrap_or_default();
-    let system_prompt = ChatMessage::new(
-        Role::System,
-        ghost::harness::prompt::system_prompt(role.config(&cfg).persona.as_deref()),
-    );
+    let system_prompt =
+        ChatMessage::new(Role::System, ghost::harness::prompt::system_prompt(persona));
     if let Some(system) = messages
         .iter_mut()
         .find(|message| message.role == Role::System)
@@ -489,7 +565,7 @@ async fn run_chat(
     } else {
         messages.insert(0, system_prompt);
     }
-    let evidence = checkpoint
+    let mut evidence = checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.evidence.clone())
         .unwrap_or_default();
@@ -503,7 +579,7 @@ async fn run_chat(
         .unwrap_or_default();
     println!("[ghost] ready");
     emit_ready(role, agent_id.as_deref());
-    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut lines = input.lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let text = line.trim();
         if text.is_empty() {
@@ -534,12 +610,72 @@ async fn run_chat(
             );
             continue;
         }
-        let request = serde_json::from_str::<WorkRequest>(text).ok();
+        let assignment = serde_json::from_str::<tachyon_api::web::WorkerAssignment>(text).ok();
+        if assignment.is_none()
+            && serde_json::from_str::<serde_json::Value>(text)
+                .is_ok_and(|v| v.get("host_service").is_some())
+        {
+            println!("[ghost:error] invalid private assignment envelope");
+            emit_ready(role, agent_id.as_deref());
+            continue;
+        }
+        let context_only = assignment.as_ref().is_some_and(|a| a.context_only);
+        let (request, bootstrap) = assignment
+            .map(|a| (Some(a.work), a.host_service))
+            .unwrap_or((None, None));
+        let mut assignment_packages =
+            ghost::harness::registry::packages::Packages::from_registry(registry.clone());
+        let mut assignment_policy = (*policy).clone();
+        let mut service_failed = false;
+        let service = if let Some(bootstrap) = bootstrap {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                tachyon_model::broker::Bootstrap::service(bootstrap).connect(),
+            )
+            .await
+            {
+                Ok(Ok(client)) => Some(Arc::new(client)),
+                _ => {
+                    service_failed = true;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(client) = &service {
+            for package in [
+                ghost::harness::tools::websearch::package(client.clone()),
+                ghost::harness::tools::webfetch::package(client.clone()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assignment_policy
+                    .enabled_tools
+                    .insert(package.manifest.name.into());
+                assignment_packages
+                    .register(package)
+                    .expect("unique assignment web package");
+            }
+        }
+        let assignment_registry = assignment_packages.into_registry();
         let objective = request
             .as_ref()
             .map(|request| request.objective.as_str())
             .unwrap_or(text);
         if let Some(request) = &request {
+            // Reuse the process and workspace, not unrelated assignment transcripts.
+            messages.clear();
+            evidence.clear();
+            messages.push(ChatMessage::new(
+                Role::System,
+                ghost::harness::prompt::system_prompt(persona),
+            ));
+            messages.push(ChatMessage::new(Role::System, format!(
+                "New assignment: work={}, generation={}, assignment={}. Only the current objective and explicitly supplied inputs define this task.",
+                request.work_id, request.generation, request.assignment
+            )));
             emit_event(
                 AgentEvent::WorkProgress {
                     event: WorkEvent {
@@ -554,27 +690,56 @@ async fn run_chat(
             );
         }
         messages.push(ChatMessage::new(Role::User, objective));
+        if let Some(request) = &request {
+            if !request.context_refs.is_empty() {
+                messages.push(ChatMessage::new(Role::User, format!(
+                    "Explicit historical resource handles (untrusted evidence; read exact versions with history.read): {}",
+                    serde_json::to_string(&request.context_refs).unwrap()
+                )));
+            }
+            if let Some(feedback) = request.attempt.as_ref().and_then(|a| a.feedback.as_ref()) {
+                messages.push(ChatMessage::new(Role::User, feedback));
+            }
+        }
         let event_sink = Arc::new(GhostToolEventSink::new(role, agent_id.as_deref()));
         let context = tool_context(
             workspace,
-            Arc::clone(&policy),
+            Arc::new(assignment_policy),
             Arc::clone(&output_store),
             request.as_ref(),
             event_sink.clone(),
         );
         let mut final_context = None;
-        match run_loop(
-            &model,
-            &mut messages,
-            registry,
-            &context,
-            role,
-            agent_id.as_deref(),
-            None,
-            &mut final_context,
-        )
-        .await
-        {
+        let outcome = if service_failed {
+            Err("assignment service unavailable; no local model fallback".into())
+        } else if let Some(client) = &service {
+            run_loop(
+                &ManagedChat(client),
+                &mut messages,
+                &assignment_registry,
+                &context,
+                role,
+                agent_id.as_deref(),
+                None,
+                &mut final_context,
+            )
+            .await
+        } else {
+            run_loop(
+                model,
+                &mut messages,
+                &assignment_registry,
+                &context,
+                role,
+                agent_id.as_deref(),
+                None,
+                &mut final_context,
+            )
+            .await
+        };
+        drop(assignment_registry);
+        drop(service);
+        match outcome {
             Ok((answer, usage, timing)) => {
                 emit_event(
                     AgentEvent::Usage {
@@ -591,7 +756,7 @@ async fn run_chat(
                 emit_answer(
                     &answer,
                     objective,
-                    request.as_ref(),
+                    request.as_ref().filter(|_| !context_only),
                     role,
                     agent_id.as_deref(),
                     event_sink.artifact_paths(),
@@ -603,7 +768,7 @@ async fn run_chat(
                 );
             }
             Err(error) => {
-                if let Some(request) = &request {
+                if let Some(request) = request.as_ref().filter(|_| !context_only) {
                     emit_event(
                         AgentEvent::WorkCandidate {
                             candidate: WorkResult {
@@ -673,6 +838,17 @@ async fn run_loop<M: ghost::harness::agent::AgentModel>(
     let sink = GhostAgentLoopSink {
         role,
         agent_id,
+        identity: context
+            .identity
+            .work_id
+            .as_ref()
+            .map(|_| ApiToolTelemetryIdentity {
+                task_id: context.identity.task_id.clone(),
+                work_id: context.identity.work_id.clone(),
+                generation: context.identity.generation,
+                assignment: context.identity.assignment,
+                attempt_id: context.identity.attempt_id.clone(),
+            }),
         waits: Default::default(),
     };
     // Each objective owns its instruction selection. Chat history/checkpoints are
@@ -735,6 +911,7 @@ fn tool_context_chars() -> usize {
 struct GhostAgentLoopSink<'a> {
     role: AgentRole,
     agent_id: Option<&'a str>,
+    identity: Option<ApiToolTelemetryIdentity>,
     waits: std::sync::Mutex<(Duration, Duration)>,
 }
 
@@ -757,6 +934,7 @@ impl AgentLoopEventSink for GhostAgentLoopSink<'_> {
                         id: call.id.clone(),
                         name: call.name.clone(),
                         arguments: call.arguments.clone(),
+                        identity: self.identity.clone(),
                     },
                     self.role,
                     self.agent_id,
@@ -769,6 +947,7 @@ impl AgentLoopEventSink for GhostAgentLoopSink<'_> {
                         turn: None,
                         id: id.clone(),
                         output: output.clone(),
+                        identity: self.identity.clone(),
                     },
                     self.role,
                     self.agent_id,
@@ -890,6 +1069,25 @@ fn emit_answer(
 }
 
 fn emit_event(event: AgentEvent, role: AgentRole, agent_id: Option<&str>) {
+    #[cfg(test)]
+    if CAPTURED_EVENTS
+        .try_with(|events| events.lock().unwrap().push(event.clone()))
+        .is_ok()
+    {
+        return;
+    }
+    if let AgentEvent::WorkCandidate { candidate } = &event {
+        eprintln!(
+            "[work-evidence] {}",
+            serde_json::json!({
+                "stage": "ghost_candidate", "worker_id": agent_id,
+                "work_id": candidate.work_id, "generation": candidate.generation,
+                "assignment": candidate.assignment,
+                "observed_invocations": candidate.evidence.observed_invocations,
+                "retained_results": candidate.evidence.tools.len(), "omitted": candidate.evidence.omitted,
+            })
+        );
+    }
     let sequence = EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let session = agent_id
         .map(str::to_string)
@@ -970,8 +1168,435 @@ fn parse_args() -> (
 }
 
 #[cfg(test)]
+tokio::task_local! {
+    static CAPTURED_EVENTS: Mutex<Vec<AgentEvent>>;
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn warm_tool_lifecycle_identity_comes_from_each_host_assignment() {
+        use ghost::harness::{
+            agent::{AgentModel, ModelFuture},
+            runtime::NoopOutputStore,
+        };
+        struct Script(AtomicU64);
+        impl AgentModel for Script {
+            fn chat<'a>(
+                &'a self,
+                _: &'a [ChatMessage],
+                _: &'a [tachyon_model::ToolSpec],
+            ) -> ModelFuture<'a> {
+                Box::pin(async move {
+                    let step = self.0.fetch_add(1, Ordering::SeqCst);
+                    assert!(step < 8, "unexpected model call");
+                    Ok(tachyon_model::Completion {
+                        text: if step % 2 == 0 { "" } else { "done" }.into(),
+                        tool_calls: if step % 2 == 0 {
+                            vec![ToolCall {
+                                id: "local-call".into(),
+                                name: "missing-fixture-tool".into(),
+                                arguments: "{}".into(),
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        usage: Default::default(),
+                        finish_reason: None,
+                    })
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut input = String::new();
+        let mut expected = Vec::new();
+        for (work_id, generation, assignment, attempt) in [
+            ("first", 1, 1, None),
+            ("reused", 1, 2, Some("retry")),
+            ("reused", 2, 2, Some("replacement")),
+        ] {
+            let request: WorkRequest = serde_json::from_value(serde_json::json!({
+                "work_id": work_id, "objective": "fixture", "generation": generation,
+                "assignment": assignment, "deadline_ms": u64::MAX, "lifetime_class": "long",
+                "attempt": attempt.map(|id| serde_json::json!({"id": id})),
+            }))
+            .unwrap();
+            input.push_str(
+                &serde_json::to_string(&tachyon_api::web::WorkerAssignment {
+                    work: request,
+                    host_service: None,
+                    context_only: false,
+                })
+                .unwrap(),
+            );
+            input.push('\n');
+            expected.push(Some(ApiToolTelemetryIdentity {
+                task_id: None,
+                work_id: Some(work_id.into()),
+                generation: Some(generation),
+                assignment: Some(assignment),
+                attempt_id: attempt.map(str::to_owned),
+            }));
+        }
+        input.push_str("standalone objective\n");
+        expected.push(None);
+        CAPTURED_EVENTS
+            .scope(Mutex::new(Vec::new()), async {
+                assert_eq!(
+                    run_chat_model(
+                        &Script(AtomicU64::new(0)),
+                        None,
+                        input.as_bytes(),
+                        &ToolRegistry::default(),
+                        Arc::new(ToolPolicy::worker_default(root.path().into())),
+                        Arc::new(NoopOutputStore),
+                        AgentRole::Worker,
+                        Some("warm-worker".into()),
+                        root.path(),
+                    )
+                    .await,
+                    ExitCode::SUCCESS
+                );
+                let events = CAPTURED_EVENTS.with(|events| events.lock().unwrap().clone());
+                let mut starts = Vec::new();
+                let mut finishes = Vec::new();
+                let mut telemetry = Vec::new();
+                for event in events {
+                    match event {
+                        AgentEvent::ToolStarted {
+                            turn, id, identity, ..
+                        } => {
+                            assert_eq!(turn, None);
+                            assert_eq!(id, "local-call");
+                            starts.push(identity);
+                        }
+                        AgentEvent::ToolFinished {
+                            turn, id, identity, ..
+                        } => {
+                            assert_eq!(turn, None);
+                            assert_eq!(id, "local-call");
+                            finishes.push(identity);
+                        }
+                        AgentEvent::ToolTelemetry { identity, .. } => {
+                            telemetry.push(identity.work_id.as_ref().map(|_| identity.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(starts, expected);
+                assert_eq!(finishes, expected);
+                assert_eq!(telemetry, expected);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn evidence_keeps_large_errors_later_sources_and_invocation_counts() {
+        use ghost::harness::runtime::{NoopOutputStore, ToolError, ToolResult};
+        use serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let sink = Arc::new(GhostToolEventSink::new(AgentRole::Worker, None));
+        let context = tool_context(
+            root.path(),
+            Arc::new(ToolPolicy::worker_default(root.path().into())),
+            Arc::new(NoopOutputStore),
+            None,
+            sink.clone(),
+        );
+        sink.record_result(
+            "fixture",
+            &context,
+            &json!({"large": "x".repeat(9000)}),
+            &ToolError::invalid("\u{0000}".repeat(16_384)).into_result(),
+        );
+        sink.record_result(
+            "read",
+            &context,
+            &json!({}),
+            &ToolResult::success("later source evidence".into(), json!({})),
+        );
+        let registry = ToolRegistry::default();
+        for _ in 0..40 {
+            assert!(registry
+                .execute("unknown", &context, json!({}))
+                .await
+                .is_err());
+        }
+        let evidence = sink.evidence.snapshot();
+        assert_eq!(evidence.observed_invocations, Some(42));
+        assert_eq!(
+            evidence.observed_invocations,
+            Some(evidence.tools.len() as u64 + evidence.omitted)
+        );
+        assert_eq!(evidence.tools[0].output["is_error"], true);
+        assert_eq!(evidence.tools[0].output["truncated"], true);
+        assert!(evidence.tools[0].arguments.get("omitted").is_some());
+        assert_eq!(evidence.tools[1].output["content"], "later source evidence");
+        assert_eq!(evidence.tools[2].output["metadata"]["retryable"], false);
+        assert!(evidence.omitted > 0);
+        assert!(serde_json::to_vec(&evidence).unwrap().len() <= 16 * 1024);
+    }
+
+    #[tokio::test]
+    async fn warm_work_requests_do_not_recycle_history_or_evidence() {
+        use ghost::harness::{
+            agent::{AgentModel, ModelFuture},
+            runtime::{Capability, NoopOutputStore, Tool, ToolFuture, ToolResult},
+        };
+        use tachyon_api::types::LifetimeClass;
+        struct Source(tachyon_model::ToolSpec);
+        impl Tool for Source {
+            fn name(&self) -> &'static str {
+                "read"
+            }
+            fn schema(&self) -> &tachyon_model::ToolSpec {
+                &self.0
+            }
+            fn capabilities(&self) -> &'static [Capability] {
+                &[]
+            }
+            fn execute<'a>(&'a self, _: &'a ToolContext, _: serde_json::Value) -> ToolFuture<'a> {
+                Box::pin(async {
+                    Ok(ToolResult::success(
+                        "fixture source observation".into(),
+                        serde_json::json!({}),
+                    ))
+                })
+            }
+        }
+        struct Script(AtomicU64);
+        impl AgentModel for Script {
+            fn chat<'a>(
+                &'a self,
+                messages: &'a [ChatMessage],
+                _: &'a [tachyon_model::ToolSpec],
+            ) -> ModelFuture<'a> {
+                Box::pin(async move {
+                    let step = self.0.fetch_add(1, Ordering::SeqCst);
+                    assert!(step < 4, "unexpected retry/model call");
+                    let serialized = serde_json::to_string(messages).unwrap();
+                    assert!(!serialized.contains("unrelated checkpoint"));
+                    if step >= 2 {
+                        assert!(serialized.contains("New assignment: work=second"));
+                        assert!(!serialized.contains("first objective"));
+                        assert!(!serialized.contains("fixture source observation"));
+                        assert!(!serialized.contains("first verified summary"));
+                    }
+                    if step == 3 {
+                        assert!(serialized.contains("explicit-finding"));
+                        assert!(serialized.contains("repair feedback"));
+                        assert!(!serialized.contains("cached claim without retrieval"));
+                    }
+                    Ok(tachyon_model::Completion {
+                        text: match step {
+                            0 => "",
+                            1 => "first verified summary",
+                            _ => "cached claim without retrieval",
+                        }
+                        .into(),
+                        tool_calls: if step == 0 {
+                            vec![ToolCall {
+                                id: "source-call".into(),
+                                name: "read".into(),
+                                arguments: "{}".into(),
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        usage: Default::default(),
+                        finish_reason: None,
+                    })
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        write_chat_checkpoint(
+            &chat_checkpoint_path(root.path(), AgentRole::Worker),
+            &ChatCheckpoint {
+                messages: vec![ChatMessage::new(Role::User, "unrelated checkpoint")],
+                evidence: vec![serde_json::json!({"claim":"unrelated checkpoint"})],
+                next_commit: 1,
+                context_epoch: 0,
+            },
+        );
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(Source(tachyon_model::ToolSpec::new(
+                "read",
+                "fixture source",
+                serde_json::json!({"type":"object"}),
+            )))
+            .unwrap();
+        let mut input = String::new();
+        for (assignment, id, objective) in [
+            (1, "first", "first objective: retrieve source"),
+            (2, "second", "retrieve a fresh source observation"),
+            (
+                3,
+                "second",
+                "compare the explicitly supplied historical finding",
+            ),
+        ] {
+            let request = WorkRequest {
+                work_id: id.into(),
+                objective: objective.into(),
+                generation: 7,
+                assignment,
+                deadline_ms: u64::MAX,
+                lifetime_class: LifetimeClass::Long,
+                context_refs: if assignment == 3 {
+                    vec![tachyon_api::context::ResourceRef {
+                        kind: tachyon_api::context::ResourceKind::Finding,
+                        work_id: "second".into(),
+                        id: "explicit-finding".into(),
+                        version: "1".into(),
+                    }]
+                } else {
+                    vec![]
+                },
+                constraints: None,
+                attempt: (assignment == 3).then(|| tachyon_api::types::WorkAttempt {
+                    id: "retry".into(),
+                    feedback: Some("repair feedback".into()),
+                    continuation: None,
+                }),
+            };
+            input.push_str(&serde_json::to_string(&request).unwrap());
+            input.push('\n');
+        }
+        let model = Script(AtomicU64::new(0));
+        CAPTURED_EVENTS
+            .scope(Mutex::new(Vec::new()), async {
+                assert_eq!(
+                    run_chat_model(
+                        &model,
+                        None,
+                        input.as_bytes(),
+                        &registry,
+                        Arc::new(ToolPolicy::worker_default(root.path().into())),
+                        Arc::new(NoopOutputStore),
+                        AgentRole::Worker,
+                        Some("warm-worker".into()),
+                        root.path()
+                    )
+                    .await,
+                    ExitCode::SUCCESS
+                );
+                let events = CAPTURED_EVENTS.with(|events| events.lock().unwrap().clone());
+                let candidates: Vec<_> = events
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        AgentEvent::WorkCandidate { candidate } => Some(candidate),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(candidates.len(), 3);
+                assert_eq!(candidates[0].evidence.observed_invocations, Some(1));
+                assert_eq!(
+                    candidates[0].evidence.tools[0].output["content"],
+                    "fixture source observation"
+                );
+                assert_eq!(candidates[1].evidence.observed_invocations, Some(0));
+                assert!(candidates[1].evidence.tools.is_empty());
+                assert_eq!(candidates[1].evidence.omitted, 0);
+                assert_eq!(candidates[2].evidence, candidates[1].evidence);
+                for (index, candidate) in candidates.into_iter().enumerate() {
+                    let review = tachyon_api::types::WorkReviewRequest {
+                        review_id: format!("review-{index}"),
+                        coordinator_generation: 1,
+                        worker: tachyon_api::types::WorkReviewContext {
+                            worker_id: "warm-worker".into(),
+                            current_lifetime_class: LifetimeClass::Long,
+                            turns_used: index as u32 + 1,
+                            turn_budget: None,
+                            purpose: "fixture".into(),
+                        },
+                        deadline_ms: u64::MAX,
+                        candidate,
+                    };
+                    let received: tachyon_api::types::WorkReviewRequest =
+                        serde_json::from_str(&serde_json::to_string(&review).unwrap()).unwrap();
+                    assert_eq!(received.candidate.evidence, review.candidate.evidence);
+                    assert_eq!(received.candidate.generation, 7);
+                    assert_eq!(received.candidate.assignment, index as u64 + 1);
+                }
+            })
+            .await;
+        assert_eq!(model.0.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn plain_chat_preserves_checkpoint_and_conversation() {
+        use ghost::harness::{
+            agent::{AgentModel, ModelFuture},
+            runtime::NoopOutputStore,
+        };
+        struct Script(AtomicU64);
+        impl AgentModel for Script {
+            fn chat<'a>(
+                &'a self,
+                messages: &'a [ChatMessage],
+                _: &'a [tachyon_model::ToolSpec],
+            ) -> ModelFuture<'a> {
+                Box::pin(async move {
+                    let step = self.0.fetch_add(1, Ordering::SeqCst);
+                    let text = serde_json::to_string(messages).unwrap();
+                    assert!(text.contains("previous conversation"));
+                    assert!(text.contains("first plain turn"));
+                    assert!(!text.contains("New assignment:"));
+                    if step == 1 {
+                        assert!(text.contains("plain answer"));
+                        assert!(text.contains("second plain turn"));
+                    }
+                    Ok(tachyon_model::Completion {
+                        text: "plain answer".into(),
+                        tool_calls: vec![],
+                        usage: Default::default(),
+                        finish_reason: None,
+                    })
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = chat_checkpoint_path(root.path(), AgentRole::Worker);
+        let evidence = vec![serde_json::json!({"existing": "evidence"})];
+        write_chat_checkpoint(
+            &path,
+            &ChatCheckpoint {
+                messages: vec![ChatMessage::new(Role::User, "previous conversation")],
+                evidence: evidence.clone(),
+                next_commit: 42,
+                context_epoch: 7,
+            },
+        );
+        let model = Script(AtomicU64::new(0));
+        CAPTURED_EVENTS
+            .scope(Mutex::new(Vec::new()), async {
+                assert_eq!(
+                    run_chat_model(
+                        &model,
+                        None,
+                        &b"first plain turn\nsecond plain turn\n"[..],
+                        &ToolRegistry::default(),
+                        Arc::new(ToolPolicy::worker_default(root.path().into())),
+                        Arc::new(NoopOutputStore),
+                        AgentRole::Worker,
+                        None,
+                        root.path()
+                    )
+                    .await,
+                    ExitCode::SUCCESS
+                );
+            })
+            .await;
+        let saved = load_chat_checkpoint(&path).unwrap();
+        assert_eq!(saved.evidence, evidence);
+        assert_eq!(saved.next_commit, 44);
+        assert_eq!(saved.context_epoch, 7);
+        assert_eq!(model.0.load(Ordering::SeqCst), 2);
+    }
 
     #[tokio::test]
     async fn scripted_python_hostcall_evidence_survives_review_input_and_failed_cells() {
@@ -1083,6 +1708,7 @@ mod tests {
         let evidence = sink.evidence.snapshot();
         assert_eq!(evidence.omitted, 0);
         assert_eq!(evidence.tools.len(), 5);
+        assert_eq!(evidence.observed_invocations, Some(5));
         let read = &evidence.tools[0];
         assert_eq!(read.tool_name, "read");
         assert_eq!(read.call_id.as_deref(), Some("python-1-2"));

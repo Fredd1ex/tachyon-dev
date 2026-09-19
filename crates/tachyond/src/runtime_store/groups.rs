@@ -10,7 +10,7 @@ use redb::{ReadableTable, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-const ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("campaign_work_limits");
+pub(super) const ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("campaign_work_limits");
 
 fn err(e: impl std::fmt::Display) -> String {
     format!("campaign groups: {e}")
@@ -1282,6 +1282,24 @@ fn load(tx: &WriteTransaction, campaign: &str) -> Result<Option<Root>, String> {
         .transpose()
 }
 fn save(tx: &WriteTransaction, root: &Root) -> Result<(), String> {
+    if super::campaign_oversight::enabled_in(tx, &root.campaign_id)? {
+        if let Some(previous) = load(tx, &root.campaign_id)? {
+            if root.work.iter().any(|(id, member)| {
+                member.wait != previous.work.get(id).and_then(|m| m.wait.clone())
+            }) {
+                super::campaign_oversight::trigger_in(tx, &root.campaign_id, "blocked_state")?;
+            }
+            if root.work.iter().any(|(id, member)| {
+                member.terminal && previous.work.get(id).is_some_and(|m| !m.terminal)
+            }) {
+                super::campaign_oversight::trigger_in(
+                    tx,
+                    &root.campaign_id,
+                    "logical_work_terminal",
+                )?;
+            }
+        }
+    }
     tx.open_table(ROOTS)
         .map_err(err)?
         .insert(
@@ -1371,7 +1389,11 @@ impl RuntimeStore {
         tx.commit().map_err(err)
     }
 
-    fn cancel_work_in(tx: &WriteTransaction, campaign: &str, id: &str) -> Result<(), String> {
+    pub(super) fn cancel_work_in(
+        tx: &WriteTransaction,
+        campaign: &str,
+        id: &str,
+    ) -> Result<(), String> {
         let mut root = load(tx, campaign)?.ok_or_else(|| err("unknown root"))?;
         let member = root.work.get_mut(id).ok_or_else(|| err("unknown work"))?;
         let mut work = Self::admitted_work_in(tx, id)?;
@@ -1561,6 +1583,12 @@ impl RuntimeStore {
         }
         let mut root = load(&tx, campaign)?.ok_or_else(|| err("host work limits required"))?;
         if let Some(attention) = attention {
+            if attention.campaign_id != *campaign
+                || attention.work_id != work.admission.work_id
+                || attention.generation != work.admission.generation
+            {
+                return Err(err("attention source identity mismatch"));
+            }
             if Self::latest_instruction_revision_in(&tx, &work.admission)?
                 != attention.instruction_revision
             {
@@ -1577,6 +1605,21 @@ impl RuntimeStore {
             {
                 return Err(err("attention limit or duplicate request"));
             }
+            Self::admit_attention_in(
+                &tx,
+                super::attention::AttentionSource {
+                    scope: tachyon_api::todo::TodoScope::Campaign {
+                        campaign_id: campaign.clone(),
+                    },
+                    work_id: Some(attention.work_id.clone()),
+                    campaign_id: Some(campaign.clone()),
+                    generation: attention.generation,
+                    instruction_revision: attention.instruction_revision,
+                    category: tachyon_api::attention::AttentionCategory::Question,
+                    cause_id: attention.request_id.clone(),
+                },
+                now,
+            )?;
             questions.push(attention);
         }
         if root

@@ -13,6 +13,7 @@ use crate::registry::{
 pub const fn definition() -> RoleDescriptor {
     RoleDescriptor {
         id: RoleId::Coordinator,
+        display_name: "Coordinator",
         stable_id: RoleId::Coordinator.stable_id(),
         purpose: "Coordinate internal objectives and review worker evidence and lifecycle.",
         capabilities: CAPABILITIES,

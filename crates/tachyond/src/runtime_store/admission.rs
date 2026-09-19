@@ -827,6 +827,15 @@ impl RuntimeStore {
                 "invalid admission identity/objective/revision/generation",
             ));
         }
+        if write
+            .open_table(super::model_accounting::services::SERVICES)
+            .map_err(err)?
+            .get(admission.work_id.as_str())
+            .map_err(err)?
+            .is_some()
+        {
+            return Err(err("Work identity conflicts with host service"));
+        }
         let mut table = write.open_table(WORK).map_err(err)?;
         if let Some(value) = table.get(admission.work_id.as_str()).map_err(err)? {
             let work = decode(value.value(), &admission.work_id)?;

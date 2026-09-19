@@ -1,0 +1,74 @@
+ you                                                                                                     ^ 1  [00:00:00]
+
+    Investigate benchmark; this campaign is already host-authorized.
+
+ Conversational Agent                                                                                    ^ 1  [00:00:00]
+
+    Command verification passed; candidate 42 and its evidence are retained.
+
+ you                                                                                                     ^ 2  [00:00:00]
+
+    What is WorkerState?
+
+ Conversational Agent                                                                                    ^ 2  [00:00:00]
+
+    WorkerState describes the worker lifecycle.
+
+ you                                                                                                     ^ 3  [00:00:00]
+
+    Remind me at 3 PM to review the benchmark.
+
+ Conversational Agent                                                                                    ^ 3  [00:00:00]
+
+    Scheduled.
+
+ you                                                                                                     ^ 4  [00:00:00]
+
+    Update my review plan.
+
+ Conversational Agent                                                                                    ^ 4  [00:00:00]
+
+    pending
+
+ you                                                                                                     ^ 5  [00:00:00]
+
+    Update my review plan.
+
+ Conversational Agent                                                                                    ^ 5  [00:00:00]
+
+    in_progress
+
+ you                                                                                                     ^ 6  [00:00:00]
+
+    Update my review plan.
+
+ Conversational Agent                                                                                    ^ 6  [00:00:00]
+
+    blocked
+
+ you                                                                                                     ^ 7  [00:00:00]
+
+    Update my review plan.
+
+ Conversational Agent                                                                                    ^ 7  [00:00:00]
+
+    completed
+
+ Conversational Agent                                                                                         [00:00:00]
+
+    Campaign campaign-fixture advisory (unverified background assessment, revision 2): A
+    candidate is ready; independent verification is still required
+    Sources: finding:benchmark-candidate:fixture-hash
+
+ Conversational Agent                                                                                         [00:00:00]
+
+    Work needs your input (1 item). Review attention for details.
+
+ you                                                                                                     ^ 8  [00:00:00]
+
+    Stop the speculative branch; retain this candidate and complete verification. Cancel the
+    unrelated queued branch.
+
+ Conversational Agent                                                                                    ^ 8  [00:00:00]
+
+    Steering applied; the unrelated queued branch is cancelled.

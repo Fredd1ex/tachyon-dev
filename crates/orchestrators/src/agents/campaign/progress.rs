@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CampaignSnapshot {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub evidence_total: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<tachyon_api::campaign_oversight::AssessmentEvidence>,
     pub id: String,
     pub revision: u64,
     pub objective_summary: String,
@@ -11,6 +17,10 @@ pub struct CampaignSnapshot {
     pub todos: Vec<TodoSummary>,
     pub todos_partial: bool,
     pub resources: ResourceSnapshot,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +44,10 @@ pub enum TodoStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved_tokens: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved_cost_micro_usd: Option<String>,
     pub sampled_at_ms: Option<u64>,
     pub stale: bool,
     // Decimal strings preserve exact wide service counters; None means unknown.
@@ -50,6 +64,16 @@ impl CampaignSnapshot {
             || self.objective_summary.trim().is_empty()
             || self.objective_summary.len() > 4096
             || self.todos.len() > 20
+            || self.triggers.len() > 8
+            || self
+                .triggers
+                .iter()
+                .any(|s| s.is_empty() || s.len() > 64 || s.chars().any(char::is_control))
+            || self.evidence.len() > 20
+            || self.evidence_total < self.evidence.len() as u64
+            || self.evidence.iter().any(|e| {
+                e.reference.is_empty() || e.reference.len() > 512 || e.summary.len() > 2048
+            })
             || self
                 .todos
                 .iter()
@@ -58,6 +82,8 @@ impl CampaignSnapshot {
                 &self.resources.final_tokens,
                 &self.resources.final_cost_micro_usd,
                 &self.resources.unresolved_native_jobs,
+                &self.resources.unresolved_tokens,
+                &self.resources.unresolved_cost_micro_usd,
             ]
             .iter()
             .any(|v| {
@@ -81,6 +107,9 @@ mod tests {
     #[test]
     fn compact_render_is_deterministic_bounded_and_preserves_unknown() {
         let mut s = CampaignSnapshot {
+            triggers: vec![],
+            evidence_total: 0,
+            evidence: vec![],
             id: "c".into(),
             revision: 2,
             objective_summary: "Ship".into(),
@@ -88,6 +117,8 @@ mod tests {
             todos: vec![],
             todos_partial: false,
             resources: ResourceSnapshot {
+                unresolved_tokens: None,
+                unresolved_cost_micro_usd: None,
                 sampled_at_ms: None,
                 stale: true,
                 final_tokens: None,

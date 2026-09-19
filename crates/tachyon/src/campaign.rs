@@ -201,6 +201,16 @@ pub fn run(action: CampaignAction) -> ExitCode {
                 }
             }
             CampaignAction::Inspect { id } => ApiRequest::CampaignInspect { id },
+            CampaignAction::Assessments { id } => ApiRequest::CampaignAssessmentList { id },
+            CampaignAction::Assess {
+                id,
+                command_id,
+                unisolated_development,
+            } => ApiRequest::CampaignAssessmentRequest {
+                id,
+                command_id,
+                unisolated_development,
+            },
             CampaignAction::Recover {
                 id,
                 unisolated_development,
@@ -275,6 +285,20 @@ pub fn run(action: CampaignAction) -> ExitCode {
                 "Answer accepted: work={:?} request={:?}",
                 attention.work_id, attention.request_id
             ),
+            ApiResponse::CampaignAssessments { records } => {
+                for record in records {
+                    println!(
+                        "{} revision={} status={} triggers={}",
+                        record.request_id,
+                        record.revision,
+                        record.status,
+                        record.triggers.join(",")
+                    );
+                    if let Some(published) = record.published {
+                        println!("{}", published.advisory());
+                    }
+                }
+            }
             ApiResponse::CampaignInspection {
                 campaign,
                 diagnostics,

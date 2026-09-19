@@ -393,85 +393,112 @@ mod tests {
     #[tokio::test]
     async fn local_review_uses_only_registry_review_schema_and_preserves_decision() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let model = local_model(listener.local_addr().unwrap());
-        let request = request(WorkOutcome::Completed {
-            result: "verified".into(),
-            artifacts: vec![],
-            context: String::new(),
-            suggested_reuse: false,
-        });
-        let server = async {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            let mut length = 0;
-            loop {
-                line.clear();
-                assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        length = value.trim().parse::<usize>().unwrap();
+        for fresh_lookup in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let model = local_model(listener.local_addr().unwrap());
+            let mut request = request(WorkOutcome::Completed {
+                result: "verified".into(),
+                artifacts: vec![],
+                context: String::new(),
+                suggested_reuse: false,
+            });
+            if fresh_lookup {
+                request.candidate.objective = "Retrieve fresh source evidence".into();
+            }
+            let server = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
                     }
                 }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let schema = tachyon_orchestrator::agents::coordinator::tools::review_tool();
+                assert_eq!(
+                    body["tools"],
+                    json!([{"type":"function", "function": {
+                        "name": schema.name, "description": schema.description, "parameters": schema.parameters
+                    }}])
+                );
+                let prompt = registry::builtin()
+                    .resolve(
+                        RoleId::Coordinator,
+                        HostLane::Background,
+                        InvocationKind::Review,
+                    )
+                    .unwrap()
+                    .render(InvocationContext {
+                        identity: None,
+                        persona: Some("fixture persona"),
+                    })
+                    .unwrap()
+                    .prompt;
+                assert_eq!(body["messages"][0]["content"], prompt);
+                let received: WorkReviewRequest =
+                    serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+                assert_eq!(received.candidate.evidence, request.candidate.evidence);
+                assert_eq!(received.candidate.evidence.observed_invocations, None);
+                let arguments = if fresh_lookup {
+                    "{\"decision\":\"rework\",\"rationale\":\"fresh source evidence missing\"}"
+                } else {
+                    "{\"decision\":\"accept\",\"lifecycle\":\"keep_current\",\"rationale\":\"verified\"}"
+                };
+                let body = format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"review-call","type":"function","function":{"name":REVIEW_TOOL,"arguments":arguments}}]},"finish_reason":"tool_calls"}]})
+                );
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                reader
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            };
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let (result, ()) = tokio::join!(
+                    review(&request, Some(&model), Some("fixture persona")),
+                    server
+                );
+                result
+            })
+            .await
+            .unwrap();
+            if fresh_lookup {
+                assert_eq!(
+                    result,
+                    decision(
+                        &request,
+                        WorkReviewRecommendation::Rework {
+                            revised_objective: None
+                        },
+                        "fresh source evidence missing"
+                    )
+                );
+            } else {
+                assert_eq!(
+                    result,
+                    decision(
+                        &request,
+                        WorkReviewRecommendation::Accept {
+                            lifecycle: LifecycleRecommendation::KeepCurrent
+                        },
+                        "verified"
+                    )
+                );
             }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).await.unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            let schema = tachyon_orchestrator::agents::coordinator::tools::review_tool();
-            assert_eq!(
-                body["tools"],
-                json!([{"type":"function", "function": {
-                    "name": schema.name, "description": schema.description, "parameters": schema.parameters
-                }}])
-            );
-            let prompt = registry::builtin()
-                .resolve(
-                    RoleId::Coordinator,
-                    HostLane::Background,
-                    InvocationKind::Review,
-                )
-                .unwrap()
-                .render(InvocationContext {
-                    identity: None,
-                    persona: Some("fixture persona"),
-                })
-                .unwrap()
-                .prompt;
-            assert_eq!(body["messages"][0]["content"], prompt);
-            let body = format!(
-                "data: {}\n\ndata: [DONE]\n\n",
-                json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"review-call","type":"function","function":{"name":REVIEW_TOOL,"arguments":"{\"decision\":\"accept\",\"lifecycle\":\"keep_current\",\"rationale\":\"verified\"}"}}]},"finish_reason":"tool_calls"}]})
-            );
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-            reader
-                .get_mut()
-                .write_all(response.as_bytes())
-                .await
-                .unwrap();
-        };
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let (result, ()) = tokio::join!(
-                review(&request, Some(&model), Some("fixture persona")),
-                server
-            );
-            result
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            result,
-            decision(
-                &request,
-                WorkReviewRecommendation::Accept {
-                    lifecycle: LifecycleRecommendation::KeepCurrent
-                },
-                "verified"
-            )
-        );
+        }
     }
 
     #[tokio::test]
@@ -540,6 +567,7 @@ mod tests {
             output: json!({"content":"ValueError: fixture", "is_error":true, "truncated":false, "metadata":{"exit_code":1}}),
         });
         request.candidate.evidence.omitted = 2;
+        request.candidate.evidence.observed_invocations = Some(4);
         let rendered = registry::builtin()
             .resolve(
                 RoleId::Coordinator,

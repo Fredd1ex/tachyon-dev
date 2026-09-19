@@ -11,6 +11,7 @@ use thiserror::Error;
 pub mod accounting;
 #[cfg(unix)]
 pub mod broker;
+pub mod web;
 use accounting::{AccountingContext, RequestUsage};
 
 #[derive(Debug, Error)]
@@ -23,9 +24,28 @@ pub enum ModelError {
     Io(#[from] std::io::Error),
     #[error("api error: {0}")]
     Api(String),
+    #[error("provider HTTP {status} (request id: {request_id:?})")]
+    UnexpectedHttp {
+        status: u16,
+        request_id: Option<String>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, ModelError>;
+
+tokio::task_local! {
+    static OUTPUT_OBSERVER: Box<dyn Fn() + Send + Sync>;
+}
+
+/// Observe the first semantic output of each provider request in this future.
+/// Reports presence only, never content or reasoning. Child tasks do not inherit
+/// the observer; existing chat callers and provider wire payloads are unchanged.
+pub async fn with_output_observer<T>(
+    future: impl std::future::Future<Output = T>,
+    observer: impl Fn() + Send + Sync + 'static,
+) -> T {
+    OUTPUT_OBSERVER.scope(Box::new(observer), future).await
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Reasoning {
@@ -340,6 +360,8 @@ struct SseChoice {
     #[serde(default)]
     delta: SseDelta,
     #[serde(default)]
+    message: Option<SseDelta>,
+    #[serde(default)]
     finish_reason: Option<String>,
 }
 
@@ -362,6 +384,56 @@ struct SseToolCallDelta {
 struct SseFunctionDelta {
     name: Option<String>,
     arguments: Option<String>,
+}
+
+impl SseDelta {
+    fn has_semantic_output(&self) -> bool {
+        self.content
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+            || self.tool_calls.as_ref().is_some_and(|calls| {
+                calls.iter().any(|call| {
+                    call.id.as_deref().is_some_and(|id| !id.is_empty())
+                        || call.function.as_ref().is_some_and(|function| {
+                            function
+                                .name
+                                .as_deref()
+                                .is_some_and(|name| !name.is_empty())
+                                || function
+                                    .arguments
+                                    .as_deref()
+                                    .is_some_and(|args| !args.is_empty())
+                        })
+                })
+            })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn semantic_output_excludes_role_usage_empty_text_and_reasoning() {
+    for (wire, expected) in [
+        (json!({"role":"assistant"}), false),
+        (json!({"content":" \n"}), false),
+        (
+            json!({"reasoning_content":"private", "reasoning":"private"}),
+            false,
+        ),
+        (json!({"tool_calls":[]}), false),
+        (json!({"tool_calls":[{"index":0}]}), false),
+        (json!({"content":"answer"}), true),
+        (
+            json!({"tool_calls":[{"index":0,"function":{"name":"lookup"}}]}),
+            true,
+        ),
+        (
+            json!({"tool_calls":[{"index":0,"function":{"arguments":"{"}}]}),
+            true,
+        ),
+    ] {
+        let delta: SseDelta = serde_json::from_value(wire).unwrap();
+        assert_eq!(delta.has_semantic_output(), expected);
+    }
 }
 
 struct ToolArgumentStream {
@@ -655,8 +727,47 @@ impl Model {
         tools: Option<&[ToolSpec]>,
         on_delta: &mut (dyn FnMut(&str) + Send),
     ) -> Result<Completion> {
-        self.chat_with_tool_choice(messages, tools, None, on_delta, None)
+        self.chat_with_tool_choice(messages, tools, None, on_delta, None, None, None)
             .await
+    }
+
+    /// Tool-free streaming with a host byte bound, including SSE framing and
+    /// unexpected tool arguments. A missing terminal SSE marker is an error.
+    pub async fn chat_bounded(
+        &self,
+        messages: &[ChatMessage],
+        max_response_bytes: usize,
+        on_delta: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<Completion> {
+        self.chat_with_tool_choice(
+            messages,
+            None,
+            None,
+            on_delta,
+            None,
+            Some(max_response_bytes),
+            None,
+        )
+        .await
+    }
+
+    /// Standalone host transport: bounded response without changing model routing.
+    pub async fn chat_tools_bounded(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        max_response_bytes: usize,
+    ) -> Result<Completion> {
+        self.chat_with_tool_choice(
+            messages,
+            Some(tools),
+            None,
+            &mut |_| {},
+            None,
+            Some(max_response_bytes),
+            None,
+        )
+        .await
     }
 
     /// Require the model to select one supplied tool and stream the selected
@@ -673,6 +784,8 @@ impl Model {
             Some(tools),
             Some(streamed_argument),
             on_delta,
+            None,
+            None,
             None,
         )
         .await
@@ -694,6 +807,8 @@ impl Model {
             streamed_argument,
             on_delta,
             Some(accounting),
+            None,
+            None,
         )
         .await
     }
@@ -705,8 +820,14 @@ impl Model {
         streamed_argument: Option<(&str, &str)>,
         on_delta: &mut (dyn FnMut(&str) + Send),
         accounting: Option<&AccountingContext<'_>>,
+        response_byte_limit: Option<usize>,
+        mut web: Option<&mut web::WebStream>,
     ) -> Result<Completion> {
-        let context = fit_context(messages, self.context_length);
+        let context = if web.is_some() {
+            messages.to_vec()
+        } else {
+            fit_context(messages, self.context_length)
+        };
         let wire: Vec<WireMessage> = context.iter().map(to_wire).collect();
         let tools_wire: Vec<serde_json::Value> = tools
             .map(|ts| ts.iter().map(|t| t.to_json()).collect())
@@ -747,7 +868,21 @@ impl Model {
             });
         }
 
-        if self.debug {
+        if let Some(web) = web.as_ref() {
+            body["tools"] = json!([web.tool]);
+            body["max_tool_calls"] = json!(web.limits.max_tool_calls);
+            body["max_tokens"] = json!(web.limits.max_output_tokens);
+            body.as_object_mut()
+                .unwrap()
+                .remove("max_completion_tokens");
+            // Native function-call scheduling is not a server-tool requirement.
+            body.as_object_mut().unwrap().remove("parallel_tool_calls");
+            body["reasoning"] = json!({"enabled": false});
+            body["provider"]["allow_fallbacks"] = json!(false);
+            body["provider"]["require_parameters"] = json!(true);
+        }
+
+        if self.debug && web.is_none() {
             if let Some(log_path) = &self.debug_log {
                 if let Some(dir) = log_path.parent() {
                     let _ = std::fs::create_dir_all(dir);
@@ -772,8 +907,7 @@ impl Model {
         // Accounted requests pin routing and prohibit invisible redirect/retry
         // dispatch. Host bounds cover this exact serialized body, not fit_context's
         // heuristic. No accounting state is added to the provider wire payload.
-        let accounted_http;
-        let http = if let Some(context) = accounting {
+        if let Some(context) = accounting {
             let estimate = &context.request.estimate;
             estimate.upper_bound()?;
             if estimate.base_url != self.base_url
@@ -793,6 +927,9 @@ impl Model {
                     "wire request exceeds host byte bound".into(),
                 ));
             }
+        }
+        let accounted_http;
+        let http = if accounting.is_some() || response_byte_limit.is_some() {
             accounted_http = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
@@ -802,6 +939,7 @@ impl Model {
             &self.http
         };
         let mut billed_usage = RequestUsage::Unknown;
+        let mut billing_unknown_seen = false;
         let mut billing_done = false;
         accounting::dispatch(accounting, || async {
             let resp = http
@@ -814,7 +952,26 @@ impl Model {
 
             if !resp.status().is_success() {
                 let status = resp.status();
-                if accounting.is_some() {
+                if web.is_some() {
+                    // Never retain the response body: it may echo prompts or credentials.
+                    let request_id = resp
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|value| value.to_str().ok())
+                        .filter(|value| {
+                            !value.is_empty()
+                                && value.len() <= 128
+                                && value
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                        })
+                        .map(|value| self.redact_trace(value));
+                    return Err(ModelError::UnexpectedHttp {
+                        status: status.as_u16(),
+                        request_id,
+                    });
+                }
+                if accounting.is_some() || response_byte_limit.is_some() {
                     return Err(ModelError::Api(format!("status {status}")));
                 }
                 let text = resp.text().await.unwrap_or_default();
@@ -832,12 +989,18 @@ impl Model {
             let mut stream = resp.bytes_stream();
             let mut buf = Vec::new();
             let mut response_bytes = 0usize;
+            let mut first_output = false;
             'stream: while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
-                if accounting.is_some() {
+                if let Some(limit) = response_byte_limit.or_else(|| accounting.map(|_| 1024 * 1024))
+                {
                     response_bytes = response_bytes.saturating_add(chunk.len());
-                    if response_bytes > 1024 * 1024 {
-                        return Err(ModelError::Api("accounted response byte limit".into()));
+                    if response_bytes > limit {
+                        return Err(ModelError::Api(if accounting.is_some() {
+                            "accounted response byte limit".into()
+                        } else {
+                            "response byte limit".into()
+                        }));
                     }
                 }
                 buf.extend_from_slice(&chunk);
@@ -847,7 +1010,26 @@ impl Model {
                         billing_done = true;
                         break 'stream;
                     }
-                    if accounting.is_some() && !data.is_empty() {
+                    if response_byte_limit.is_some() && !data.is_empty() {
+                        let raw: serde_json::Value = serde_json::from_slice(&data)
+                            .map_err(|_| ModelError::Api("malformed response stream".into()))?;
+                        if raw.get("error").is_some() {
+                            if web.is_some() {
+                                let code = raw
+                                    .pointer("/error/code")
+                                    .and_then(serde_json::Value::as_u64);
+                                return Err(ModelError::Api(match code {
+                                    Some(code) => format!("provider stream error; code {code}"),
+                                    None => "provider stream error".into(),
+                                }));
+                            }
+                            return Err(ModelError::Api("provider stream error".into()));
+                        }
+                        if let Some(web) = web.as_mut() {
+                            web.observe(self, &raw)?;
+                        }
+                    }
+                    if (accounting.is_some() || web.is_some()) && !data.is_empty() {
                         let raw: serde_json::Value =
                             serde_json::from_slice(&data).map_err(|e| {
                                 ModelError::Api(format!("malformed billing stream: {e}"))
@@ -855,9 +1037,22 @@ impl Model {
                         if raw.get("error").is_some() {
                             return Err(ModelError::Api("provider stream error".into()));
                         }
-                        if let Some(value) = raw.get("usage").filter(|v| !v.is_null()) {
-                            let parsed = accounting::openrouter_usage(value)
-                                .ok_or_else(|| ModelError::Api("malformed billing usage".into()))?;
+                        let usage = if web.is_some() {
+                            web::billing_usage(&raw)
+                        } else {
+                            raw.get("usage").filter(|v| !v.is_null())
+                        };
+                        if let Some(value) = usage {
+                            let parsed = match accounting::openrouter_usage(value) {
+                                Some(parsed) => parsed,
+                                None if web.is_some() => {
+                                    billing_unknown_seen = true;
+                                    RequestUsage::Unknown
+                                }
+                                None => {
+                                    return Err(ModelError::Api("malformed billing usage".into()))
+                                }
+                            };
                             if billed_usage != RequestUsage::Unknown && billed_usage != parsed {
                                 return Err(ModelError::Api("conflicting billing usage".into()));
                             }
@@ -868,9 +1063,54 @@ impl Model {
                         if let Some(chunk_usage) = chunk.usage {
                             usage = chunk_usage;
                         }
-                        for choice in chunk.choices {
+                        for mut choice in chunk.choices {
+                            if web.is_some() {
+                                if let Some(message) = choice.message.take() {
+                                    if choice.delta.content.is_some()
+                                        || choice.delta.tool_calls.is_some()
+                                    {
+                                        return Err(ModelError::Api(
+                                            "ambiguous web response message".into(),
+                                        ));
+                                    }
+                                    if let Some(snapshot) = message.content.as_ref() {
+                                        if !snapshot.starts_with(&text) {
+                                            return Err(ModelError::Api(
+                                                "conflicting web response message".into(),
+                                            ));
+                                        }
+                                        choice.delta.content =
+                                            Some(snapshot[text.len()..].to_string());
+                                    }
+                                    choice.delta.tool_calls = message.tool_calls;
+                                }
+                            }
+                            if web.is_some()
+                                && choice
+                                    .delta
+                                    .tool_calls
+                                    .as_ref()
+                                    .is_some_and(|calls| !calls.is_empty())
+                            {
+                                return Err(ModelError::Api(
+                                    "unexpected client tool call in web report".into(),
+                                ));
+                            }
+                            if !first_output && choice.delta.has_semantic_output() {
+                                first_output = true;
+                                let _ = OUTPUT_OBSERVER.try_with(|observer| observer());
+                            }
                             if let Some(fr) = &choice.finish_reason {
                                 if !fr.is_empty() {
+                                    if web.is_some()
+                                        && finish_reason
+                                            .as_ref()
+                                            .is_some_and(|previous| previous != fr)
+                                    {
+                                        return Err(ModelError::Api(
+                                            "conflicting web finish reason".into(),
+                                        ));
+                                    }
                                     finish_reason = Some(fr.clone());
                                 }
                             }
@@ -879,10 +1119,21 @@ impl Model {
                                     on_delta(&content);
                                 }
                                 text.push_str(&content);
+                                if web
+                                    .as_ref()
+                                    .is_some_and(|w| text.len() > w.limits.max_answer_bytes)
+                                {
+                                    return Err(ModelError::Api("web answer byte limit".into()));
+                                }
+                                if let Some(web) = web.as_mut() {
+                                    web.retained_text.clone_from(&text);
+                                }
                             }
                             if let Some(tcs) = choice.delta.tool_calls {
                                 for tc in tcs {
-                                    if accounting.is_some() && tc.index >= 64 {
+                                    if (accounting.is_some() || response_byte_limit.is_some())
+                                        && tc.index >= 64
+                                    {
                                         return Err(ModelError::Api(
                                             "accounted tool call limit".into(),
                                         ));
@@ -919,8 +1170,16 @@ impl Model {
                                 }
                             }
                         }
+                    } else if response_byte_limit.is_some() && !data.is_empty() {
+                        return Err(ModelError::Api("malformed response delta".into()));
                     }
                 }
+            }
+            if response_byte_limit.is_some() && !billing_done {
+                return Err(ModelError::Api("incomplete response stream".into()));
+            }
+            if web.is_some() && finish_reason.is_none() {
+                return Err(ModelError::Api("web response missing finish reason".into()));
             }
             if let Some(stream) = argument_stream.as_mut() {
                 if let Some(delta) = stream.finish() {
@@ -930,6 +1189,13 @@ impl Model {
 
             usage.context_tokens = usage.prompt_tokens;
             usage.context_window = self.context_length;
+            if let Some(web) = web.as_mut() {
+                web.usage = if billing_done && !billing_unknown_seen {
+                    billed_usage
+                } else {
+                    RequestUsage::Unknown
+                };
+            }
             Ok((
                 Completion {
                     text,
@@ -937,7 +1203,7 @@ impl Model {
                     usage,
                     finish_reason,
                 },
-                if billing_done {
+                if billing_done && !billing_unknown_seen {
                     billed_usage
                 } else {
                     RequestUsage::Unknown

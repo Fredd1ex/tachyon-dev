@@ -87,6 +87,68 @@ fn record(value: &[u8], scope: &TodoScope, id: &str) -> Result<Todo, TodoError> 
     Ok(todo)
 }
 
+/// Bounded first-page projection in the caller's canonical snapshot. Descriptions
+/// are not assessment input; retaining them would defeat the prompt byte bound.
+pub(super) fn assessment_page_in(
+    tx: &redb::ReadTransaction,
+    campaign: &str,
+) -> Result<TodoResponse, String> {
+    let read = || -> Result<TodoResponse, TodoError> {
+        let scope = TodoScope::Campaign {
+            campaign_id: campaign.into(),
+        };
+        let key = scope_key(&scope)?;
+        let revision = tx
+            .open_table(SCOPES)
+            .map_err(storage)?
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|v| v.value())
+            .unwrap_or(0);
+        let watermark =
+            feed::watermark(&tx.open_table(feed::METADATA).map_err(storage)?).map_err(storage)?;
+        let order = tx.open_table(ORDER).map_err(storage)?;
+        let records = tx.open_table(RECORDS).map_err(storage)?;
+        let mut todos = Vec::new();
+        for entry in order
+            .range((key.as_str(), 0, "")..=(key.as_str(), u64::MAX, "\u{10ffff}"))
+            .map_err(storage)?
+            .take(21)
+        {
+            let (index, _) = entry.map_err(storage)?;
+            let (_, _, id) = index.value();
+            let value = records
+                .get((key.as_str(), id))
+                .map_err(storage)?
+                .ok_or_else(|| storage("missing indexed todo"))?;
+            let mut todo = record(value.value(), &scope, id)?;
+            todo.description.clear();
+            todos.push(todo);
+        }
+        let more = todos.len() > 20;
+        todos.truncate(20);
+        let next_cursor = more.then(|| {
+            let last = todos.last().unwrap();
+            TodoCursor {
+                version: 1,
+                instance_id: watermark.instance_id.clone(),
+                scope: scope.clone(),
+                filter: Default::default(),
+                scope_revision: revision,
+                after_order_key: last.order_key,
+                after_id: last.id.clone(),
+            }
+        });
+        Ok(TodoResponse::List {
+            todos,
+            scope_revision: revision,
+            watermark,
+            next_cursor,
+        })
+    };
+    read().map_err(|e| format!("assessment todos: {e:?}"))
+}
+
 #[derive(Serialize, Deserialize)]
 struct Receipt {
     schema_version: u32,
@@ -404,6 +466,12 @@ impl TodoFacade<'_> {
             TodoRequest::List { .. } => unreachable!(),
         };
         let bytes = encode(&todo)?;
+        if todo.status == TodoStatus::Blocked {
+            if let TodoScope::Campaign { campaign_id } = &todo.scope {
+                super::campaign_oversight::trigger_in(&tx, campaign_id, "blocked_state")
+                    .map_err(storage)?;
+            }
+        }
         tx.open_table(RECORDS)
             .map_err(storage)?
             .insert((key.as_str(), todo.id.as_str()), bytes.as_slice())

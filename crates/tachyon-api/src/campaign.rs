@@ -162,6 +162,10 @@ impl ReconciliationReceipt {
 #[serde(deny_unknown_fields)]
 pub struct CampaignManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<CampaignWeb>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oversight: Option<CampaignOversight>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_storage_bytes: Option<u64>,
     pub schema_version: u32,
     pub campaign_id: String,
@@ -190,6 +194,28 @@ pub struct CampaignManifest {
     pub allocation: Option<CampaignAllocation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compute: Option<ComputeEnvelope>,
+}
+
+/// An allowance, not extra funding. All web billing debits existing Work allocations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignWeb {
+    pub max_requests: u8,
+    pub max_server_calls: u8,
+    /// Actual OpenRouter inference provider slug, never the gateway name.
+    pub inference_provider: String,
+}
+
+/// Explicit host approval only. Uses the campaign model, pricing and request caps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignOversight {
+    pub tokens: u64,
+    pub cost_micro_usd: u64,
+    pub max_assessments: u64,
+    pub timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
 }
 
 /// Aggregate native-job wall time, not CPU cycles or GPU utilization.
@@ -732,6 +758,30 @@ mod tests {
             "\"retained_storage_bytes\":18446744073709551616",
         );
         assert!(CampaignManifest::parse(overflowing.as_bytes(), 1).is_err());
+    }
+
+    #[test]
+    fn web_allowance_is_explicit_strict_and_does_not_increase_funding() {
+        let mut value = fixture();
+        assert!(parse(&value).unwrap().web.is_none());
+        value["web"] = serde_json::json!({"max_requests":2,"max_server_calls":4,"inference_provider":"test-provider"});
+        assert!(parse(&value).is_err()); // No existing fee allowance.
+        value["other_micro_usd"] = serde_json::json!(1);
+        let grant = parse(&value).unwrap();
+        assert_eq!(grant.work_cost_micro_usd, 100);
+        assert_eq!(grant.other_micro_usd, 1);
+        for (field, invalid) in [
+            ("max_requests", serde_json::json!(0)),
+            ("max_requests", serde_json::json!(5)),
+            ("max_server_calls", serde_json::json!(17)),
+            ("inference_provider", serde_json::json!("openrouter")),
+            ("inference_provider", serde_json::json!(" openrouter")),
+            ("extra_money", serde_json::json!(1)),
+        ] {
+            let mut changed = value.clone();
+            changed["web"][field] = invalid;
+            assert!(parse(&changed).is_err());
+        }
     }
     fn child_repair_bounds(value: &serde_json::Value, pointer: &str) {
         let original = parse(value).unwrap();
@@ -1500,6 +1550,21 @@ impl CampaignManifest {
     }
 
     pub fn validate(&self, now_ms: u64) -> Result<(), String> {
+        if let Some(web) = &self.web {
+            if !(1..=4).contains(&web.max_requests)
+                || !(1..=16).contains(&web.max_server_calls)
+                || web.inference_provider.trim().is_empty()
+                || web.inference_provider.len() > 128
+                || web.inference_provider.eq_ignore_ascii_case("openrouter")
+                || web
+                    .inference_provider
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace())
+                || self.other_micro_usd == 0
+            {
+                return Err("invalid campaign web allowance or inference provider".into());
+            }
+        }
         if self.retained_storage_bytes == Some(0) {
             return Err("retained_storage_bytes must be positive".into());
         }
@@ -1611,6 +1676,29 @@ impl CampaignManifest {
             + u128::from(self.other_micro_usd);
         if tokens > self.work_tokens || cost > u128::from(self.work_cost_micro_usd) {
             return Err("request upper bound exceeds work budget".into());
+        }
+        let mut root_tokens = self.work_tokens;
+        let mut root_cost = self.work_cost_micro_usd;
+        if let Some(o) = &self.oversight {
+            if !(1..=64).contains(&o.max_assessments)
+                || !(1..=300_000).contains(&o.timeout_ms)
+                || o.tokens < tokens
+                || u128::from(o.cost_micro_usd) < cost
+                || o.conversation_id.as_ref().is_some_and(|id| {
+                    id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control)
+                })
+            {
+                return Err("invalid bounded oversight policy".into());
+            }
+            root_tokens = root_tokens
+                .checked_sub(o.tokens)
+                .ok_or("oversight exceeds Work tokens")?;
+            root_cost = root_cost
+                .checked_sub(o.cost_micro_usd)
+                .ok_or("oversight exceeds Work cost")?;
+            if root_tokens < tokens || u128::from(root_cost) < cost {
+                return Err("oversight must leave the root minimum request budget".into());
+            }
         }
         if let Some(children) = &self.children {
             for child in children
@@ -1773,8 +1861,8 @@ impl CampaignManifest {
             let mut groups = BTreeSet::new();
             let mut paths = vec![&self.workspace, &self.home];
             let mut remaining = [
-                self.work_tokens,
-                self.work_cost_micro_usd,
+                root_tokens,
+                root_cost,
                 self.verification_tokens,
                 self.verification_cost_micro_usd,
             ];

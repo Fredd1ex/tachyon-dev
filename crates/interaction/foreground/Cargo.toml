@@ -16,6 +16,10 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tachyon-api.workspace = true
+tachyon-client.workspace = true
 tachyon-model.workspace = true
 tachyon-orchestrator.workspace = true
 tachyon-util.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

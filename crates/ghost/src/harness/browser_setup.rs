@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
@@ -15,6 +17,71 @@ const BROWSER_SETUP_STAMP_VERSION: u32 = 3;
 const BROWSER_SETUP_STAMP: &str = "browser-setup.verified.json";
 const AGENT_BROWSER_ENGINE: &str = "lightpanda";
 const DEFAULT_MAX_OUTPUT: &str = "30000";
+
+// Process-local negative cache: no persistent host state or cross-root poisoning.
+struct SetupFailure {
+    key: String,
+    message: String,
+    expires: Instant,
+}
+
+static FAILURES: OnceLock<Mutex<HashMap<PathBuf, SetupFailure>>> = OnceLock::new();
+const FAILURE_TTL: Duration = Duration::from_secs(3600);
+const TRANSIENT_COOLDOWN: Duration = Duration::from_secs(60);
+const TRANSIENT_PREFIX: &str = "transient browser setup: ";
+
+fn failure_key(
+    root: &Path,
+    agent: Option<&std::ffi::OsStr>,
+    light: Option<&std::ffi::OsStr>,
+    download: &(Result<&str, String>, &str),
+) -> String {
+    let metadata = |path: &Path| {
+        path.metadata().ok().map(|m| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mode(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        })
+    };
+    let agent_path = agent
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("agent-browser/bin/agent-browser"));
+    let light_path = light
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("lightpanda/lightpanda"));
+    let root_identity = root.metadata().ok().map(|m| (m.dev(), m.ino()));
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{:?}",
+                (
+                    BROWSER_SETUP_STAMP_VERSION,
+                    AGENT_BROWSER_VERSION,
+                    AGENT_BROWSER_ENGINE,
+                    std::env::var_os("AGENT_BROWSER_MAX_OUTPUT")
+                        .unwrap_or_else(|| DEFAULT_MAX_OUTPUT.into()),
+                    canonicalize_or_original(root.to_owned()),
+                    root_identity,
+                    agent,
+                    light,
+                    download,
+                    (&agent_path, metadata(&agent_path)),
+                    (&light_path, metadata(&light_path)),
+                    metadata(&root.join(BROWSER_SETUP_STAMP)),
+                )
+            )
+            .as_bytes()
+        )
+    )
+}
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct BrowserSetupStamp {
@@ -73,7 +140,44 @@ fn ensure_at(
         .map_err(|error| format!("failed to open browser setup lock: {error}"))?;
     lock_setup(&lock, Instant::now() + Duration::from_secs(20))?;
 
-    let result = ensure_locked(tools_root, agent, light, download);
+    let failures = FAILURES.get_or_init(Default::default);
+    let root = canonicalize_or_original(tools_root.to_owned());
+    let key = failure_key(tools_root, agent, light, &download);
+    {
+        let mut failures = failures
+            .lock()
+            .map_err(|_| "browser setup failure cache lock poisoned")?;
+        failures.retain(|_, failure| failure.expires > Instant::now());
+        if let Some(failure) = failures.get(&root).filter(|failure| failure.key == key) {
+            return Err(failure.message.clone());
+        }
+        failures.remove(&root);
+    }
+    let result = ensure_locked(tools_root, agent, light, download.clone());
+    let result = result.map_err(|message| {
+        let transient = message.starts_with(TRANSIENT_PREFIX);
+        let message = message.strip_prefix(TRANSIENT_PREFIX).unwrap_or(&message);
+        let recovery = if transient {
+            "bounded attempts exhausted; host may retry after 60s"
+        } else {
+            "repair the configured executable or update the pin/configuration before retrying (failure cache expires after 1h)"
+        };
+        let message = format!("{message}; {recovery}. Do not repeat agent_browser unchanged.");
+        // Setup may have published agent-browser before Lightpanda failed.
+        let key = failure_key(tools_root, agent, light, &download);
+        if let Ok(mut failures) = failures.lock() {
+            failures.insert(
+                root,
+                SetupFailure {
+                    key,
+                    message: message.clone(),
+                    expires: Instant::now()
+                        + if transient { TRANSIENT_COOLDOWN } else { FAILURE_TTL },
+                },
+            );
+        }
+        message
+    });
     let _ = FileExt::unlock(&lock);
     result
 }
@@ -99,6 +203,17 @@ fn ensure_locked(
     configured_lightpanda: Option<&std::ffi::OsStr>,
     download: (Result<&str, String>, &str),
 ) -> Result<(PathBuf, PathBuf), String> {
+    if configured_lightpanda.is_none() {
+        download.0.as_ref().map_err(Clone::clone)?;
+        if download.1.len() != 64
+            || !download
+                .1
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("Lightpanda pin requires a published lowercase SHA-256 digest".into());
+        }
+    }
     let stamp_path = tools_root.join(BROWSER_SETUP_STAMP);
     let agent_browser_root = tools_root.join("agent-browser");
     let managed_agent_browser = agent_browser_root.join("bin/agent-browser");
@@ -354,9 +469,18 @@ fn valid_lightpanda(program: &Path) -> bool {
     version_output(program, &["version"], Duration::from_secs(5)).is_some_and(|version| {
         // Lightpanda prints build_config.version as one line, without a product prefix.
         let version = version.trim();
+        let mut core = version
+            .split(['-', '+'])
+            .next()
+            .unwrap_or_default()
+            .split('.');
+        let valid_core = (0..3).all(|_| {
+            core.next()
+                .is_some_and(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        }) && core.next().is_none();
         !version.is_empty()
             && version.len() <= 128
-            && version.chars().any(|c| c.is_ascii_digit())
+            && valid_core
             && version
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
@@ -392,18 +516,73 @@ fn download_executable(
     digest: Option<&str>,
     validate: fn(&Path) -> bool,
 ) -> Result<(), String> {
+    download_executable_until(
+        url,
+        destination,
+        name,
+        digest,
+        validate,
+        Instant::now() + Duration::from_secs(120),
+    )
+}
+
+fn download_executable_until(
+    url: &str,
+    destination: &Path,
+    name: &str,
+    digest: Option<&str>,
+    validate: fn(&Path) -> bool,
+    deadline: Instant,
+) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|error| format!("failed to create {name} downloader: {error}"))?;
-    let response = client
-        .get(url)
-        .header("Accept", "application/octet-stream")
-        .header("User-Agent", "tachyon-browser-setup")
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(|error| format!("failed to download {name}: {error}"))?;
-    stage_executable(response, destination, name, digest, validate)
+    for attempt in 0..2 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "{TRANSIENT_PREFIX}failed to download {name}: download deadline expired"
+            ));
+        }
+        let response = client
+            .get(url)
+            .timeout(remaining)
+            .header("Accept", "application/octet-stream")
+            .header("User-Agent", "tachyon-browser-setup")
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status);
+        let result = match response {
+            Ok(response) => stage_executable(response, destination, name, digest, validate),
+            Err(error) => {
+                let status = error.status();
+                let transient = status.is_some_and(|s| s.is_server_error() || s.as_u16() == 429)
+                    || error.is_timeout()
+                    || error.is_connect();
+                // Do not expose redirect URLs, proxy credentials, or response bodies.
+                let reason = status
+                    .map(|s| format!("HTTP {}", s.as_u16()))
+                    .unwrap_or_else(|| "network request failed".into());
+                Err(format!(
+                    "{}failed to download {name}: {reason}",
+                    if transient { TRANSIENT_PREFIX } else { "" }
+                ))
+            }
+        };
+        if attempt == 0
+            && result
+                .as_ref()
+                .is_err_and(|error| error.starts_with(TRANSIENT_PREFIX))
+        {
+            std::thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            );
+            continue;
+        }
+        return result;
+    }
+    unreachable!("bounded download attempts return a result")
 }
 
 fn stage_executable(
@@ -430,8 +609,21 @@ fn stage_executable(
             .create_new(true)
             .open(&download)
             .map_err(|error| format!("failed to create {name} download: {error}"))?;
-        let count = std::io::copy(&mut response.take(256 * 1024 * 1024 + 1), &mut file)
-            .map_err(|error| format!("failed to save {name} download: {error}"))?;
+        let mut response = response.take(256 * 1024 * 1024 + 1);
+        let mut count = 0;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            // Keep transport errors distinct from local writes, without leaking URLs.
+            let read = response.read(&mut buffer).map_err(|_| {
+                format!("{TRANSIENT_PREFIX}failed to download {name}: response body read failed")
+            })?;
+            if read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..read])
+                .map_err(|error| format!("failed to save {name} download: {error}"))?;
+            count += read;
+        }
         if count == 0 || count > 256 * 1024 * 1024 {
             return Err(format!("{name} download has invalid size"));
         }
@@ -492,16 +684,21 @@ fn agent_browser_download_url() -> Result<String, String> {
 }
 
 fn lightpanda_download() -> (Result<&'static str, String>, &'static str) {
-    // GitHub asset IDs and published SHA-256 digests, inspected 2026-09-09.
-    // Never follow the mutable nightly tag to a replacement executable.
-    match (std::env::consts::OS, std::env::consts::ARCH) {
+    lightpanda_download_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn lightpanda_download_for(os: &str, arch: &str) -> (Result<&'static str, String>, &'static str) {
+    // Official GitHub release metadata, inspected 2026-09-18:
+    // https://api.github.com/repos/lightpanda-io/browser/releases/tags/0.4.1
+    // GitHub reports immutable=false; the mandatory digest fixes accepted bytes.
+    match (os, arch) {
         ("linux", "x86_64") => (
-            Ok("https://api.github.com/repos/lightpanda-io/browser/releases/assets/551831859"),
-            "50533da8fb42505479cec086291695949c67169ff8840deb259a6bd253b6169b",
+            Ok("https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-x86_64-linux"),
+            "1d40801e72c0bc61b2cbd3f3562bcfc46de7b79e0568f33f686b64f2e587610a",
         ),
         ("macos", "aarch64") => (
-            Ok("https://api.github.com/repos/lightpanda-io/browser/releases/assets/551818190"),
-            "f0ae8b4b8ed671a17a14d4f4e13addb1434873f49648f3385dfb81410aa4d32a",
+            Ok("https://github.com/lightpanda-io/browser/releases/download/0.4.1/lightpanda-aarch64-macos"),
+            "99e67739ed8cf5b985af7cbfa7c76b2bab257b171b2dad21109bd74b4f3bb510",
         ),
         (os, arch) => (
             Err(format!(
@@ -515,6 +712,299 @@ fn lightpanda_download() -> (Result<&'static str, String>, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_http_failures_are_bounded_cached_and_configuration_scoped() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        for (status, expected) in [(404, 1), (429, 2), (502, 2), (200, 2)] {
+            let dir = tempfile::tempdir().unwrap();
+            let agent = dir.path().join("agent");
+            executable(&agent, b"#!/bin/sh\nprintf 'agent-browser 0.35.0\\n'\n");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}/fixture", listener.local_addr().unwrap());
+            let digest = "0".repeat(64);
+            let requests = AtomicUsize::new(0);
+            let stop = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        match listener.accept() {
+                            Ok((mut socket, _)) => {
+                                socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                                let mut request = Vec::new();
+                                while !request.ends_with(b"\r\n\r\n") {
+                                    let mut byte = [0];
+                                    socket.read_exact(&mut byte).unwrap();
+                                    request.push(byte[0]);
+                                }
+                                requests.fetch_add(1, Ordering::SeqCst);
+                                let length = if status == 200 { 10 } else { 0 };
+                                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").unwrap();
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("{error}"),
+                        }
+                    }
+                });
+                let calls: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            ensure_at(
+                                dir.path(),
+                                Some(agent.as_os_str()),
+                                None,
+                                (Ok(&url), &digest),
+                            )
+                        })
+                    })
+                    .collect();
+                for call in calls {
+                    let error = call.join().unwrap().unwrap_err();
+                    let reason = if status == 200 {
+                        "response body read failed".into()
+                    } else {
+                        format!("HTTP {status}")
+                    };
+                    assert!(error.contains(&reason), "{error}");
+                    assert!(error.contains("Do not repeat"));
+                }
+                assert_eq!(requests.load(Ordering::SeqCst), expected);
+                // Sequential calls do not obtain another attempt budget either.
+                assert!(ensure_at(
+                    dir.path(),
+                    Some(agent.as_os_str()),
+                    None,
+                    (Ok(&url), &digest)
+                )
+                .is_err());
+                assert_eq!(requests.load(Ordering::SeqCst), expected);
+                {
+                    // Simulate the documented host cooldown without sleeping a minute.
+                    FAILURES
+                        .get()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .get_mut(&canonicalize_or_original(dir.path().to_owned()))
+                        .unwrap()
+                        .expires = Instant::now();
+                    assert!(ensure_at(
+                        dir.path(),
+                        Some(agent.as_os_str()),
+                        None,
+                        (Ok(&url), &digest)
+                    )
+                    .is_err());
+                    assert_eq!(requests.load(Ordering::SeqCst), 2 * expected);
+                }
+                stop.store(true, Ordering::SeqCst);
+            });
+            let key = failure_key(
+                dir.path(),
+                Some(agent.as_os_str()),
+                None,
+                &(Ok(&url), &digest),
+            );
+            let other = tempfile::tempdir().unwrap();
+            assert_ne!(
+                key,
+                failure_key(
+                    other.path(),
+                    Some(agent.as_os_str()),
+                    None,
+                    &(Ok(&url), &digest)
+                )
+            );
+            assert_ne!(
+                key,
+                failure_key(
+                    dir.path(),
+                    Some(agent.as_os_str()),
+                    None,
+                    &(Ok(&url), &"1".repeat(64))
+                )
+            );
+            let light = dir.path().join("manual-lightpanda");
+            executable(&light, b"#!/bin/sh\nprintf '0.4.1\\n'\n");
+            ensure_at(
+                dir.path(),
+                Some(agent.as_os_str()),
+                Some(light.as_os_str()),
+                (Ok(&url), &digest),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn browser_stamp_write_failure_is_reported_and_repair_invalidates_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let light = dir.path().join("light");
+        executable(&agent, b"#!/bin/sh\nprintf 'agent-browser 0.35.0\\n'\n");
+        executable(&light, b"#!/bin/sh\nprintf '0.4.1\\n'\n");
+        let stamp_path = dir.path().join(BROWSER_SETUP_STAMP);
+        std::fs::create_dir(&stamp_path).unwrap();
+        let ensure = || {
+            ensure_at(
+                dir.path(),
+                Some(agent.as_os_str()),
+                Some(light.as_os_str()),
+                lightpanda_download(),
+            )
+        };
+        let error = ensure().unwrap_err();
+        assert!(
+            error.contains("failed to activate browser setup stamp"),
+            "{error}"
+        );
+        assert_eq!(ensure().unwrap_err(), error);
+        std::fs::remove_dir(&stamp_path).unwrap();
+        ensure().unwrap();
+        assert!(stamp_path.is_file());
+    }
+
+    #[test]
+    fn browser_download_retry_shares_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/fixture", listener.local_addr().unwrap());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let (mut socket, _) = listener.accept().unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+                let _ = socket.write_all(b"HTTP/1.1 502 Fixture\r\nContent-Length: 0\r\n\r\n");
+            });
+            let start = Instant::now();
+            let error = download_executable_until(
+                &url,
+                &dir.path().join("binary"),
+                "fixture",
+                None,
+                |_| panic!("must not execute"),
+                start + Duration::from_millis(50),
+            )
+            .unwrap_err();
+            assert!(error.starts_with(TRANSIENT_PREFIX), "{error}");
+            assert!(start.elapsed() < Duration::from_millis(180));
+            listener.set_nonblocking(true).unwrap();
+            assert!(
+                listener.accept().is_err(),
+                "deadline must not grant a second request"
+            );
+        });
+    }
+
+    #[test]
+    fn browser_pin_validation_precedes_stamp_and_old_stamp_cannot_approve_new_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let light = dir.path().join("lightpanda/lightpanda");
+        std::fs::create_dir(light.parent().unwrap()).unwrap();
+        executable(&agent, b"#!/bin/sh\nprintf 'agent-browser 0.35.0\\n'\n");
+        let body = b"#!/bin/sh\nprintf '0.4.1\\n'\n";
+        executable(&light, body);
+        let digest = format!("{:x}", Sha256::digest(body));
+        let stamp_path = dir.path().join(BROWSER_SETUP_STAMP);
+        let mut stamp = verification_stamp(&agent, &light).unwrap();
+        stamp.managed_lightpanda_digest = Some(digest.clone());
+        write_verified_stamp(&stamp_path, &stamp).unwrap();
+        assert!(ensure_locked(
+            dir.path(),
+            Some(agent.as_os_str()),
+            None,
+            (Err("invalid pin metadata".into()), &digest)
+        )
+        .unwrap_err()
+        .contains("invalid pin metadata"));
+        for invalid in ["", "xyz", &"A".repeat(64)] {
+            stamp.managed_lightpanda_digest = Some(invalid.into());
+            write_verified_stamp(&stamp_path, &stamp).unwrap();
+            assert!(ensure_locked(
+                dir.path(),
+                Some(agent.as_os_str()),
+                None,
+                (Ok("invalid URL"), invalid)
+            )
+            .unwrap_err()
+            .contains("SHA-256 digest"));
+        }
+        // An old manifest stamp with unchanged metadata must rehash, not bless old bytes.
+        stamp.managed_lightpanda_digest = Some("0".repeat(64));
+        write_verified_stamp(&stamp_path, &stamp).unwrap();
+        ensure_locked(
+            dir.path(),
+            Some(agent.as_os_str()),
+            None,
+            (Ok("invalid URL"), &digest),
+        )
+        .unwrap();
+        let accepted = std::fs::read(&stamp_path).unwrap();
+        assert!(ensure_locked(
+            dir.path(),
+            Some(agent.as_os_str()),
+            None,
+            (Ok("invalid URL"), &"1".repeat(64))
+        )
+        .unwrap_err()
+        .contains("failed to download"));
+        assert_eq!(std::fs::read(&stamp_path).unwrap(), accepted);
+        assert_eq!(std::fs::read(&light).unwrap(), body);
+    }
+
+    #[test]
+    fn browser_failure_cache_recovers_after_manual_executable_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let light = dir.path().join("light");
+        executable(&agent, b"#!/bin/sh\nprintf 'agent-browser 0.35.0\\n'\n");
+        std::fs::write(&light, b"not executable").unwrap();
+        let ensure = || {
+            ensure_at(
+                dir.path(),
+                Some(agent.as_os_str()),
+                Some(light.as_os_str()),
+                lightpanda_download(),
+            )
+        };
+        let error = ensure().unwrap_err();
+        assert!(error.contains("not an executable file"));
+        assert_eq!(ensure().unwrap_err(), error);
+        for pin in ["one", "two", "three"] {
+            assert!(ensure_at(
+                dir.path(),
+                Some(agent.as_os_str()),
+                Some(light.as_os_str()),
+                (Ok(pin), "")
+            )
+            .is_err());
+            let failures = FAILURES.get().unwrap().lock().unwrap();
+            let failure = failures
+                .get(&canonicalize_or_original(dir.path().to_owned()))
+                .unwrap();
+            assert_eq!(
+                failure.key,
+                failure_key(
+                    dir.path(),
+                    Some(agent.as_os_str()),
+                    Some(light.as_os_str()),
+                    &(Ok(pin), "")
+                )
+            );
+        }
+        executable(&light, b"#!/bin/sh\nprintf '0.4.1\\n'\n");
+        ensure().unwrap();
+        assert!(!FAILURES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .contains_key(&canonicalize_or_original(dir.path().to_owned())));
+    }
 
     #[test]
     fn browser_lightpanda_download_checks_hash_before_publish_or_execution() {
@@ -556,7 +1046,7 @@ mod tests {
                     socket.write_all(body).unwrap();
                 });
                 // The fixture serves exactly one download, even for concurrent cold use/repair.
-                for _ in 0..if succeeds { 8 } else { 1 } {
+                for _ in 0..8 {
                     let url = &url;
                     let digest = &digest;
                     let dir = &dir;
@@ -587,7 +1077,7 @@ mod tests {
                     dir.path(),
                     Some(agent.as_os_str()),
                     None,
-                    (Err("must not download on cache hit".into()), &digest),
+                    (Ok(&url), &digest),
                 )
                 .unwrap();
                 executable(&destination, stale.as_bytes());
@@ -798,6 +1288,15 @@ printf 'agent-browser 0.35.0\n'
         assert!(!supports_required_agent_browser(&binary));
         executable(&binary, b"#!/bin/sh\nprintf '0.2.0-dev+123abc\\n'\n");
         assert!(valid_lightpanda(&binary));
+        executable(&binary, b"#!/bin/sh\nprintf '0.4.1\\n'\n");
+        assert!(valid_lightpanda(&binary));
+        for output in ["unknown1", "Lightpanda 0.4.1", "0.4", "0.4.1 extra"] {
+            executable(
+                &binary,
+                format!("#!/bin/sh\nprintf '{output}\\n'\n").as_bytes(),
+            );
+            assert!(!valid_lightpanda(&binary), "{output}");
+        }
         executable(&binary, b"#!/bin/sh\nprintf 'Chrome 123\\n'\n");
         assert!(!valid_lightpanda(&binary));
         executable(
@@ -871,15 +1370,21 @@ printf 'agent-browser 0.35.0\n'
 
     #[test]
     fn supported_target_has_an_official_lightpanda_download() {
-        if matches!(
-            (std::env::consts::OS, std::env::consts::ARCH),
-            ("linux", "x86_64") | ("macos", "aarch64")
-        ) {
-            assert!(lightpanda_download().0.unwrap().starts_with(
-                "https://api.github.com/repos/lightpanda-io/browser/releases/assets/"
-            ));
-            assert_eq!(lightpanda_download().1.len(), 64);
+        for (os, arch, asset) in [
+            ("linux", "x86_64", "lightpanda-x86_64-linux"),
+            ("macos", "aarch64", "lightpanda-aarch64-macos"),
+        ] {
+            let (url, digest) = lightpanda_download_for(os, arch);
+            let url = url.unwrap();
+            assert!(url.starts_with("https://github.com/lightpanda-io/browser/releases/download/"));
+            assert!(url.ends_with(asset));
+            assert!(!url.contains("nightly") && !url.contains("latest"));
+            assert_eq!(digest.len(), 64);
+            assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+            let provenance = include_str!("../../../../docs/ghost/BROWSER.md");
+            assert!(provenance.contains(digest));
         }
+        assert!(lightpanda_download_for("linux", "aarch64").0.is_err());
     }
 
     #[test]

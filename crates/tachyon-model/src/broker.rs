@@ -14,6 +14,182 @@ pub const MAX_TOOLS: usize = 64;
 pub const MAX_REQUESTS: usize = 128;
 pub const UPLOAD_CHUNK: usize = 32 * 1024;
 
+fn valid_web_result(
+    request: &tachyon_api::web::WebRequest,
+    result: &tachyon_api::web::WebResult,
+) -> bool {
+    let targets = match request {
+        tachyon_api::web::WebRequest::Fetch { urls, .. } => urls.as_slice(),
+        _ => &[],
+    };
+    let calls = if targets.is_empty() {
+        1
+    } else {
+        targets.len() as u64
+    };
+    result.usage.valid()
+        && result.answer.len() <= 16384
+        && result.citations.len() <= 16
+        && result.annotations.len() <= 16
+        && result
+            .observed_search_uses
+            .unwrap_or(0)
+            .saturating_add(result.observed_fetch_uses.unwrap_or(0))
+            <= calls
+        && result.requested_urls == targets
+        && serde_json::to_vec(result).is_ok_and(|b| b.len() <= 262144)
+        && result.citations.len() == result.annotations.len()
+        && result
+            .citations
+            .iter()
+            .zip(&result.annotations)
+            .all(|(citation, annotation)| {
+                crate::web::public_url(&citation.url).is_ok()
+                    && annotation.get("type").and_then(|v| v.as_str()) == Some("url_citation")
+                    && annotation
+                        .pointer("/url_citation/url")
+                        .and_then(|v| v.as_str())
+                        == Some(citation.url.as_str())
+                    && annotation["url_citation"]["title"] == serde_json::json!(citation.title)
+                    && annotation["url_citation"]["content"] == serde_json::json!(citation.excerpt)
+                    && annotation["url_citation"]["start_index"]
+                        == serde_json::json!(citation.start_index)
+                    && annotation["url_citation"]["end_index"]
+                        == serde_json::json!(citation.end_index)
+                    && annotation["url_citation"]["source_index"]
+                        == serde_json::json!(citation.source_index)
+                    && annotation.as_object().is_some_and(|a| a.len() == 2)
+                    && annotation
+                        .get("url_citation")
+                        .and_then(|v| v.as_object())
+                        .is_some_and(|a| {
+                            a.keys().all(|k| {
+                                matches!(
+                                    k.as_str(),
+                                    "url"
+                                        | "title"
+                                        | "content"
+                                        | "start_index"
+                                        | "end_index"
+                                        | "source_index"
+                                )
+                            })
+                        })
+            })
+}
+
+#[cfg(test)]
+mod web_reply_tests {
+    use super::*;
+    use tachyon_api::{agents, web::*};
+    #[tokio::test]
+    async fn web_error_replies_require_exact_command_and_bounded_message() {
+        let command = WebCommand {
+            command_id: "command".into(),
+            caller_id: "work".into(),
+            tool_call_id: "tool".into(),
+            turn_id: "turn".into(),
+            request_id: "request".into(),
+            request: WebRequest::Search {
+                query: "test".into(),
+                domains: None,
+                max_results: 3,
+            },
+        };
+        for fault in 0..5 {
+            let (host, client) = private_pair().unwrap();
+            let mut returned = command.clone();
+            let mut message = "provider HTTP 400".to_string();
+            match fault {
+                1 => returned.turn_id = "other".into(),
+                2 => message = "x".repeat(513),
+                3 => message.push('\n'),
+                4 => message.clear(),
+                _ => {}
+            }
+            let server = async move {
+                let mut stream = host.authenticate().await.unwrap();
+                let _: FrameRequest = read_frame(&mut stream).await.unwrap();
+                write_frame(
+                    &mut stream,
+                    &FrameReply::Control(agents::Reply::WebError {
+                        command: returned,
+                        message,
+                    }),
+                )
+                .await
+                .unwrap();
+            };
+            let (_, result) = tokio::join!(server, client.web_lookup(command.clone()));
+            let error = result.unwrap_err().to_string();
+            if fault == 0 {
+                assert_eq!(error, "api error: provider HTTP 400");
+            } else {
+                assert_eq!(error, protocol_error().to_string(), "fault {fault}");
+            }
+        }
+    }
+    #[tokio::test]
+    async fn web_reply_kind_identity_answer_and_annotation_bounds_are_strict() {
+        let command = WebCommand {
+            command_id: "command".into(),
+            caller_id: "work".into(),
+            tool_call_id: "tool".into(),
+            turn_id: "turn".into(),
+            request_id: "request".into(),
+            request: WebRequest::Search {
+                query: "test".into(),
+                domains: None,
+                max_results: 3,
+            },
+        };
+        let result = WebResult {
+            usage: Default::default(),
+            answer: "report".into(),
+            citations: vec![],
+            annotations: vec![],
+            status: WebStatus::Unverified,
+            notice: "report".into(),
+            host_observed_at: 1,
+            observed_search_uses: None,
+            observed_fetch_uses: None,
+            requested_urls: vec![],
+        };
+        for fault in 0..6 {
+            let (host, client) = private_pair().unwrap();
+            let mut returned = command.clone();
+            let mut report = result.clone();
+            match fault {
+                1 => returned.turn_id = "other".into(),
+                2 => report.answer = "x".repeat(16385),
+                3 => report.annotations = vec![serde_json::json!({"type":"arbitrary"}); 17],
+                4 => report.requested_urls.push("https://other.example".into()),
+                _ => {}
+            }
+            let server = async move {
+                let mut stream = host.authenticate().await.unwrap();
+                let _: FrameRequest = read_frame(&mut stream).await.unwrap();
+                let reply = if fault == 5 {
+                    agents::Reply::WebFetch {
+                        command: returned,
+                        result: report,
+                    }
+                } else {
+                    agents::Reply::WebSearch {
+                        command: returned,
+                        result: report,
+                    }
+                };
+                write_frame(&mut stream, &FrameReply::Control(reply))
+                    .await
+                    .unwrap();
+            };
+            let (_, result) = tokio::join!(server, client.web_lookup(command.clone()));
+            assert_eq!(result.is_ok(), fault == 0, "fault {fault}");
+        }
+    }
+}
+
 /// Native job admission only, not an OS sandbox or a CPU utilization limit.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -316,6 +492,17 @@ impl PrivateListener {
         .await
     }
 
+    pub fn service_bootstrap(
+        &self,
+        controls: Vec<tachyon_api::agents::Control>,
+    ) -> tachyon_api::web::ServiceBootstrap {
+        tachyon_api::web::ServiceBootstrap {
+            path: self.directory.path().join("model.sock"),
+            capability: self.capability,
+            controls,
+        }
+    }
+
     pub async fn accept(self, pid: u32, uid: u32) -> Result<HostChannel> {
         let (stream, _) = self.listener.accept().await?;
         let peer = stream.peer_cred()?;
@@ -330,6 +517,13 @@ impl PrivateListener {
 }
 
 impl Bootstrap {
+    pub fn service(value: tachyon_api::web::ServiceBootstrap) -> Self {
+        Self {
+            path: value.path,
+            capability: value.capability,
+            controls: value.controls,
+        }
+    }
     pub async fn connect(self) -> Result<BrokerClient> {
         let stream = UnixStream::connect(self.path).await?;
         Ok(BrokerClient {
@@ -372,6 +566,25 @@ impl HostChannel {
 }
 
 impl BrokerClient {
+    /// Private, permit-bound web report. No provider credentials or policy arguments.
+    pub async fn web_lookup(
+        &self,
+        command: tachyon_api::web::WebCommand,
+    ) -> Result<tachyon_api::web::WebResult> {
+        use tachyon_api::{
+            agents::{Reply, Request},
+            web::WebRequest,
+        };
+        let request = match command.request {
+            WebRequest::Search { .. } => Request::WebSearch { command },
+            WebRequest::Fetch { .. } => Request::WebFetch { command },
+        };
+        match self.control(&request).await? {
+            Reply::WebSearch { result, .. } | Reply::WebFetch { result, .. } => Ok(result),
+            Reply::WebError { message, .. } => Err(ModelError::Api(message)),
+            _ => Err(protocol_error()),
+        }
+    }
     /// One immediate request/reply. Busy never retains the socket or its mutex.
     pub async fn cpu_job(&self, request: CpuJobRequest) -> Result<CpuJobReply> {
         let mut guard = self.connection.lock().await;
@@ -545,6 +758,32 @@ impl BrokerClient {
         };
         use tachyon_api::agents::{Reply as ControlReply, Request as ControlRequest};
         let matches = match (request, &reply) {
+            (
+                ControlRequest::WebSearch { command } | ControlRequest::WebFetch { command },
+                ControlReply::WebError {
+                    command: returned,
+                    message,
+                },
+            ) => {
+                command == returned
+                    && !message.is_empty()
+                    && message.len() <= 512
+                    && !message.chars().any(char::is_control)
+            }
+            (
+                ControlRequest::WebSearch { command },
+                ControlReply::WebSearch {
+                    command: returned,
+                    result,
+                },
+            )
+            | (
+                ControlRequest::WebFetch { command },
+                ControlReply::WebFetch {
+                    command: returned,
+                    result,
+                },
+            ) => command == returned && valid_web_result(&command.request, result),
             (ControlRequest::Todo { request }, ControlReply::Todo { scope, result }) => {
                 use tachyon_api::{agents::services::Scope, todo::TodoScope};
                 matches!(

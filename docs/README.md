@@ -19,6 +19,8 @@ installation, and repository status:
   managed work, lazy provisioning, and workspace-matched reuse.
 - [`tachyon/MEMORY.md`](tachyon/MEMORY.md) - memory service and persistence
   direction.
+- [`tachyon/WEB.md`](tachyon/WEB.md) - OpenRouter-only host retrieval, durable web
+  budgets, and public/private Rust consumer APIs.
 - [`tachyon/RELIABILITY.md`](tachyon/RELIABILITY.md) - reliability invariants
   and release gates.
 - [`tachyon/STATUS.md`](tachyon/STATUS.md) - implemented, partial, and missing
@@ -29,7 +31,7 @@ installation, and repository status:
 ## Interaction
 
 - [`interaction/ARCHITECTURE.md`](interaction/ARCHITECTURE.md) - implemented host
-  layout, completed structural refactor, and separate integration follow-up.
+  layout, completed structural refactor, and opt-in campaign integration.
 - [`interaction/roles.md`](interaction/roles.md) - descriptive role registry,
   Conversation/Coordinator/Campaign capabilities, and prompt compatibility.
 - [`interaction/daemon-messaging.md`](interaction/daemon-messaging.md) - extracted
@@ -37,7 +39,13 @@ installation, and repository status:
 - [`interaction/TODOS.md`](interaction/TODOS.md) - durable structured todos,
   exact grants, operator endpoints, and transactional operational feed.
 - [`interaction/CAMPAIGN_OVERSIGHT.md`](interaction/CAMPAIGN_OVERSIGHT.md) - explicit
-  one-shot background assessment of host-supplied snapshots, not automatic oversight.
+  background assessment and host-authorized linked Conversation campaign control.
+- [`tachyon/CAMPAIGN_OVERSIGHT.md`](tachyon/CAMPAIGN_OVERSIGHT.md) - opt-in event-driven
+  budgeted assessments, strict manifest schema, typed Conversation evidence and operator commands.
+- [`interaction/ATTENTION.md`](interaction/ATTENTION.md) - durable host notices,
+  standalone display during synthesis, and explicit displayed/acknowledged receipts.
+- [`interaction/PARALLEL_ACCEPTANCE.md`](interaction/PARALLEL_ACCEPTANCE.md) - local
+  real-process fixtures, exact test commands, recorded evidence and replay limits.
 
 ## Tachyond
 

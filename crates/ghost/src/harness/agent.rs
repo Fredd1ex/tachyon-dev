@@ -239,14 +239,22 @@ pub fn normalized_call_signature(call: &ToolCall) -> String {
 }
 
 async fn run_tool(call: &ToolCall, registry: &ToolRegistry, context: &ToolContext) -> ToolResult {
+    let call_context = context.for_call(call.id.clone());
     let input = match serde_json::from_str(&call.arguments) {
         Ok(input) => input,
         Err(error) => {
-            return super::runtime::ToolError::invalid(format!("invalid JSON arguments: {error}"))
-                .into_result();
+            let result =
+                super::runtime::ToolError::invalid(format!("invalid JSON arguments: {error}"))
+                    .into_result();
+            context.event_sink.record_result(
+                &call.name,
+                &call_context,
+                &serde_json::json!({"invalid_arguments": call.arguments}),
+                &result,
+            );
+            return result;
         }
     };
-    let call_context = context.for_call(call.id.clone());
     registry
         .execute(&call.name, &call_context, input)
         .await
@@ -301,6 +309,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingSink {
+        evidence: crate::harness::runtime::WorkEvidenceCollector,
         waits: Mutex<Vec<(bool, Duration)>>,
         tools: Mutex<Vec<String>>,
         call_ids: Mutex<Vec<Option<String>>>,
@@ -308,6 +317,16 @@ mod tests {
     }
 
     impl ToolEventSink for RecordingSink {
+        fn record_result(
+            &self,
+            name: &str,
+            context: &ToolContext,
+            input: &serde_json::Value,
+            result: &ToolResult,
+        ) {
+            self.evidence.record(name, context, input, result);
+        }
+
         fn emit(&self, event: ToolTelemetry) {
             self.tools.lock().unwrap().push(event.tool_name);
             self.call_ids.lock().unwrap().push(event.identity.call_id);
@@ -336,6 +355,61 @@ mod tests {
             }],
             usage: TokenUsage::default(),
             finish_reason: Some("tool_calls".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_calls_are_observed_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let sink = Arc::new(RecordingSink::default());
+        let mut context = ToolContext {
+            workspace_root: root.clone(),
+            cwd: root.clone(),
+            identity: ToolIdentity::default(),
+            deadline: Instant::now() + Duration::from_secs(10),
+            cancellation: CancellationToken::new(),
+            policy: Arc::new(ToolPolicy::worker_default(root)),
+            event_sink: sink.clone(),
+            output_store: Arc::new(NoopOutputStore),
+            host_service: None,
+        };
+        let registry = native_registry();
+        for (index, (name, arguments)) in [
+            ("read", "{"),
+            ("unknown", "{}"),
+            ("read", r#"{"path":42}"#),
+            ("read", r#"{"path":"missing"}"#),
+            ("read", "{}"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index == 3 {
+                Arc::make_mut(&mut context.policy)
+                    .enabled_tools
+                    .remove("read");
+            } else if index == 4 {
+                Arc::make_mut(&mut context.policy)
+                    .enabled_tools
+                    .insert("read".into());
+                context.cancellation.cancel();
+            }
+            let call = ToolCall {
+                id: format!("rejected-{index}"),
+                name: name.into(),
+                arguments: arguments.into(),
+            };
+            assert!(run_tool(&call, &registry, &context).await.is_error);
+            let evidence = sink.evidence.snapshot();
+            assert_eq!(evidence.observed_invocations, Some(index as u64 + 1));
+            assert_eq!(evidence.tools.len(), index + 1);
+            assert_eq!(
+                evidence.tools[index].call_id.as_deref(),
+                Some(call.id.as_str())
+            );
+            assert_eq!(evidence.tools[index].output["is_error"], true);
+            assert_eq!(evidence.omitted, 0);
         }
     }
 

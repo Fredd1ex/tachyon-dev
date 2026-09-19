@@ -6,11 +6,9 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tachyon_api::types::AgentEvent;
-use tachyon_api::{InteractionEvent, InteractionMetadata};
+use tachyon_api::InteractionEvent;
 use tachyon_model::{ChatMessage, Role, TokenUsage};
-use tachyon_orchestrator::conversation::policy::{
-    publication_requires_dependency, InteractionDecision,
-};
+use tachyon_orchestrator::conversation::policy::InteractionDecision;
 use tokio::io::AsyncBufReadExt;
 
 use crate::checkpoints::{
@@ -21,12 +19,12 @@ use crate::input::{decode_chat_input, ChatInput};
 use crate::model::classify;
 use crate::runtime::{from_agent_config, AgentRole};
 use crate::streaming::{
-    emit_event, emit_interaction_event, emit_queued_turn, emit_turn,
-    synthetic_interaction_metadata, CONCURRENT_TURN_ACKNOWLEDGEMENT,
+    acknowledgement_delay, emit_event, emit_interaction_event, emit_turn,
+    synthetic_interaction_metadata, with_turn_feedback,
 };
 use crate::turns::{
-    commit_ready_turns, compact_context_messages, estimated_context_tokens, evidence_matches,
-    is_completed_evidence, same_evidence, ConversationState,
+    commit_ready_turns, compact_context_messages, estimated_context_tokens, is_completed_evidence,
+    same_evidence, ConversationState,
 };
 
 /// Chat mode: read user lines from stdin forever. Stays alive even if the
@@ -81,6 +79,10 @@ pub(super) async fn run_chat(
         initial_messages.retain(|message| message.role != Role::System);
     }
     let conversation = Arc::new(Mutex::new(ConversationState {
+        assessments: checkpoint
+            .as_ref()
+            .map(|c| c.assessments.clone())
+            .unwrap_or_default(),
         messages: initial_messages,
         evidence: checkpoint
             .as_ref()
@@ -99,66 +101,45 @@ pub(super) async fn run_chat(
         checkpoint.as_ref().map(|c| c.next_commit).unwrap_or(1),
     ));
     let active_turns = Arc::new(Mutex::new(BTreeMap::<u64, String>::new()));
-    // Bound deferred work so input cannot grow memory without limit. Independent
-    // turns do not use this queue and may run while it is draining.
-    let (turn_tx, mut turn_rx) = tokio::sync::mpsc::channel::<(
-        u64,
-        String,
-        InteractionMetadata,
-        bool,
-        InteractionDecision,
-        Option<String>,
-        TokenUsage,
-        std::time::Instant,
-    )>(64);
-
-    // Every accepted turn gets its own task. Publication policy, rather than
-    // admission order, decides whether it may answer alongside active work.
-    let processor_model = model.clone();
-    let processor_conversation = Arc::clone(&conversation);
-    let processor_active_turns = Arc::clone(&active_turns);
-    let processor_state_changed = Arc::clone(&state_changed);
-    let processor_checkpoint_tx = checkpoint_tx.clone();
-    tokio::spawn(async move {
-        while let Some((
-            turn,
-            text,
-            metadata,
-            queued,
-            decision,
-            acknowledgement,
-            routing_usage,
-            accepted_at,
-        )) = turn_rx.recv().await
-        {
-            let args = (
-                turn,
-                text,
-                metadata,
-                queued,
-                decision,
-                acknowledgement,
-                routing_usage,
-                accepted_at,
-                processor_model.clone(),
-                model_error.clone(),
-                Arc::clone(&processor_conversation),
-                Arc::clone(&processor_active_turns),
-                Arc::clone(&processor_state_changed),
-                processor_checkpoint_tx.clone(),
-                role,
-                agent_id.clone(),
-            );
-            tokio::spawn(process_turn(args, emit_interaction_event));
-        }
-    });
+    let mut jobs = tokio::task::JoinSet::new();
 
     println!("[foreground] ready");
     let stdin = tokio::io::stdin();
     let mut reader = tokio::io::BufReader::new(stdin).lines();
     while let Ok(Some(line)) = reader.next_line().await {
+        while jobs.try_join_next().is_some() {}
         let (text, mut metadata) = match decode_chat_input(&line, role) {
+            ChatInput::Cancel => {
+                let _publication = crate::turns::PUBLICATION.lock().unwrap();
+                let mut state = conversation.lock().unwrap();
+                state.cancel_pending_turns(next_turn.load(Ordering::Relaxed));
+                active_turns.lock().unwrap().clear();
+                jobs.abort_all();
+                let _ = checkpoint_tx.send(checkpoint_snapshot(&state));
+                state_changed.notify_waiters();
+                continue;
+            }
             ChatInput::User { text, metadata } => (text, metadata),
+            ChatInput::CampaignAssessment {
+                assessment,
+                metadata,
+            } => {
+                let mut state = conversation.lock().unwrap();
+                if !state.retain_assessment(assessment.clone()) {
+                    continue;
+                }
+                let _ = checkpoint_tx.send(checkpoint_snapshot(&state));
+                // A stable publication identity makes retries idempotent at the
+                // host/history boundary. No new turn, provider call or pending reply.
+                drop(state);
+                emit_interaction_event(
+                    &metadata,
+                    InteractionEvent::UserVisibleNotificationPublished {
+                        text: assessment.advisory(),
+                    },
+                );
+                continue;
+            }
             ChatInput::Evidence(record) => {
                 if is_completed_evidence(record.event()) {
                     let mut state = conversation.lock().unwrap();
@@ -195,25 +176,44 @@ pub(super) async fn run_chat(
                 mut metadata,
                 model: use_model,
             } => {
+                // Deterministic attention is an overlay, not a conversation turn.
+                // It must neither wait for a provider nor mutate partial history.
+                if !use_model && metadata.message_id.starts_with("attention-command-") {
+                    emit_interaction_event(
+                        &metadata,
+                        InteractionEvent::UserVisibleNotificationPublished { text },
+                    );
+                    continue;
+                }
                 let turn = next_turn.fetch_add(1, Ordering::Relaxed);
                 metadata.turn_id = Some(turn.to_string());
-                let notification = if use_model {
-                    modeled_notification(model.as_deref(), &conversation, &text).await
-                } else {
-                    text
-                };
-                emit_interaction_event(
-                    &metadata,
-                    InteractionEvent::UserVisibleNotificationPublished {
-                        text: notification.clone(),
-                    },
-                );
-                let mut state = conversation.lock().unwrap();
-                state
-                    .pending
-                    .insert(turn, vec![ChatMessage::new(Role::Assistant, notification)]);
-                commit_ready_turns(&mut state);
-                let _ = checkpoint_tx.send(checkpoint_snapshot(&state));
+                let model = model.clone();
+                let conversation = Arc::clone(&conversation);
+                let checkpoint_tx = checkpoint_tx.clone();
+                let state_changed = Arc::clone(&state_changed);
+                jobs.spawn(async move {
+                    let notification = if use_model {
+                        modeled_notification(model.as_deref(), &conversation, &text).await
+                    } else {
+                        text
+                    };
+                    let mut state = conversation.lock().unwrap();
+                    if state.turn_terminal(turn) {
+                        return;
+                    }
+                    emit_interaction_event(
+                        &metadata,
+                        InteractionEvent::UserVisibleNotificationPublished {
+                            text: notification.clone(),
+                        },
+                    );
+                    state
+                        .pending
+                        .insert(turn, vec![ChatMessage::new(Role::Assistant, notification)]);
+                    commit_ready_turns(&mut state);
+                    let _ = checkpoint_tx.send(checkpoint_snapshot(&state));
+                    state_changed.notify_waiters();
+                });
                 continue;
             }
             ChatInput::Compaction(command) => {
@@ -221,7 +221,7 @@ pub(super) async fn run_chat(
                     let mut state = conversation.lock().unwrap();
                     if command.epoch > state.context_epoch {
                         compact_context_messages(&mut state.messages, command.target_tokens);
-                        state.evidence.clear();
+                        // Completed evidence is scoped separately from model context.
                         state.context_epoch = command.epoch;
                         let _ = checkpoint_tx.send(checkpoint_snapshot(&state));
                     }
@@ -238,11 +238,16 @@ pub(super) async fn run_chat(
         };
         let turn = next_turn.fetch_add(1, Ordering::Relaxed);
         metadata.turn_id = Some(turn.to_string());
+        let accepted_at = std::time::Instant::now();
         emit_interaction_event(
             &metadata,
             InteractionEvent::UserTurnAccepted { text: text.clone() },
         );
-        let accepted_at = std::time::Instant::now();
+        emit_event(AgentEvent::Timing {
+            turn,
+            stage: "input_accepted".into(),
+            elapsed_ms: accepted_at.elapsed().as_millis() as u64,
+        });
         let (queued, classifier_context) = {
             let mut active = active_turns.lock().unwrap();
             let queued = !active.is_empty();
@@ -254,90 +259,79 @@ pub(super) async fn run_chat(
             active.insert(turn, text.clone());
             (queued, context)
         };
-        if !queued {
-            if turn_tx
-                .send((
-                    turn,
-                    text,
-                    metadata,
-                    false,
-                    InteractionDecision::WaitForActiveTurn,
-                    None,
-                    TokenUsage::default(),
-                    accepted_at,
-                ))
-                .await
-                .is_err()
-            {
-                active_turns.lock().unwrap().remove(&turn);
-                break;
-            }
-            continue;
-        }
-
         let fallback_decision = fallback_interaction_decision(&classifier_context, &text);
-        emit_turn(Some(turn), "[status] routing alongside active work".into());
-        if publication_requires_dependency(true, fallback_decision) {
-            emit_queued_turn(turn, None);
-        } else {
-            emit_turn(
-                Some(turn),
-                format!("[status] working {CONCURRENT_TURN_ACKNOWLEDGEMENT}"),
-            );
+        if queued {
+            emit_turn(Some(turn), "[status] routing alongside active work".into());
         }
-        let classifier_tx = turn_tx.clone();
-        let classifier_model = model.clone();
-        let classifier_active_turns = Arc::clone(&active_turns);
-        let classifier_metadata = metadata.clone();
-        tokio::spawn(async move {
-            let (decision, acknowledgement, usage) = if let Some(model) = classifier_model {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    classify(&model, &classifier_context, &text),
-                )
-                .await
-                {
-                    Ok(Ok((decision, Some(acknowledgement), usage))) => {
-                        (decision, Some(acknowledgement), usage)
-                    }
-                    Ok(Ok((_, None, usage))) => (fallback_decision, None, usage),
-                    Ok(Err(_)) | Err(_) => (fallback_decision, None, TokenUsage::default()),
+        let model = model.clone();
+        let model_error = model_error.clone();
+        let active_turns = Arc::clone(&active_turns);
+        let conversation = Arc::clone(&conversation);
+        let state_changed = Arc::clone(&state_changed);
+        let checkpoint_tx = checkpoint_tx.clone();
+        let agent_id = agent_id.clone();
+        // One task and one cancellable timer per admitted turn, including routing.
+        // Independent turns never wait behind another turn's provider request.
+        jobs.spawn(with_turn_feedback(
+            turn,
+            accepted_at,
+            acknowledgement_delay(),
+            async move {
+                let (decision, acknowledgement, usage) =
+                    if let Some(model) = model.as_ref().filter(|_| queued) {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            classify(model, &classifier_context, &text),
+                        )
+                        .await
+                        {
+                            Ok(Ok((decision, Some(acknowledgement), usage))) => {
+                                (decision, Some(acknowledgement), usage)
+                            }
+                            Ok(Ok((_, None, usage))) => (fallback_decision, None, usage),
+                            Ok(Err(_)) | Err(_) => (fallback_decision, None, TokenUsage::default()),
+                        }
+                    } else {
+                        (fallback_decision, None, TokenUsage::default())
+                    };
+                if queued {
+                    emit_event(AgentEvent::Timing {
+                        turn,
+                        stage: "routing".into(),
+                        elapsed_ms: accepted_at.elapsed().as_millis() as u64,
+                    });
                 }
-            } else {
-                (fallback_decision, None, TokenUsage::default())
-            };
-            emit_event(AgentEvent::Timing {
-                turn,
-                stage: "routing".into(),
-                elapsed_ms: accepted_at.elapsed().as_millis() as u64,
-            });
-            if classifier_tx
-                .send((
-                    turn,
-                    text,
-                    classifier_metadata,
-                    true,
-                    decision,
-                    acknowledgement,
-                    usage,
-                    accepted_at,
-                ))
-                .await
-                .is_err()
-            {
-                classifier_active_turns.lock().unwrap().remove(&turn);
-            }
-        });
+                process_turn(
+                    (
+                        turn,
+                        text,
+                        metadata,
+                        queued,
+                        decision,
+                        acknowledgement,
+                        usage,
+                        accepted_at,
+                        model,
+                        model_error,
+                        conversation,
+                        active_turns,
+                        state_changed,
+                        checkpoint_tx,
+                        role,
+                        agent_id,
+                    ),
+                    emit_interaction_event,
+                )
+                .await;
+            },
+        ));
     }
     ExitCode::SUCCESS
 }
 
-fn fallback_interaction_decision(active_context: &str, incoming: &str) -> InteractionDecision {
-    if evidence_matches(incoming, active_context) {
-        InteractionDecision::WaitForActiveTurn
-    } else {
-        InteractionDecision::AnswerNow
-    }
+fn fallback_interaction_decision(_active_context: &str, _incoming: &str) -> InteractionDecision {
+    // Lack of shared words does not establish independence for an implicit follow-up.
+    InteractionDecision::WaitForActiveTurn
 }
 
 #[cfg(test)]
@@ -387,7 +381,7 @@ mod tests {
                             panic!("expected delegation");
                         };
                         assert_eq!(selected.as_deref(), cwd);
-                        assert_eq!(origin_turn_id, Some(turn.to_string()));
+                        assert_eq!(origin_turn_id, Some(format!("conversation:{}:{turn}", crate::streaming::session_id())));
                         assert!(ids.insert(logical_task_id));
                     }
                 }
@@ -419,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_fallback_keeps_unrelated_conversation_moving() {
+    fn routing_fallback_does_not_guess_independence_from_missing_shared_words() {
         let active = "Active turn 2: get the weather in London";
         assert_eq!(
             fallback_interaction_decision(active, "will I need a coat in London?"),
@@ -427,11 +421,15 @@ mod tests {
         );
         assert_eq!(
             fallback_interaction_decision(active, "tell me a joke"),
-            InteractionDecision::AnswerNow
+            InteractionDecision::WaitForActiveTurn
         );
         assert_eq!(
             fallback_interaction_decision(active, "summarize our current conversation"),
-            InteractionDecision::AnswerNow
+            InteractionDecision::WaitForActiveTurn
+        );
+        assert_eq!(
+            fallback_interaction_decision(active, "will I need a coat?"),
+            InteractionDecision::WaitForActiveTurn
         );
     }
 }

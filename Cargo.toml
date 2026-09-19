@@ -7,6 +7,21 @@ version = "0.3.0"
 edition = "2021"
 license = "MIT"
 
+# Keep useful application backtraces without accumulating incremental caches.
+[profile.dev]
+debug = 1
+incremental = false
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.test]
+debug = 1
+incremental = false
+
+[profile.test.package."*"]
+debug = 0
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

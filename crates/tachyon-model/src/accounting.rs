@@ -39,7 +39,10 @@ pub struct RequestEstimate {
     pub output_tokens: u32,
     pub input_micro_usd_per_million: u64,
     pub output_micro_usd_per_million: u64,
-    /// Upper bound for all charges not covered by the two token rates.
+    /// Upper bound for all charges not covered by the two token rates, including
+    /// every permitted server web-tool use. Web callers must supply a host-attested
+    /// ceiling covering the fixed tool's fee floor; inclusive usage.cost is
+    /// reconciled without adding fees.
     pub other_micro_usd: u64,
 }
 

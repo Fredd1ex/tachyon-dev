@@ -184,11 +184,6 @@ impl ModelBroker {
                         Some(attention.clone()),
                     )?;
                     state.grants.get_mut(&nonce).unwrap().paused = true;
-                    if let Ok(mut queue) = store.attention_notifications.lock() {
-                        if queue.len() < 64 {
-                            queue.push_back(attention);
-                        }
-                    }
                     Ok((None, funding, wait.revision, request_id, resume_deadline))
                 }
             }
@@ -555,7 +550,20 @@ mod tests {
                         .unwrap(),
                     Reply::Answer { resumed: true, .. }
                 ));
-                assert_eq!(store.attention_notifications.lock().unwrap().len(), 1);
+                assert_eq!(
+                    store
+                        .attention_snapshot(
+                            &tachyon_api::todo::TodoScope::Campaign {
+                                campaign_id: campaign.clone()
+                            },
+                            None,
+                            32
+                        )
+                        .unwrap()
+                        .records
+                        .len(),
+                    1
+                );
                 assert!(matches!(
                     broker
                         .work_private(

@@ -6,12 +6,13 @@ through permit-scoped `history` without flooding this view. Those resources are
 not a TUI archive or a restorable Python session.
 
 Mouse capture is off by default so ordinary drag and terminal Copy work natively.
-Use `Ctrl+O` or empty-input arrows to open/select turn traces; Page keys navigate
-the loaded transcript. The wheel is terminal-owned by default, with scrollback
+Task/tool monitoring is inline. Use `Ctrl+O` to expand structured turn details and
+then `Ctrl+D` for the secondary diagnostics inspector. Empty-input arrows and Page
+keys navigate without opening details. The wheel is terminal-owned by default, with scrollback
 behavior depending on the terminal's alternate-screen settings.
 
 For clickable details, enter `/mouse` to opt into capture, then open a conversation
-turn's trace, click a worker row, and click a tool evidence header. The same
+turn's explicit `view subagent` action, then click a tool evidence header. The same
 header collapses the cell. Inside an open cell, click **Raw diagnostics** to
 show or hide diagnostic details for that item independently. Closing the worker
 or trace hides its evidence even if a tool cell was previously expanded. Raw
@@ -62,6 +63,31 @@ Timing details distinguish unknown measurements from measured zero. Inference
 and parallel-tool batch waits are subsets of execution wall time. Review is a
 separate candidate-to-decision wait, including queue/IPC time. These numbers are
 not summed into a synthetic total.
+
+Conversation badges show `elapsed` since the accepted request, including queue
+and orchestration wait, even before a worker acknowledges the request. Worker
+rows show elapsed time since the first recorded start in that scoped turn (or
+the first observed Spawn), not the lifetime of a reused agent. Unknown starts
+are omitted rather than shown as zero. Terminal worker rows use recorded
+`execution` when available; this is execution wall time, not CPU time or total
+request latency. Otherwise elapsed time freezes at the recorded terminal event.
+The main elapsed row disappears entirely on completion or failure, leaving the
+recorded `done` badge when available. Previous visits have no main elapsed row,
+including unfinished checkpoints; their worker timers never tick.
+
+Expanded traces show measured foreground model tokens and worker reported tokens,
+each with prompt and completion counts, using stored turn metrics only. Foreground
+usage does not separate classifier and synthesis calls. Worker usage is aggregated
+once per stored assignment, not added again from nested tool evidence. Missing
+usage is unavailable, not zero. `review tokens unavailable` explicitly marks the
+absence of per-stage review usage: `WorkTiming` contains wall times, not tokens.
+No remainder is inferred from aggregate totals. These are reported token counts,
+not a complete stage-by-stage monetary cost breakdown.
+
+Live estimates advance monotonically in whole seconds. Only visible badge spans
+are overlaid after layout-cache lookup; ticks do not reformat Markdown or tool
+evidence, invalidate history layouts, wrap bodies, or move scroll anchors. Badge
+text is clipped to the available row width and long durations saturate at `99h+`.
 
 An open trace renders at most 20 worker summary rows, ordered by worker ID,
 including an already selected worker even when it falls outside that window.

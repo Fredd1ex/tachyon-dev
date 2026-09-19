@@ -12,6 +12,8 @@ pub mod python;
 pub mod services;
 #[cfg(test)]
 mod services_tests;
+pub mod webfetch;
+pub mod websearch;
 pub mod workspace;
 
 pub use browser::agent_browser;

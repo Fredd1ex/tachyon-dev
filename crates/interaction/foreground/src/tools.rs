@@ -61,8 +61,179 @@ pub(super) fn task_intents(call: &ToolCall) -> Vec<TaskIntent> {
 }
 
 pub(super) struct ToolOutput {
+    pub(super) web_usage: Option<tachyon_api::web::WebUsage>,
     pub(super) text: String,
     pub(super) succeeded: bool,
+    pub(super) task_outcomes: Vec<TaskOutcome>,
+}
+
+/// Deterministic host projection. The daemon retains the original typed result.
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WebOutcome {
+    pub(super) tool_call_id: String,
+    pub(super) query: String,
+    pub(super) freshness: String,
+    pub(super) evidence_notice: String,
+    pub(super) omitted: usize,
+    pub(super) result: tachyon_api::web::WebResult,
+}
+
+impl WebOutcome {
+    fn bounded(
+        call: &ToolCall,
+        request: &tachyon_api::web::WebRequest,
+        result: tachyon_api::web::WebResult,
+    ) -> Self {
+        let mut out = Self {
+            tool_call_id: call.id.clone(),
+            query: match request {
+                tachyon_api::web::WebRequest::Search { query, .. } => query.chars().take(512).collect(),
+                tachyon_api::web::WebRequest::Fetch { .. } => "Known URL retrieval; see requested_urls".into(),
+            },
+            freshness: "unknown".into(),
+            evidence_notice: "Model-mediated report, not raw pages or automatically source-verified. Partial/unverified reports do not confirm retrieval. host_observed_at is receipt time, not publication time. Offsets refer only to original provider text, never this projection; source_index is provider metadata, not a verified source. Full evidence retained in daemon record.".into(),
+            omitted: 0,
+            result,
+        };
+        assert!(out.fit(8192), "validated web envelope fits tool budget");
+        out
+    }
+
+    pub(super) fn fit(&mut self, budget: usize) -> bool {
+        // Typed citations already contain the known annotation fields. Do not
+        // spend model context on a second copy of potentially large excerpts.
+        self.omitted += self.result.annotations.len();
+        self.result.annotations.clear();
+        while !json_fits(self, budget) {
+            self.omitted += 1;
+            if !self.result.answer.is_empty() {
+                self.result.answer = self
+                    .result
+                    .answer
+                    .chars()
+                    .take(self.result.answer.chars().count() / 2)
+                    .collect();
+                for citation in &mut self.result.citations {
+                    citation.start_index = None;
+                    citation.end_index = None;
+                }
+                continue;
+            }
+            // Reduce the largest excerpt first so one large source cannot evict
+            // the titles and excerpts of every other source.
+            if let Some(text) = self
+                .result
+                .citations
+                .iter_mut()
+                .filter_map(|c| c.excerpt.as_mut())
+                .filter(|s| !s.is_empty())
+                .max_by_key(|s| s.len())
+            {
+                *text = text.chars().take(text.chars().count() / 2).collect();
+                continue;
+            }
+            if let Some(text) = self
+                .result
+                .citations
+                .iter_mut()
+                .filter_map(|c| c.title.as_mut())
+                .filter(|s| !s.is_empty())
+                .max_by_key(|s| s.len())
+            {
+                *text = text.chars().take(text.chars().count() / 2).collect();
+                continue;
+            }
+            if self.result.requested_urls.pop().is_some() {
+                continue;
+            }
+            if self.result.citations.pop().is_some() {
+                continue;
+            }
+            if !self.query.is_empty() {
+                self.query = self
+                    .query
+                    .chars()
+                    .take(self.query.chars().count() / 2)
+                    .collect();
+                continue;
+            }
+            if !self.result.notice.is_empty() {
+                self.result.notice = self
+                    .result
+                    .notice
+                    .chars()
+                    .take(self.result.notice.chars().count() / 2)
+                    .collect();
+                continue;
+            }
+            return false;
+        }
+        true
+    }
+}
+
+/// Native delegation results, not fields recovered from arbitrary worker prose.
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TaskOutcome {
+    pub(super) objective: String,
+    pub(super) result: Option<String>,
+    pub(super) completed_scopes: Option<Vec<String>>,
+    pub(super) failure_reason: Option<String>,
+    #[serde(default)]
+    pub(super) evidence: tachyon_api::types::WorkEvidence,
+}
+
+#[derive(serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WorkerEvidence {
+    pub(super) task_outcomes: Vec<TaskOutcome>,
+    #[serde(default)]
+    pub(super) omitted: usize,
+}
+
+pub(super) const MAX_WORKER_EVIDENCE_BYTES: usize = 1024 * 1024;
+
+/// Count encoded bytes without allocating a serialized copy of a raw report.
+pub(super) fn json_fits(value: &impl serde::Serialize, budget: usize) -> bool {
+    struct Budget(usize);
+    impl std::io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.0 {
+                return Err(std::io::ErrorKind::FileTooLarge.into());
+            }
+            self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Budget(budget), value).is_ok()
+}
+
+impl TaskOutcome {
+    pub(super) fn from_work_result(work: &tachyon_api::WorkResult) -> Self {
+        use tachyon_api::types::WorkOutcome;
+        let (result, failure_reason) = match &work.outcome {
+            WorkOutcome::Completed { result, .. } => (Some(result.clone()), None),
+            WorkOutcome::Failed { message } => (None, Some(message.clone())),
+            WorkOutcome::Blocked { reason } | WorkOutcome::Cancelled { reason } => {
+                (None, Some(reason.clone()))
+            }
+            WorkOutcome::TimedOut { .. } => {
+                (None, Some("The lookup exceeded its deadline.".into()))
+            }
+        };
+        Self {
+            objective: work.objective.clone(),
+            result,
+            completed_scopes: None,
+            failure_reason,
+            evidence: work.evidence.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -155,17 +326,43 @@ pub(super) fn available_tools_for_context(
 }
 
 impl ToolOutput {
+    pub(super) fn account_web_usage(
+        &self,
+        usage: &mut tachyon_model::TokenUsage,
+        seen: &mut BTreeSet<String>,
+    ) {
+        if let Some(receipt) = &self.web_usage {
+            if let (Some(id), Some(input), Some(output)) = (
+                &receipt.receipt_id,
+                receipt.input_tokens,
+                receipt.output_tokens,
+            ) {
+                if receipt.valid() && seen.insert(id.clone()) {
+                    *usage += tachyon_model::TokenUsage {
+                        prompt_tokens: input.min(u64::from(u32::MAX)) as u32,
+                        completion_tokens: output.min(u64::from(u32::MAX)) as u32,
+                        total_tokens: input.saturating_add(output).min(u64::from(u32::MAX)) as u32,
+                        ..Default::default()
+                    };
+                }
+            }
+        }
+    }
     fn success(text: String) -> Self {
         Self {
+            web_usage: None,
             text,
             succeeded: true,
+            task_outcomes: Vec::new(),
         }
     }
 
     fn failure(text: String) -> Self {
         Self {
+            web_usage: None,
             text,
             succeeded: false,
+            task_outcomes: Vec::new(),
         }
     }
 }
@@ -179,19 +376,86 @@ pub(super) async fn run_tool(
     memory_context: Option<MemoryToolContext>,
     schedule_batch_valid: bool,
     schedule_context: Option<ScheduleToolContext>,
-    cwd: Option<String>,
+    metadata: Option<&InteractionMetadata>,
 ) -> ToolOutput {
-    match role.allows_tool(&tc.name) {
+    match role.allows_tool(&tc.name, metadata) {
         Ok(true) => {}
         Ok(false) => {
             return ToolOutput::failure(format!(
                 "{} is not available to the {role:?} role",
                 tc.name
-            ))
+            ));
         }
         Err(error) => return ToolOutput::failure(error),
     }
     match tc.name.as_str() {
+        "websearch" | "webfetch" => {
+            let Some(metadata) = metadata
+                .filter(|m| turn.is_some() && !m.conversation_id.is_empty() && m.turn_id.is_some())
+            else {
+                return ToolOutput::failure(
+                    "Web retrieval requires a current conversation turn.".into(),
+                );
+            };
+            let request = match serde_json::from_str(&tc.arguments)
+                .map_err(|_| "invalid JSON")
+                .and_then(|v| tachyon_api::web::WebRequest::from_tool_input(&tc.name, v))
+            {
+                Ok(request) => request,
+                _ => return ToolOutput::failure("Invalid web request kind or payload.".into()),
+            };
+            let command = tachyon_api::web::WebCommand {
+                command_id: tc.id.clone(),
+                caller_id: metadata.conversation_id.clone(),
+                tool_call_id: tc.id.clone(),
+                turn_id: metadata.turn_id.clone().unwrap(),
+                request_id: tc.id.clone(),
+                request: request.clone(),
+            };
+            if let Err(error) = command.validate() {
+                return ToolOutput::failure(error.into());
+            }
+            match crate::delegation::web_for_turn(metadata.clone(), command).await {
+                Ok(result) => {
+                    if !result.usage.valid() { return ToolOutput::failure("Invalid web usage receipt.".into()); }
+                    let succeeded = !matches!(result.status, tachyon_api::web::WebStatus::Failed);
+                    ToolOutput { web_usage: Some(result.usage.clone()), text: serde_json::to_string(&WebOutcome::bounded(tc, &request, result)).unwrap(), succeeded, task_outcomes: vec![] }
+                }
+                Err(error) => ToolOutput::failure(serde_json::json!({"error":error,"freshness":"unknown","instruction":"Retrieval not confirmed; do not claim verification."}).to_string()),
+            }
+        }
+        "campaign" => {
+            let Some(metadata) =
+                metadata.filter(|m| turn.is_some() && !m.conversation_id.is_empty())
+            else {
+                return ToolOutput::failure(
+                    "Campaign access requires a current conversation turn.".into(),
+                );
+            };
+            let request =
+                serde_json::from_str::<tachyon_api::conversation_campaign::Request>(&tc.arguments)
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| {
+                        r.validate()?;
+                        Ok(r)
+                    });
+            let result = match request {
+                Ok(request) => {
+                    crate::delegation::campaign_for_turn(metadata.clone(), request).await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(response) => ToolOutput::success(response.to_string()),
+                Err(error) => ToolOutput::failure(serde_json::json!({"error":error,"instruction":"No change confirmed; do not claim Done."}).to_string()),
+            }
+        }
+        "todo" => {
+            let Some(metadata) = metadata.filter(|_| turn.is_some()) else {
+                return todo_failure(tachyon_api::todo::TodoError::AuthorityDenied);
+            };
+            run_todo_tool(&tc.arguments, metadata).await
+        }
         "memory" => {
             if !memory_batch_valid {
                 return ToolOutput::failure(
@@ -221,7 +485,11 @@ pub(super) async fn run_tool(
             if !delegation_allowed {
                 return ToolOutput::failure("Delegation has already been used for this turn. Synthesize an answer from the worker results already received; do not spawn another worker.".into());
             }
-            let requests = match delegation_requests(tc, turn, cwd) {
+            let requests = match delegation_requests(
+                tc,
+                turn,
+                metadata.and_then(|metadata| metadata.cwd.clone()),
+            ) {
                 Ok(requests) => requests,
                 Err(error) => return ToolOutput::failure(error),
             };
@@ -236,21 +504,76 @@ pub(super) async fn run_tool(
                 .into_iter()
                 .map(|request| tokio::task::spawn_blocking(move || spawn_via_daemon(request)));
             let results = join_all(jobs).await;
-            let mut outcomes: Vec<_> = results
+            let outcomes: Vec<_> = results
                 .into_iter()
                 .map(|result| match result {
-                    Ok(Ok(answer)) => ToolOutput::success(answer),
+                    Ok(Ok(work)) => ToolOutput {
+                        web_usage: None,
+                        text: String::new(),
+                        succeeded: true,
+                        task_outcomes: vec![TaskOutcome::from_work_result(&work)],
+                    },
                     Ok(Err(error)) => ToolOutput::failure(format!("worker failed: {error}")),
                     Err(error) => ToolOutput::failure(format!("worker task failed: {error}")),
                 })
                 .collect();
-            if tc.name == "spawn_agent" {
-                outcomes.remove(0)
-            } else {
-                compose_fanout_output(&tasks, outcomes)
-            }
+            compose_fanout_output(&tasks, outcomes)
         }
         other => ToolOutput::failure(format!("unknown tool: {other}")),
+    }
+}
+
+fn todo_failure(error: tachyon_api::todo::TodoError) -> ToolOutput {
+    ToolOutput::failure(serde_json::json!({"error":error}).to_string())
+}
+
+async fn run_todo_tool(arguments: &str, metadata: &InteractionMetadata) -> ToolOutput {
+    use tachyon_api::todo::{TodoError, TodoRequest, TodoScope};
+    // Replace only the identity-free selector, then let the shared strict typed
+    // request reject unknown fields and fields belonging to other operations.
+    let request = (|| {
+        let mut value: serde_json::Value =
+            serde_json::from_str(arguments).map_err(|error| TodoError::Invalid {
+                message: error.to_string(),
+            })?;
+        let object = value.as_object_mut().ok_or_else(|| TodoError::Invalid {
+            message: "todo arguments must be an object".into(),
+        })?;
+        if object
+            .get("scope")
+            .is_some_and(|scope| scope.as_str() != Some("current_conversation"))
+        {
+            return Err(TodoError::AuthorityDenied);
+        }
+        if metadata.conversation_id.trim().is_empty() {
+            return Err(TodoError::AuthorityDenied);
+        }
+        let scope = TodoScope::Conversation {
+            id: metadata.conversation_id.clone(),
+        };
+        object.insert("scope".into(), serde_json::to_value(&scope).unwrap());
+        let request: TodoRequest =
+            serde_json::from_value(value).map_err(|error| TodoError::Invalid {
+                message: error.to_string(),
+            })?;
+        if let TodoRequest::List {
+            cursor: Some(cursor),
+            ..
+        } = &request
+        {
+            if cursor.scope != scope {
+                return Err(TodoError::AuthorityDenied);
+            }
+        }
+        Ok(request)
+    })();
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => return todo_failure(error),
+    };
+    match crate::delegation::todo_for_turn(request).await {
+        Ok(response) => ToolOutput::success(serde_json::to_string(&response).unwrap()),
+        Err(error) => todo_failure(error),
     }
 }
 
@@ -299,7 +622,7 @@ async fn run_memory_tool(arguments: &str, context: MemoryToolContext) -> ToolOut
         {
             Ok(result) => result,
             Err(error) => {
-                return ToolOutput::failure(format!("Memory recall unavailable: {error}"))
+                return ToolOutput::failure(format!("Memory recall unavailable: {error}"));
             }
         };
         {
@@ -434,7 +757,7 @@ async fn run_schedule_tool(arguments: &str, context: ScheduleToolContext) -> Too
                     return ToolOutput::failure(
                         "Schedule create requires either delay_seconds or local_time with day."
                             .into(),
-                    )
+                    );
                 }
             };
             if context
@@ -711,66 +1034,371 @@ fn valid_memory_field(value: &str, max_chars: usize) -> bool {
 }
 
 fn compose_fanout_output(tasks: &[String], outcomes: Vec<ToolOutput>) -> ToolOutput {
-    let succeeded = outcomes.iter().filter(|outcome| outcome.succeeded).count();
-    let status = if succeeded == tasks.len() {
-        "complete"
-    } else if succeeded == 0 {
-        "failed"
-    } else {
-        "partial"
-    };
-    let mut evidence = Vec::new();
-    let mut failures = Vec::new();
     let mut outcomes = outcomes.into_iter();
-    for (index, objective) in tasks.iter().enumerate() {
+    let mut task_outcomes = Vec::new();
+    for objective in tasks {
         let outcome = outcomes.next().unwrap_or_else(|| {
             ToolOutput::failure("worker returned no outcome for this objective".into())
         });
-        let outcome_status = if outcome.succeeded {
-            "succeeded"
-        } else {
-            "failed"
-        };
-        let entry = format!(
-            "Objective {} [{outcome_status}]: {}\n{}",
-            index + 1,
-            objective,
-            outcome.text
-        );
-        if outcome.succeeded {
-            evidence.push(entry);
-        } else {
-            failures.push(entry);
+        if !outcome.task_outcomes.is_empty() {
+            task_outcomes.extend(outcome.task_outcomes);
+            continue;
         }
-    }
-
-    let mut sections = vec![format!(
-        "Coverage: {status} ({succeeded}/{} objectives succeeded).",
-        tasks.len()
-    )];
-    if !evidence.is_empty() {
-        sections.push(format!("Valid evidence:\n{}", evidence.join("\n\n")));
-    }
-    if !failures.is_empty() {
-        sections.push(format!(
-            "Failed objectives (not evidence):\n{}",
-            failures.join("\n\n")
-        ));
+        task_outcomes.push(TaskOutcome {
+            objective: objective.clone(),
+            result: outcome.succeeded.then(|| outcome.text.clone()),
+            completed_scopes: None,
+            failure_reason: (!outcome.succeeded).then_some(outcome.text),
+            evidence: Default::default(),
+        });
     }
     ToolOutput {
-        text: sections.join("\n\n"),
-        succeeded: succeeded > 0,
+        web_usage: None,
+        text: serde_json::to_string(&WorkerEvidence {
+            task_outcomes: task_outcomes.clone(),
+            omitted: 0,
+        })
+        .expect("native worker evidence is serializable"),
+        succeeded: task_outcomes.iter().any(|outcome| outcome.result.is_some()),
+        task_outcomes,
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::turns::durable_turn_messages;
     use tachyon_api::FOREGROUND_ID;
 
     fn interaction_metadata() -> tachyon_api::InteractionMetadata {
         tachyon_api::InteractionMetadata::new("command-1", "turn-1", FOREGROUND_ID, 1)
+    }
+
+    #[test]
+    fn web_usage_receipts_deduplicate_tokens_and_preserve_unknown_cost() {
+        let mut out = ToolOutput::success("report".into());
+        out.web_usage = Some(tachyon_api::web::WebUsage {
+            receipt_id: Some("host-receipt".into()),
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            cost_micro_usd: None,
+        });
+        let mut usage = tachyon_model::TokenUsage::default();
+        let mut seen = BTreeSet::new();
+        out.account_web_usage(&mut usage, &mut seen);
+        out.account_web_usage(&mut usage, &mut seen);
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (10, 2, 12)
+        );
+        assert_eq!(out.web_usage.as_ref().unwrap().cost_micro_usd, None);
+        out.web_usage.as_mut().unwrap().cost_micro_usd = Some(7001);
+        out.account_web_usage(&mut usage, &mut seen);
+        assert_eq!(usage.total_tokens, 12);
+        out.web_usage = Some(tachyon_api::web::WebUsage {
+            receipt_id: Some("unknown".into()),
+            ..Default::default()
+        });
+        out.account_web_usage(&mut usage, &mut seen);
+        assert!(!seen.contains("unknown"));
+        let mut new_turn = BTreeSet::new();
+        out.web_usage = Some(tachyon_api::web::WebUsage {
+            receipt_id: Some("fresh-root-receipt".into()),
+            input_tokens: Some(3),
+            output_tokens: Some(1),
+            cost_micro_usd: Some(100),
+        });
+        out.account_web_usage(&mut usage, &mut new_turn);
+        assert_eq!(usage.total_tokens, 16);
+    }
+
+    pub(crate) fn web_result() -> tachyon_api::web::WebResult {
+        tachyon_api::web::WebResult {
+            usage: Default::default(),
+            answer: "A model-mediated summary.".into(),
+            citations: vec![tachyon_api::web::Citation {
+                url: "https://arxiv.org/html/2401.00001".into(),
+                title: Some("Paper".into()),
+                excerpt: Some("Source snippet".into()),
+                source_index: Some(1),
+                start_index: None,
+                end_index: None,
+            }],
+            annotations: vec![],
+            status: tachyon_api::web::WebStatus::Grounded,
+            notice: "Grounded does not establish per-URL success.".into(),
+            host_observed_at: 42,
+            observed_search_uses: Some(1),
+            observed_fetch_uses: None,
+            requested_urls: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn web_disabled_invalid_and_retries_preserve_authority() {
+        let mut cfg = tachyon_util::config::Config::default();
+        cfg.web.enabled = false;
+        let primary = AgentRole::Conversation
+            .primary(&tachyon_orchestrator::registry::builtin(), &cfg)
+            .unwrap();
+        assert!(!primary
+            .tools
+            .iter()
+            .any(|tool| matches!(tool.name.as_str(), "websearch" | "webfetch")));
+        let mut metadata = interaction_metadata();
+        metadata.turn_id = Some("turn-1".into());
+        let call = ToolCall {
+            id: "native-1".into(),
+            name: "websearch".into(),
+            arguments: r#"{"query":"current facts"}"#.into(),
+        };
+        {
+            assert!(!AgentRole::Conversation
+                .tools(false, Some(&metadata))
+                .unwrap()
+                .iter()
+                .any(|t| t.name.starts_with("web")));
+            assert!(
+                !run_tool(
+                    &call,
+                    AgentRole::Conversation,
+                    true,
+                    Some(1),
+                    true,
+                    None,
+                    true,
+                    None,
+                    Some(&metadata)
+                )
+                .await
+                .succeeded
+            );
+        }
+        metadata.web_availability = Some(tachyon_api::interaction::WebAvailability {
+            available: true,
+            reason: None,
+        });
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured = calls.clone();
+        crate::delegation::WEB_SERVICE
+            .scope(
+                Arc::new(move |metadata, command| {
+                    captured.lock().unwrap().push((metadata, command));
+                    Ok(web_result())
+                }),
+                async {
+                    for arguments in [
+                        r#"{"kind":"fetch","urls":["https://arxiv.org/pdf/2401.00001"]}"#,
+                        r#"{"kind":"search","query":"x","model":"invented"}"#,
+                        r#"{"kind":"search","query":"x","caller_id":"other"}"#,
+                    ] {
+                        let invalid = ToolCall {
+                            arguments: arguments.into(),
+                            ..call.clone()
+                        };
+                        assert!(
+                            !run_tool(
+                                &invalid,
+                                AgentRole::Conversation,
+                                true,
+                                Some(1),
+                                true,
+                                None,
+                                true,
+                                None,
+                                Some(&metadata)
+                            )
+                            .await
+                            .succeeded
+                        );
+                    }
+                    assert!(calls.lock().unwrap().is_empty());
+                    for _ in 0..2 {
+                        assert!(
+                            run_tool(
+                                &call,
+                                AgentRole::Conversation,
+                                true,
+                                Some(1),
+                                true,
+                                None,
+                                true,
+                                None,
+                                Some(&metadata)
+                            )
+                            .await
+                            .succeeded
+                        );
+                    }
+                },
+            )
+            .await;
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[0], calls[1]);
+        assert_eq!(calls[0].0, metadata);
+        assert_eq!(calls[0].1.command_id, call.id);
+    }
+
+    #[tokio::test]
+    async fn web_failure_diagnostic_survives_foreground_tool_result() {
+        let mut metadata = interaction_metadata();
+        metadata.turn_id = Some("turn-1".into());
+        metadata.web_availability = Some(tachyon_api::interaction::WebAvailability {
+            available: true,
+            reason: None,
+        });
+        let call = ToolCall {
+            id: "rejected".into(),
+            name: "websearch".into(),
+            arguments: r#"{"query":"fixture"}"#.into(),
+        };
+        let diagnostic = "web retrieval failed: provider HTTP 400; request id fixture-request-400; spend may be unknown";
+        crate::delegation::WEB_SERVICE
+            .scope(Arc::new(move |_, _| Err(diagnostic.into())), async {
+                let result = run_tool(
+                    &call,
+                    AgentRole::Conversation,
+                    true,
+                    Some(1),
+                    true,
+                    None,
+                    true,
+                    None,
+                    Some(&metadata),
+                )
+                .await;
+                assert!(!result.succeeded);
+                assert!(result.text.contains(diagnostic));
+                assert!(result.web_usage.is_none());
+            })
+            .await;
+    }
+
+    #[test]
+    fn review_synthesis_shares_space_across_web_results() {
+        use tachyon_model::{ChatMessage, Content, Role};
+        let mut messages = vec![ChatMessage::new(Role::User, "Compare these four sources")];
+        for index in 0..4 {
+            let call = ToolCall {
+                id: format!("web-{index}"),
+                name: "websearch".into(),
+                arguments: String::new(),
+            };
+            let request = tachyon_api::web::WebRequest::Search {
+                query: format!("source {index}"),
+                domains: None,
+                max_results: 3,
+            };
+            let mut result = web_result();
+            result.answer = "report prose ".repeat(1200);
+            result.citations[0].url = format!("https://example.org/source-{index}");
+            result.citations[0].title = Some(format!("Observed title {index}"));
+            result.citations[0].excerpt = Some(format!("Observed excerpt {index}"));
+            result.citations[0].source_index = Some(index);
+            result.citations[0].start_index = Some(42);
+            result.citations[0].end_index = Some(84);
+            result.status = tachyon_api::web::WebStatus::Partial;
+            let outcome = WebOutcome::bounded(&call, &request, result);
+            assert!(json_fits(&outcome, 8192));
+            let output = serde_json::to_string(&outcome).unwrap();
+            messages.push(ChatMessage {
+                role: Role::Assistant,
+                content: vec![Content::ToolCall(call.clone())],
+            });
+            messages.push(ChatMessage {
+                role: Role::Tool,
+                content: vec![Content::ToolResult {
+                    id: call.id,
+                    output,
+                }],
+            });
+        }
+        let brief =
+            serde_json::to_value(crate::model::SynthesisBrief::from_messages(&messages, None))
+                .unwrap();
+        assert_eq!(
+            brief["web"].as_array().unwrap().len(),
+            4,
+            "share prose budget rather than discard later sources and their citations"
+        );
+        assert!(json_fits(&brief, 8192));
+        for (index, outcome) in brief["web"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(outcome["result"]["status"], "partial");
+            assert_eq!(
+                outcome["result"]["citations"][0]["url"],
+                format!("https://example.org/source-{index}")
+            );
+            assert_eq!(
+                outcome["result"]["citations"][0]["title"],
+                format!("Observed title {index}")
+            );
+            assert_eq!(
+                outcome["result"]["citations"][0]["excerpt"],
+                format!("Observed excerpt {index}")
+            );
+            assert_eq!(outcome["result"]["citations"][0]["source_index"], index);
+            assert!(outcome["result"]["citations"][0]["start_index"].is_null());
+            assert!(outcome["result"]["citations"][0]["end_index"].is_null());
+            assert_eq!(outcome["result"]["annotations"], serde_json::json!([]));
+        }
+    }
+
+    #[test]
+    fn web_projection_prioritizes_citations_and_bounds_encoded_bytes() {
+        let call = ToolCall {
+            id: "native-1".into(),
+            name: "websearch".into(),
+            arguments: String::new(),
+        };
+        let request = tachyon_api::web::WebRequest::Search {
+            query: "latest paper".into(),
+            domains: None,
+            max_results: 3,
+        };
+        let mut result = web_result();
+        result.answer = "\\\"".repeat(16000);
+        let out = WebOutcome::bounded(&call, &request, result);
+        assert!(json_fits(&out, 8192));
+        assert_eq!(out.result.citations.len(), 1);
+        assert!(out.omitted > 0);
+        assert_eq!(out.freshness, "unknown");
+        let mut messages = vec![tachyon_model::ChatMessage::new(
+            tachyon_model::Role::User,
+            "latest paper",
+        )];
+        messages.push(tachyon_model::ChatMessage {
+            role: tachyon_model::Role::Assistant,
+            content: vec![tachyon_model::Content::ToolCall(call)],
+        });
+        messages.push(tachyon_model::ChatMessage {
+            role: tachyon_model::Role::Tool,
+            content: vec![tachyon_model::Content::ToolResult {
+                id: "native-1".into(),
+                output: serde_json::to_string(&WebOutcome::bounded(
+                    &ToolCall {
+                        id: "native-1".into(),
+                        name: "websearch".into(),
+                        arguments: String::new(),
+                    },
+                    &request,
+                    web_result(),
+                ))
+                .unwrap(),
+            }],
+        });
+        let brief =
+            serde_json::to_value(crate::model::SynthesisBrief::from_messages(&messages, None))
+                .unwrap();
+        assert_eq!(brief["web"][0]["tool_call_id"], "native-1");
+        messages.remove(1);
+        let brief =
+            serde_json::to_value(crate::model::SynthesisBrief::from_messages(&messages, None))
+                .unwrap();
+        assert_eq!(brief["web"], serde_json::json!([]));
     }
     #[test]
     fn delegation_calls_produce_provider_neutral_task_intents() {
@@ -819,11 +1447,13 @@ mod tests {
 
     #[test]
     fn conversation_advertises_and_authorizes_contextual_services() {
-        let tools = AgentRole::Conversation.tools(false).unwrap();
+        let tools = AgentRole::Conversation.tools(false, None).unwrap();
         assert!(tools.iter().any(|tool| tool.name == "memory"));
         assert!(tools.iter().any(|tool| tool.name == "schedule"));
-        assert!(AgentRole::Conversation.allows_tool("memory").unwrap());
-        assert!(AgentRole::Conversation.allows_tool("schedule").unwrap());
+        assert!(AgentRole::Conversation.allows_tool("memory", None).unwrap());
+        assert!(AgentRole::Conversation
+            .allows_tool("schedule", None)
+            .unwrap());
         assert!(serde_json::from_str::<MemoryToolArgs>(
             r#"{"action":"recall","query":"relevant food preferences","include_history":false}"#
         )
@@ -849,7 +1479,7 @@ mod tests {
             mutation_succeeded: Arc::new(Mutex::new(None)),
         };
         let tools = available_tools_for_context(
-            &AgentRole::Conversation.tools(false).unwrap(),
+            &AgentRole::Conversation.tools(false, None).unwrap(),
             Some(&context),
             None,
         );
@@ -863,7 +1493,7 @@ mod tests {
 
     #[test]
     fn contextual_filters_preserve_registry_order_and_unaffected_schemas() {
-        let primary = AgentRole::Conversation.tools(false).unwrap();
+        let primary = AgentRole::Conversation.tools(false, None).unwrap();
         let memory = MemoryToolContext {
             metadata: interaction_metadata(),
             turn: 1,
@@ -880,7 +1510,7 @@ mod tests {
             mutation_used: Arc::new(AtomicBool::new(false)),
             mutation_succeeded: Arc::new(Mutex::new(None)),
         };
-        for (memory_done, schedule_done, names) in [
+        for (memory_done, schedule_done, mut names) in [
             (
                 None,
                 None,
@@ -898,9 +1528,15 @@ mod tests {
             ),
             (Some(false), Some(true), vec!["spawn_agent", "spawn_agents"]),
         ] {
+            names.push("todo");
+            names.push("campaign");
             *memory.mutation_succeeded.lock().unwrap() = memory_done;
             *schedule.mutation_succeeded.lock().unwrap() = schedule_done;
             let actual = available_tools_for_context(&primary, Some(&memory), Some(&schedule));
+            assert_eq!(
+                actual.last().unwrap().parameters,
+                primary.last().unwrap().parameters
+            );
             assert_eq!(
                 actual
                     .iter()
@@ -936,6 +1572,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn todo_rejects_model_authority_and_invalid_mutations_before_transport() {
+        use serde_json::json;
+        let service = Arc::new(|_: tachyon_api::todo::TodoRequest| -> Result<tachyon_api::todo::TodoResponse, tachyon_api::todo::TodoError> {
+            panic!("invalid arguments must not reach a daemon")
+        });
+        crate::delegation::TODO_SERVICE.scope(service, async {
+            for arguments in [
+                json!({"operation":"list","scope":"current_work"}),
+                json!({"operation":"list","scope":"current_campaign"}),
+                json!({"operation":"list","scope":{"kind":"conversation","id":"other"}}),
+                json!({"operation":"list","campaign_id":"guessed"}),
+                json!({"operation":"list","actor":"operator","role":"host"}),
+                json!({"operation":"add","title":"missing revision","command_id":"x"}),
+                json!({"operation":"add","title":"missing command","expected_revision":0}),
+                json!({"operation":"update","id":"x","status":"completed","command_id":"x"}),
+                json!({"operation":"list","title":"not a list field"}),
+                json!({"operation":"list","cursor":{"version":1,"instance_id":"x","scope":{"kind":"conversation","id":"other"},"filter":{"status":null,"ids":null},"scope_revision":0,"after_order_key":0,"after_id":"x"}}),
+            ] {
+                let output = run_todo_tool(&arguments.to_string(), &interaction_metadata()).await;
+                assert!(!output.succeeded, "{arguments}");
+                assert!(serde_json::from_str::<serde_json::Value>(&output.text).unwrap()["error"].is_object());
+            }
+        }).await;
+    }
+
     #[test]
     fn fanout_output_preserves_partial_coverage_and_separates_failures() {
         let tasks = vec![
@@ -953,19 +1615,56 @@ mod tests {
         );
 
         assert!(output.succeeded);
-        assert!(output
-            .text
-            .contains("Coverage: partial (2/3 objectives succeeded)."));
-        let evidence = output.text.find("Valid evidence:").unwrap();
-        let failures = output
-            .text
-            .find("Failed objectives (not evidence):")
-            .unwrap();
-        assert!(evidence < failures);
-        assert!(output.text[..failures].contains("verify package release"));
-        assert!(output.text[..failures].contains("check security advisory"));
-        assert!(!output.text[..failures].contains("worker timed out"));
-        assert!(output.text[failures..].contains("inspect deployment status"));
-        assert!(output.text[failures..].contains("worker timed out"));
+        let evidence: WorkerEvidence = serde_json::from_str(&output.text).unwrap();
+        assert_eq!(evidence.task_outcomes.len(), 3);
+        assert_eq!(
+            evidence.task_outcomes[0].result.as_deref(),
+            Some("release evidence")
+        );
+        assert_eq!(evidence.task_outcomes[1].result, None);
+        assert_eq!(
+            evidence.task_outcomes[1].failure_reason.as_deref(),
+            Some("worker timed out")
+        );
+        assert_eq!(
+            evidence.task_outcomes[2].result.as_deref(),
+            Some("advisory evidence")
+        );
+    }
+
+    #[tokio::test]
+    async fn campaign_native_service_preserves_host_origin_and_rejects_model_authority() {
+        use serde_json::json;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let captured = calls.clone();
+        let service = Arc::new(move |origin, request| {
+            captured.lock().unwrap().push((origin, request));
+            Ok(json!({"status":"accepted","accepted_revision":2}))
+        });
+        crate::delegation::CAMPAIGN_SERVICE.scope(service, async {
+            let metadata = interaction_metadata();
+            for args in [
+                json!({"operation":"list","actor":"root"}),
+                json!({"operation":"list","origin":{"conversation_id":"other"}}),
+                json!({"operation":"create","objective":"invented"}),
+                json!({"operation":"resize","campaign_id":"linked","max_running":10}),
+                json!({"operation":"steer","campaign_id":"linked","work_id":"exact","command_id":"x","instructions":"stop"}),
+                json!({"operation":"cancel","campaign_id":"linked","work_id":"exact","generation":1}),
+                json!({"operation":"status","campaign_id":"linked","limit":33}),
+            ] {
+                let call = ToolCall { id: "provider-call".into(), name: "campaign".into(), arguments: args.to_string() };
+                assert!(!run_tool(&call, AgentRole::Conversation, true, Some(1), true, None, true, None, Some(&metadata)).await.succeeded);
+            }
+            assert!(calls.lock().unwrap().is_empty());
+            let call = ToolCall { id: "provider-call".into(), name: "campaign".into(), arguments: json!({"operation":"steer","campaign_id":"linked","work_id":"exact","command_id":"separate-command","expected_revision":1,"instructions":"stop the requested branch"}).to_string() };
+            assert!(!run_tool(&call, AgentRole::Conversation, true, None, true, None, true, None, Some(&metadata)).await.succeeded);
+            let output = run_tool(&call, AgentRole::Conversation, true, Some(1), true, None, true, None, Some(&metadata)).await;
+            assert!(output.succeeded);
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&output.text).unwrap()["status"], "accepted");
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, metadata);
+            assert!(matches!(&calls[0].1, tachyon_api::conversation_campaign::Request::Steer { command_id, work_id, .. } if command_id == "separate-command" && work_id == "exact"));
+        }).await;
     }
 }

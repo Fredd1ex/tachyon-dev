@@ -2,7 +2,8 @@
 
 //! CLI-side daemon management: status, start, stop, restart, and auto-start.
 
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
 
 #[cfg(target_family = "unix")]
 use std::os::unix::process::CommandExt;
@@ -33,14 +34,13 @@ pub fn start() -> Option<u32> {
     let current_exe = std::env::current_exe().ok()?;
     let tachyond_bin = current_exe.parent()?.join("tachyond");
 
-    let mut child = Command::new(&tachyond_bin)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        // Detach from the calling session so closing the CLI doesn't kill us.
-        .process_group(0)
-        .spawn()
-        .ok()?;
+    let mut child = match launch(&tachyond_bin) {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("{}", launch_error(&tachyond_bin, &error));
+            return None;
+        }
+    };
 
     // Give it a moment to write its pid file.
     for _ in 0..30 {
@@ -53,6 +53,24 @@ pub fn start() -> Option<u32> {
     // Didn't detect it; drain child to avoid a zombie and report none.
     let _ = child.wait();
     None
+}
+
+fn launch(path: &Path) -> std::io::Result<Child> {
+    Command::new(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // Detach from the calling session so closing the CLI doesn't kill us.
+        .process_group(0)
+        .spawn()
+}
+
+fn launch_error(path: &Path, error: &std::io::Error) -> String {
+    let mut message = format!("failed to launch {}: {error}", path.display());
+    if error.kind() == std::io::ErrorKind::NotFound {
+        message.push_str("\nBuild all companion binaries from the repository root: cargo build --workspace --bins\nBuilding or running only --bin tachyon does not build tachyond or the interaction hosts.");
+    }
+    message
 }
 
 /// Stop the daemon gracefully (SIGTERM, escalating to SIGKILL). Returns Ok if
@@ -123,8 +141,50 @@ pub fn kill() -> Result<(), String> {
 
 /// Restart the daemon: stop if running, then start fresh.
 pub fn restart() -> Option<u32> {
-    let _ = stop();
+    // Do not stop a working daemon when its replacement has been cleaned away.
+    let executable = std::env::current_exe().ok()?.parent()?.join("tachyond");
+    if let Err(error) = std::fs::metadata(&executable) {
+        eprintln!("{}", launch_error(&executable, &error));
+        return None;
+    }
+    if let Err(error) = stop() {
+        eprintln!("failed to stop daemon before restart: {error}");
+        return None;
+    }
     // Ensure the old pid is cleared so start() doesn't see a live pid.
     daemon::clear_pid();
     start()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_companion_reports_path_and_workspace_build_command() {
+        let missing = std::env::temp_dir()
+            .join(format!(
+                "tachyon-missing-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .join("tachyond");
+        let error = launch(&missing).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let message = launch_error(&missing, &error);
+        assert!(message.contains(missing.to_str().unwrap()));
+        assert!(message.contains("cargo build --workspace --bins"));
+    }
+
+    #[test]
+    fn launch_failure_preserves_non_missing_errors() {
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let message = launch_error(Path::new("/example/tachyond"), &error);
+        assert!(message.contains("/example/tachyond"));
+        assert!(message.contains(&error.to_string()));
+        assert!(!message.contains("cargo build"));
+    }
 }

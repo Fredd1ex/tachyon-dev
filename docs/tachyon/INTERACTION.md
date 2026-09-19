@@ -6,6 +6,27 @@ and lifecycle operations.
 
 ## Actors
 
+The TUI's ORCHESTRATORS pane consumes the daemon status response's ephemeral
+`orchestrators` catalog on the existing one-second poll. Enabled registered role
+definitions supply stable IDs, display names, purposes, invocation kinds, output
+visibility, and host bindings. Disabled or removed definitions disappear on the
+next successful poll; the projection is bounded to 64 inference roles plus
+separately typed daemon and Memory infrastructure services. Memory is storage,
+not a registered inference role. No catalog data is persisted and rendering
+performs no IPC or model calls. Older daemons omit the additive catalog field;
+clients display catalog unavailability rather than inventing rows.
+
+Availability is not an active runtime instance. Conversation uses the configured
+conversation alias (for example Jarvis), and its process observations when present.
+Coordinator exposes its supervisor/review observations. Campaign remains available
+without claiming a runtime ID, activity, or start time merely because its shared
+background host is reviewing ordinary jobs. Unknown duration is `-`. Only rows
+with an explicit host control target permit process actions; available roles and
+Memory are read-only, so selecting Campaign cannot stop Coordinator. Selection is
+resolved by stable catalog ID on every action, not by a cached row number. When
+the daemon is offline, the live catalog is cleared and marked unavailable rather
+than displaying fabricated running agents. Worker instances remain in AGENTS.
+
 ```text
 User
   |
@@ -487,10 +508,10 @@ evidence is already available.
 - Typed `WorkerStarted` and `WorkerCompleted` events retain the originating turn
   so worker badges, evidence, and expanded traces cannot drift to a newer user
   message. Worker release events are also observable.
-- `Ctrl+O` trace mode is a chronological, uncollapsed diagnostic projection. It
-  overrides worker and tool-body collapse, shows full tool arguments and
-  results, and labels events authored by the Background actor. Normal chat
-  remains limited to user-facing Conversation turns.
+- Scoped task/tool monitoring is inline below conversation badges. `Ctrl+O`
+  expands structured details in that cell; `Ctrl+D` then opens the secondary
+  inspector, where raw output requires a separate opt-in. See
+  [Inline Turn Activity](TUI_ACTIVITY_DETAILS.md) for controls and display limits.
 - In chat mode, structured reply events are authoritative; legacy raw reply
   lines are emitted only for one-shot CLI output so a reply cannot render twice.
 - A worker released after successful completion must not be counted as failed,

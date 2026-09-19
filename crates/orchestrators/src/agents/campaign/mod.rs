@@ -1,4 +1,5 @@
 //! Pure campaign oversight policy; registration grants no runtime authority.
+pub mod assessment;
 pub mod progress;
 pub mod tools;
 
@@ -9,6 +10,7 @@ use crate::registry::{
 pub const fn definition() -> RoleDescriptor {
     RoleDescriptor {
         id: RoleId::Campaign,
+        display_name: "Campaign",
         stable_id: "campaign",
         purpose:
             "Assess campaign progress and flag operator attention without allocation authority.",

@@ -30,6 +30,13 @@ pub struct OperationalEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperationalChange {
-    TodoAdded { todo: crate::todo::Todo },
-    TodoUpdated { todo: crate::todo::Todo },
+    AttentionChanged {
+        attention: crate::attention::Attention,
+    },
+    TodoAdded {
+        todo: crate::todo::Todo,
+    },
+    TodoUpdated {
+        todo: crate::todo::Todo,
+    },
 }

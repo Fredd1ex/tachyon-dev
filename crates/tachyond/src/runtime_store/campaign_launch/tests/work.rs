@@ -5,6 +5,125 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires freshly built GHOST_TEST_BIN and IPython; localhost only"]
+async fn conversation_cancel_interrupts_active_root_without_fabricating_cleanup() {
+    use tachyon_api::conversation_campaign::Request;
+    let (dir, store, mut m) = fixture();
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    m.workspace = workspace.path().canonicalize().unwrap();
+    m.home = home.path().canonicalize().unwrap();
+    m.executable = PathBuf::from(std::env::var_os("GHOST_TEST_BIN").expect("fresh Ghost binary"))
+        .canonicalize()
+        .unwrap();
+    m.model = "scripted-test-model".into();
+    m.oversight = Some(tachyon_api::campaign::CampaignOversight {
+        tokens: 30,
+        cost_micro_usd: 30,
+        max_assessments: 1,
+        timeout_ms: 3000,
+        conversation_id: Some(tachyon_api::FOREGROUND_ID.into()),
+    });
+    let mut provider = crate::parallel_acceptance::provider::LocalProvider::start().await;
+    let model = Model::new(ModelConfig {
+        base_url: provider.endpoint.clone(),
+        api_key: String::new(),
+        model: m.model.clone(),
+        temperature: 0.0,
+        max_completion_tokens: Some(m.output_tokens),
+        context_length: None,
+        parallel_tool_calls: false,
+        reasoning: Default::default(),
+        routing: None,
+        debug: false,
+        debug_log: None,
+    });
+    let service = CampaignService::new(store.clone(), dir.path().into()).unwrap();
+    let run_store = store.clone();
+    let root = dir.path().to_owned();
+    service
+        .launch(
+            &m,
+            provider.endpoint.clone(),
+            false,
+            move |launch, cancel| execute(run_store, root, launch, model, cancel),
+        )
+        .unwrap();
+    let work = format!("{}-root", m.campaign_id);
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        // Hold the actual worker's provider request open throughout cancellation.
+        let mut held = Vec::new();
+        loop {
+            let request = provider.requests.recv().await.unwrap();
+            let worker = request.body["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|t| t["function"]["name"] == "work"));
+            held.push(request);
+            if worker {
+                break;
+            }
+        }
+        let state = store.campaign_work_status(&m.campaign_id, &work).unwrap();
+        assert!(state.active && !state.terminal);
+        let request = Request::Cancel {
+            campaign_id: m.campaign_id.clone(),
+            work_id: work.clone(),
+            command_id: "cancel-active-root".into(),
+            generation: 1,
+        };
+        let receipt = store
+            .conversation_campaign(tachyon_api::FOREGROUND_ID, &request)
+            .unwrap();
+        assert_eq!(receipt["status"], "accepted");
+        while !service.active.lock().unwrap()[&m.campaign_id]
+            .task
+            .is_finished()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(*service.active.lock().unwrap()[&m.campaign_id]
+            .cancel
+            .borrow());
+        let state = store.campaign_work_status(&m.campaign_id, &work).unwrap();
+        assert!(state.cancellation_requested && !state.active);
+        let record = store
+            .campaign_execution(&m.campaign_id, &work)
+            .unwrap()
+            .unwrap();
+        let snapshot = store
+            .conversation_campaign(
+                tachyon_api::FOREGROUND_ID,
+                &Request::Status {
+                    campaign_id: m.campaign_id.clone(),
+                    work_id: Some(work.clone()),
+                    after: None,
+                    limit: 1,
+                    include_plan: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot["works"][0]["cancellation_done"],
+            state.terminal && record.settled
+        );
+        let ledger = store.campaign_ledger(&m.campaign_id).unwrap();
+        assert_eq!(
+            store
+                .conversation_campaign(tachyon_api::FOREGROUND_ID, &request)
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(store.campaign_ledger(&m.campaign_id).unwrap(), ledger);
+        assert_ne!(status(&store, &m), CampaignStatus::Accepted);
+        drop(held);
+    })
+    .await;
+    service.shutdown();
+    provider.shutdown().await;
+    result.expect("active root cancellation did not interrupt execution");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires freshly built GHOST_TEST_BIN and IPython; localhost only"]
 async fn actual_root_only_work_status_ask_complete_command_gate() {
     let (dir, store, mut m) = fixture();
     let workspace = tempfile::tempdir().unwrap();
@@ -184,7 +303,20 @@ async fn actual_root_only_work_status_ask_complete_command_gate() {
     assert!(answered);
     assert_eq!(status(&store, &m), CampaignStatus::Accepted);
     assert_eq!(calls.load(Ordering::SeqCst), 4);
-    assert_eq!(store.attention_notifications.lock().unwrap().len(), 1);
+    assert_eq!(
+        store
+            .attention_snapshot(
+                &tachyon_api::todo::TodoScope::Campaign {
+                    campaign_id: m.campaign_id.clone()
+                },
+                None,
+                32
+            )
+            .unwrap()
+            .records
+            .len(),
+        1
+    );
     let record = store
         .campaign_execution(&m.campaign_id, &work)
         .unwrap()

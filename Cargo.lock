@@ -2275,6 +2275,7 @@ dependencies = [
  "clap",
  "nix",
  "rpassword",
+ "serde_json",
  "tachyon-api",
  "tachyon-client",
  "tachyon-tui",
@@ -2328,6 +2329,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tachyon-api",
+ "tachyon-client",
  "tachyon-model",
  "tachyon-orchestrator",
  "tachyon-util",
@@ -2368,6 +2370,7 @@ version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tachyon-api",
  "uuid",
 ]
 
@@ -2383,6 +2386,7 @@ dependencies = [
  "tachyon-api",
  "tachyon-client",
  "tachyon-util",
+ "tempfile",
 ]
 
 [[package]]
@@ -2418,6 +2422,7 @@ dependencies = [
  "tachyon-api",
  "tachyon-memory",
  "tachyon-model",
+ "tachyon-orchestrator",
  "tachyon-util",
  "tempfile",
  "tokio",

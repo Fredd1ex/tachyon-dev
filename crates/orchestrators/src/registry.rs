@@ -90,6 +90,7 @@ pub enum OutputVisibility {
 pub struct RoleDescriptor {
     pub id: RoleId,
     pub stable_id: &'static str,
+    pub display_name: &'static str,
     pub purpose: &'static str,
     pub capabilities: &'static [Capability],
     pub host_lane: HostLane,
@@ -113,6 +114,10 @@ pub struct Registry<'a> {
 }
 
 impl<'a> Registry<'a> {
+    pub fn enabled_roles(&self) -> impl Iterator<Item = &RoleDescriptor> {
+        self.roles.iter().filter(|role| role.enabled)
+    }
+
     pub fn new(roles: &'a [RoleDescriptor]) -> Result<Self, RegistryError> {
         for (index, role) in roles.iter().enumerate() {
             if role.stable_id.is_empty() || role.stable_id != role.id.stable_id() {
@@ -208,6 +213,7 @@ mod tests {
             assert!(pair[0].stable_id < pair[1].stable_id);
         }
         for role in ROLES {
+            assert!(!role.display_name.is_empty());
             assert!(!role.purpose.is_empty());
         }
     }
@@ -232,7 +238,16 @@ mod tests {
         };
         assert_eq!(
             names(&ROLES[1]),
-            ["spawn_agent", "spawn_agents", "memory", "schedule"]
+            [
+                "spawn_agent",
+                "spawn_agents",
+                "memory",
+                "schedule",
+                "todo",
+                "campaign",
+                "websearch",
+                "webfetch"
+            ]
         );
         assert_eq!(
             names(&ROLES[2]),

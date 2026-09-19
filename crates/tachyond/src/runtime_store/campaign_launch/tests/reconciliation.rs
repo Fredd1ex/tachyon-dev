@@ -643,6 +643,7 @@ fn reconciliation_rejects_active_task_even_after_cancel_signal() {
     service.active.lock().unwrap().insert(
         m.campaign_id.clone(),
         Active {
+            oversight: false,
             id: m.campaign_id.clone(),
             cancel,
             task: std::thread::spawn(move || {

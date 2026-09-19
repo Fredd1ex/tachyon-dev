@@ -8,9 +8,11 @@
 //! in lock-step over a single protocol.
 
 pub mod agents;
+pub mod attention;
 pub mod campaign_oversight;
 pub mod context;
 pub mod continuation;
+pub mod conversation_campaign;
 pub mod interaction;
 pub mod monitor;
 pub mod operational_events;
@@ -29,4 +31,5 @@ pub const BACKGROUND_ID: &str = "background";
 pub const MEMORY_ID: &str = "memory";
 pub mod campaign;
 pub mod integration;
+pub mod web;
 pub mod work;
