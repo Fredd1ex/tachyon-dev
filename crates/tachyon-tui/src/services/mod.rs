@@ -7,6 +7,7 @@ use tachyon_client::Client;
 pub(super) mod control;
 mod event_buffer;
 pub(super) mod history;
+pub(super) mod interaction;
 pub(super) mod subscriptions;
 
 pub(super) struct Snapshot {

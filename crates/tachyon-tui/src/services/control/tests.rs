@@ -15,6 +15,58 @@ fn info(id: &str) -> AgentInfo {
     .unwrap()
 }
 
+fn command(id: &str, text: &str) -> Command {
+    Command::Submit(tachyon_api::interaction_manager::Submit {
+        conversation_id: "foreground".into(),
+        session_id: "host".into(),
+        command_id: id.into(),
+        text: text.into(),
+        cwd: None,
+    })
+}
+
+#[test]
+fn unknown_chat_admission_retains_pending_command_identity_without_retry() {
+    let mut calls = 0;
+    let output = execute_with(command("pending-id", "hello"), |request, _| {
+        calls += 1;
+        match request {
+            ApiRequest::InteractionSnapshot => Ok(ApiResponse::InteractionFrame {
+                frame: tachyon_api::interaction_manager::Frame::Snapshot {
+                    snapshot: tachyon_api::interaction_manager::Snapshot {
+                        history_content: Vec::new(),
+                        projection: Default::default(),
+                        projection_next: None,
+                        revision: tachyon_api::interaction_manager::Revision {
+                            epoch: "daemon".into(),
+                            sequence: 0,
+                        },
+                        conversation_id: "foreground".into(),
+                        session_id: Some("host".into()),
+                        host_state: None,
+                        history: Vec::new(),
+                    },
+                },
+            }),
+            ApiRequest::InteractionSubmit { command } => {
+                assert_eq!(command.command_id, "pending-id");
+                assert_eq!(command.session_id, "host");
+                assert_eq!(command.text, "hello");
+                assert_eq!(command.cwd, None);
+                Err("lost receipt".into())
+            }
+            _ => panic!("legacy intake or automatic retry"),
+        }
+    });
+    assert_eq!(calls, 1);
+    let Output::Message(Err(error)) = output else {
+        panic!()
+    };
+    assert!(
+        error.contains("pending-id") && error.contains("host") && error.contains("never a new ID")
+    );
+}
+
 #[test]
 fn blocked_local_intake_keeps_input_and_frames_live_and_drains_fifo_without_retry() {
     let (mut client, mut server) = UnixStream::pair().unwrap();
@@ -33,14 +85,19 @@ fn blocked_local_intake_keeps_input_and_frames_live_and_drains_fifo_without_retr
             let req = read_request(&mut reader).unwrap();
             if index == 0 {
                 assert!(
-                    matches!(&req, ApiRequest::ForegroundChat { text, cwd: None } if text == "first")
+                    matches!(&req, ApiRequest::InteractionSubmit { command } if command.text == "first" && command.cwd.is_none() && command.session_id == "host-session" && !command.command_id.is_empty())
                 );
                 entered.send(()).unwrap();
                 gate.recv_timeout(Duration::from_secs(5)).unwrap();
             }
             let response = match &req {
-                ApiRequest::ForegroundChat { .. } => ApiResponse::Chat {
-                    id: tachyon_api::FOREGROUND_ID.into(),
+                ApiRequest::InteractionSubmit { command } => ApiResponse::InteractionReceipt {
+                    receipt: tachyon_api::interaction_manager::Receipt {
+                        origin: None,
+                        accepted: None,
+                        command: command.clone(),
+                        admission: tachyon_api::interaction_manager::Admission::Delivered,
+                    },
                 },
                 ApiRequest::AgentStop { id } | ApiRequest::AgentResume { id } => {
                     ApiResponse::Agent { info: info(id) }
@@ -61,7 +118,15 @@ fn blocked_local_intake_keeps_input_and_frames_live_and_drains_fifo_without_retr
     })
     .unwrap();
     let mut threads = vec![Thread::new_foreground()];
-    actions::submit_chat("/managed first", &mut threads, &mut worker).unwrap();
+    let mut interaction = crate::app::services::interaction::State::default();
+    interaction.session = Some("host-session".into());
+    actions::submit_chat(
+        "/managed first",
+        &mut threads,
+        &mut worker,
+        &mut interaction,
+    )
+    .unwrap();
     started.recv_timeout(Duration::from_secs(5)).unwrap();
     let mut draft = "next".to_string();
     let mut cursor = 4;
@@ -77,9 +142,11 @@ fn blocked_local_intake_keeps_input_and_frames_live_and_drains_fifo_without_retr
         actions::handle_slash(&format!("{verb} agent-{index}"), &mut threads, &mut worker).unwrap();
     }
     let before = threads[0].items.len();
-    assert!(actions::submit_chat(&draft, &mut threads, &mut worker)
-        .unwrap_err()
-        .contains("not accepted"));
+    assert!(
+        actions::submit_chat(&draft, &mut threads, &mut worker, &mut interaction)
+            .unwrap_err()
+            .contains("not accepted")
+    );
     assert_eq!(threads[0].items.len(), before);
     assert_eq!(draft, "next!");
     assert_eq!(worker.pending(), CAPACITY);
@@ -93,7 +160,7 @@ fn blocked_local_intake_keeps_input_and_frames_live_and_drains_fifo_without_retr
     );
     assert!(results
         .iter()
-        .all(|r| matches!(&r.output, Output::Message(Ok(_)))));
+        .all(|r| matches!(&r.output, Output::Message(Ok(_)) | Output::Interaction(_))));
     let observed = server.join().unwrap();
     for (index, req) in observed.iter().enumerate().skip(1) {
         assert!(req.contains(&format!("agent-{index}")));
@@ -112,14 +179,14 @@ fn unread_results_count_against_admission_bound() {
     .unwrap();
     for index in 0..CAPACITY {
         worker
-            .submit(index.to_string(), Command::Chat("fake".into()))
+            .submit(index.to_string(), command(&index.to_string(), "fake"))
             .unwrap();
     }
     for _ in 0..CAPACITY {
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
     assert!(worker
-        .submit("extra".into(), Command::Chat("fake".into()))
+        .submit("extra".into(), command("extra", "fake"))
         .is_err());
     assert_eq!(worker.shutdown().len(), CAPACITY);
 }

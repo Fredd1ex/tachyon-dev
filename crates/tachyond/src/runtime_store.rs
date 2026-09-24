@@ -134,6 +134,7 @@ mod compute;
 mod host_capacity;
 
 pub(crate) struct RuntimeStore {
+    operational_subscribers: std::sync::Mutex<Vec<operational_events::Subscriber>>,
     pub(crate) retained: tachyond::retained_storage::RetainedStorage,
     compute: std::sync::Mutex<compute::State>,
     host_capacity: host_capacity::HostCapacity,
@@ -165,6 +166,7 @@ impl RuntimeStore {
         .campaign_resources
         .max_retained_storage_bytes;
         let store = Self {
+            operational_subscribers: Default::default(),
             retained: tachyond::retained_storage::RetainedStorage::new(database.clone(), maximum)?,
             compute: Default::default(),
             host_capacity: host_capacity::HostCapacity::new(

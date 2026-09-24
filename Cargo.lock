@@ -2280,6 +2280,8 @@ dependencies = [
  "tachyon-client",
  "tachyon-tui",
  "tachyon-util",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -2337,6 +2339,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tachyon-interaction-manager"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tachyon-api",
+ "uuid",
+]
+
+[[package]]
 name = "tachyon-memory"
 version = "0.3.0"
 dependencies = [
@@ -2387,6 +2399,7 @@ dependencies = [
  "tachyon-client",
  "tachyon-util",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -2420,6 +2433,7 @@ dependencies = [
  "sha2",
  "signal-hook",
  "tachyon-api",
+ "tachyon-interaction-manager",
  "tachyon-memory",
  "tachyon-model",
  "tachyon-orchestrator",

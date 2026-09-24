@@ -1,14 +1,21 @@
-//! Local visit snapshots. The directory is the visit index; each file ends in a
-//! fixed-width page-offset table, so reading a page never reads other pages.
+//! History identity/formatting helpers. Legacy archive codecs are test-only;
+//! the running TUI never opens, imports, writes, or deletes local transcripts.
 use super::*;
+#[cfg(test)]
 use std::fs::{self, File, OpenOptions};
+#[cfg(test)]
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(test)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 const TURNS_PER_PAGE: usize = 32;
+#[cfg(test)]
 const MAGIC: &[u8; 8] = b"TUIVIS01";
 
+#[cfg(test)]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct SessionThread {
     pub(super) id: String,
@@ -25,6 +32,7 @@ pub(super) struct SessionThread {
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[cfg(test)]
 pub(super) struct SessionItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) attention: Option<attention::Notice>,
@@ -44,6 +52,7 @@ pub(super) struct SessionItem {
     pub(super) timestamp: u64,
 }
 
+#[cfg(test)]
 fn kind_str(k: &ItemKind) -> &'static str {
     match k {
         ItemKind::User => "user",
@@ -58,6 +67,7 @@ fn kind_str(k: &ItemKind) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn kind_from_str(s: &str) -> ItemKind {
     match s {
         "user" => ItemKind::User,
@@ -72,6 +82,7 @@ fn kind_from_str(s: &str) -> ItemKind {
     }
 }
 
+#[cfg(test)]
 pub(super) fn session_snapshot(threads: &[Thread]) -> Vec<SessionThread> {
     threads
         .iter()
@@ -118,6 +129,7 @@ pub(super) fn session_snapshot(threads: &[Thread]) -> Vec<SessionThread> {
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn restore_session(list: Vec<SessionThread>) -> Vec<Thread> {
     let threads: Vec<Thread> = list
         .into_iter()
@@ -128,6 +140,7 @@ pub(super) fn restore_session(list: Vec<SessionThread>) -> Vec<Thread> {
                 metrics.completed_ms.is_some().then(|| turn.clone())
             }));
             Thread {
+                canonical_works: HashMap::new(),
                 history_len: 0,
                 history_label: None,
                 session_started: now_seconds(),
@@ -175,6 +188,7 @@ pub(super) fn restore_session(list: Vec<SessionThread>) -> Vec<Thread> {
                 metric_revisions: HashMap::new(),
                 activity: turn_activity::Activity::default(),
                 checklist: None,
+                recorded_checklists: Default::default(),
             }
         })
         .collect();
@@ -185,6 +199,7 @@ pub(super) fn restore_session(list: Vec<SessionThread>) -> Vec<Thread> {
     }
 }
 
+#[cfg(test)]
 pub(super) struct Visits {
     root: PathBuf,
     own: String,
@@ -194,6 +209,7 @@ pub(super) struct Visits {
     completed: BTreeSet<String>,
 }
 
+#[cfg(test)]
 pub(super) struct Snapshot {
     path: PathBuf,
     list: Vec<SessionThread>,
@@ -203,12 +219,14 @@ pub(super) struct Snapshot {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 struct Recovery {
     version: u32,
     pending: HashMap<String, u64>,
     completed: BTreeSet<String>,
 }
 
+#[cfg(test)]
 pub(super) struct PageRequest {
     root: PathBuf,
     own: String,
@@ -216,12 +234,14 @@ pub(super) struct PageRequest {
     older: bool,
 }
 
+#[cfg(test)]
 pub(super) struct LoadedPage {
     selected: (String, u64),
     list: Vec<SessionThread>,
     label: String,
 }
 
+#[cfg(test)]
 impl Snapshot {
     pub(super) fn save(&self) -> io::Result<()> {
         write_snapshot_pending(
@@ -233,6 +253,7 @@ impl Snapshot {
     }
 }
 
+#[cfg(test)]
 impl Visits {
     pub(super) fn open(data: &Path) -> io::Result<Self> {
         let root = data.join("tui-visits");
@@ -472,6 +493,7 @@ impl Visits {
     }
 }
 
+#[cfg(test)]
 impl PageRequest {
     // Bounded-memory directory traversal; the current visit is never a candidate.
     fn neighbor(&self, key: &str, older: bool) -> io::Result<Option<String>> {
@@ -552,10 +574,12 @@ impl PageRequest {
     }
 }
 
+#[cfg(test)]
 fn write_snapshot(path: &Path, list: Vec<SessionThread>) -> io::Result<()> {
     write_snapshot_pending(path, list, &HashMap::new(), &BTreeSet::new())
 }
 
+#[cfg(test)]
 fn write_snapshot_pending(
     path: &Path,
     list: Vec<SessionThread>,
@@ -701,6 +725,7 @@ fn write_snapshot_pending(
     result
 }
 
+#[cfg(test)]
 fn index(file: &mut File) -> io::Result<(u64, u64)> {
     let len = file.metadata()?.len();
     if len < 24 {
@@ -722,6 +747,7 @@ fn index(file: &mut File) -> io::Result<(u64, u64)> {
     Ok((count, start))
 }
 
+#[cfg(test)]
 fn page_count(path: &Path) -> io::Result<u64> {
     index(&mut File::open(path)?).map(|(count, _)| count)
 }
@@ -731,6 +757,7 @@ fn read_pending(path: &Path) -> io::Result<HashMap<String, u64>> {
     Ok(read_recovery(path)?.pending)
 }
 
+#[cfg(test)]
 fn read_recovery(path: &Path) -> io::Result<Recovery> {
     let mut file = File::open(path)?;
     let (count, start) = index(&mut file)?;
@@ -774,10 +801,12 @@ fn read_recovery(path: &Path) -> io::Result<Recovery> {
     }
 }
 
+#[cfg(test)]
 fn read_page(path: &Path, page: u64) -> io::Result<Vec<SessionThread>> {
     read_page_file(&mut File::open(path)?, page)
 }
 
+#[cfg(test)]
 fn read_page_file(file: &mut File, page: u64) -> io::Result<Vec<SessionThread>> {
     let (count, start) = index(file)?;
     if page >= count {
@@ -797,6 +826,7 @@ fn read_page_file(file: &mut File, page: u64) -> io::Result<Vec<SessionThread>> 
     ))?)
 }
 
+#[cfg(test)]
 fn install_page(threads: &mut Vec<Thread>, list: Vec<SessionThread>, key: &str, label: String) {
     threads.retain(|t| !t.id.starts_with("visit:"));
     for thread in threads.iter_mut() {

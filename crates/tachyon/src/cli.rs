@@ -18,6 +18,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Submit to or attach to the foreground conversation. Requires a running daemon.
+    Chat(ChatArgs),
     /// Explicit native local campaign control (NOT a sandbox).
     Campaign {
         #[command(subcommand)]
@@ -27,7 +29,8 @@ pub enum Command {
     ///
     /// The task is given to a harness which works autonomously using
     /// bash, python, and a browser. The agent runs in the background;
-    /// use `tachyon logs <id>` or the TUI to follow its progress.
+    /// this command reports admission, not completion. Use `tachyon chat` or the
+    /// TUI to follow the foreground conversation.
     #[command(alias = "new", alias = "create")]
     Start(StartArgs),
 
@@ -246,6 +249,27 @@ pub struct StartArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct ChatArgs {
+    /// Text to submit; omit to attach without submitting.
+    pub text: Option<String>,
+    /// Working directory for a new command.
+    #[arg(short, long, requires = "text")]
+    pub cwd: Option<String>,
+    /// Stream manager frames after admission (attach always streams).
+    #[arg(short, long)]
+    pub follow: bool,
+    /// Emit newline-delimited JSON frames and receipts instead of canonical text.
+    #[arg(long)]
+    pub json: bool,
+    /// Recover an identical command's receipt; requires its original session ID.
+    #[arg(long, requires_all = ["session_id", "text"])]
+    pub command_id: Option<String>,
+    /// Original host session, only for explicit receipt reconciliation.
+    #[arg(long, requires = "command_id")]
+    pub session_id: Option<String>,
+}
+
+#[derive(Args, Debug)]
 pub struct ListArgs {
     /// Show more detail for each agent.
     #[arg(short, long)]
@@ -407,6 +431,39 @@ pub struct GetArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_attach_and_reconciliation_flags_are_explicit() {
+        for args in [
+            vec!["tachyon", "chat"],
+            vec!["tachyon", "chat", "hello", "--follow", "--json"],
+            vec![
+                "tachyon",
+                "chat",
+                "hello",
+                "--session-id",
+                "host",
+                "--command-id",
+                "same",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["tachyon", "chat", "--cwd", "/tmp"],
+            vec!["tachyon", "chat", "hello", "--command-id", "same"],
+            vec![
+                "tachyon",
+                "chat",
+                "--session-id",
+                "host",
+                "--command-id",
+                "same",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 
     #[test]
     fn integration_cli_requires_confirmation_state_and_has_no_root_override() {

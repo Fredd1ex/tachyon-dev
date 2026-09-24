@@ -68,7 +68,7 @@ pub(super) fn main_conversation_layout(
     activity: &str,
 ) -> CellLayout {
     let prompt = &thread.items[cell.prompt];
-    if prompt.kind == ItemKind::Reply {
+    if matches!(prompt.kind, ItemKind::Reply | ItemKind::PendingReply) {
         return standalone_reply_layout(thread, cell, width, latest_timestamp);
     }
     let mut lines = Vec::new();
@@ -204,9 +204,7 @@ pub(super) fn main_conversation_layout(
             Color::Gray
         };
         let body = if response.kind != ItemKind::Reply {
-            let pending = if cell.prompt < thread.history_len {
-                "unfinished at this visit's last checkpoint".to_owned()
-            } else if response.kind == ItemKind::User {
+            let pending = if response.kind == ItemKind::User {
                 pending_reply_activity("", true)
             } else if response.text.trim().is_empty() && active {
                 pending_reply_activity(activity, response.turn.is_some())

@@ -14,6 +14,7 @@ use crate::app::{elapsed, icon, session_archive, ClickTarget};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+#[cfg(test)]
 pub(in crate::app) fn turn_cell_layout(
     thread_index: usize,
     turn_index: usize,
@@ -50,7 +51,7 @@ pub(in crate::app) fn inline_cell_layout(
     latest_timestamp: u64,
     active: bool,
     activity: &str,
-    open: bool,
+    _open: bool,
     open_worker: Option<&str>,
 ) -> CellLayout {
     compose_cell(
@@ -62,7 +63,7 @@ pub(in crate::app) fn inline_cell_layout(
         latest_timestamp,
         active,
         activity,
-        open,
+        false,
         open_worker,
         true,
     )
@@ -82,7 +83,7 @@ fn compose_cell(
     inline: bool,
 ) -> CellLayout {
     let thread = &threads[thread_index];
-    let content_width = width.saturating_sub(if open && !inline { 2 } else { 0 });
+    let content_width = width;
     let mut layout = main_conversation_layout(
         thread,
         cell,
@@ -105,253 +106,65 @@ fn compose_cell(
             None
         };
     }
-    if let Some(at) = layout
-        .activity_row
-        .filter(|_| cell.prompt >= thread.history_len)
-    {
-        if let Some((turn, text)) = &thread.checklist {
-            if thread.items[cell.prompt].turn.as_ref() == Some(turn) && !text.is_empty() {
-                let indent = if content_width >= 8 { "    " } else { "" };
-                let lines: Vec<_> = text
-                    .lines()
-                    .map(|row| {
-                        Line::styled(
-                            format!(
-                                "{indent}{}",
-                                crate::app::panels::activity::compact(
-                                    row,
-                                    content_width as usize - indent.len(),
-                                )
-                            ),
-                            Style::default().fg(Color::Gray),
-                        )
-                    })
-                    .collect();
-                // The main timer precedes this slot; task timers are composed below.
-                layout.activity_row = Some(at + lines.len());
-                layout.hits.splice(at..at, vec![None; lines.len()]);
-                layout.lines.splice(at..at, lines);
-            }
-        }
-    }
-    if let Some(at) = layout.activity_row.filter(|_| inline && !open) {
-        use crate::app::panels::activity::{compact, compact_row, task_title, tasks};
-        let turn = thread.items[cell.prompt].turn.as_deref();
-        let rows = tasks(threads, thread_index, turn);
-        let terminal = turn.is_some_and(|t| thread.completed_turns.contains(t))
-            || cell.prompt < thread.history_len
-            || turn
-                .and_then(|t| thread.metrics.get(t))
-                .is_some_and(|m| m.ended_at_ms.is_some());
-        let mut lines = Vec::new();
-        let mut hits = Vec::new();
-        let indent = if content_width >= 8 { "    " } else { "" };
-        let budget = content_width as usize - indent.len();
-        if terminal && !rows.is_empty() {
-            let complete = rows
-                .iter()
-                .filter(|r| r.label.ends_with(" - complete"))
-                .count();
-            let text = format!(
-                "{} {}, {complete} complete · Ctrl+O details",
-                rows.len(),
-                if rows.len() == 1 { "task" } else { "tasks" }
-            );
-            lines.push(Line::styled(
-                format!("{indent}{}", compact(&text, budget)),
-                Style::default().fg(Color::DarkGray),
-            ));
-            hits.push(Some(ClickTarget::TraceSummary(turn_index)));
-        } else {
-            for row in rows.iter().take(3) {
-                lines.push(Line::styled(
-                    format!("{indent}{}", compact_row(threads, row, budget)),
-                    Style::default().fg(Color::DarkGray),
-                ));
-                // Selecting the row opens details; actions do not consume rows.
-                let item = &threads[row.id.0].items[row.id.1];
-                let source = &threads[row.id.0];
-                let worker = if row.id.0 != thread_index {
-                    Some(
-                        source
-                            .id
-                            .strip_prefix("visit:")
-                            .and_then(|id| id.split_once(':').map(|(_, id)| id))
-                            .unwrap_or(&source.id),
-                    )
-                } else {
-                    item.work
-                        .as_ref()
-                        .map(|w| w.key.work_id.as_str())
-                        .or_else(|| worker_record(&item.text).map(|(id, _)| id))
-                };
-                if item.kind == ItemKind::Spawn && row.label.ends_with(" - started") {
-                    let title = task_title(threads, row);
-                    elapsed::task_badge(&mut layout, at + lines.len() - 1, item.timestamp, title);
-                }
-                hits.push(Some(
-                    worker
-                        .map(|id| ClickTarget::Worker(turn_index, id.to_owned()))
-                        .unwrap_or(ClickTarget::TraceSummary(turn_index)),
-                ));
-            }
-            if rows.len() > 3 {
-                lines.push(Line::raw(format!(
-                    "{indent}{}",
-                    compact(
-                        &format!("+{} more · Ctrl+O details", rows.len() - 3),
-                        budget
-                    )
-                )));
-                hits.push(Some(ClickTarget::TraceSummary(turn_index)));
-            }
-        }
-        layout.hits.splice(at..at, hits);
-        layout.lines.splice(at..at, lines);
-    }
-    if let Some(at) = layout.activity_row.filter(|_| inline && open) {
-        let rows = crate::app::panels::activity::project(
+    let turn = thread.items[cell.prompt].turn.as_deref();
+    let activity_start = layout.activity_row;
+    let before = layout.lines.len();
+    if inline && !open {
+        super::active_work::insert(
+            &mut layout,
             threads,
             thread_index,
-            thread.items[cell.prompt].turn.as_deref(),
+            turn,
+            turn_index,
+            content_width,
         );
-        let mut lines = Vec::new();
-        let mut activity_hits = Vec::new();
-        let omitted = rows.len().saturating_sub(8);
-        let indent = if content_width >= 8 { "    " } else { "" };
-        let row_width = content_width.saturating_sub(indent.len() as u16);
-        for row in rows.into_iter().take(8) {
-            for text in crate::app::panels::activity::wrap(&row.label, row_width) {
-                lines.push(Line::styled(
-                    format!("{indent}{text}"),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            let item = &threads[row.id.0].items[row.id.1];
-            if item.kind == ItemKind::Spawn {
-                let turn = item.turn.as_deref().unwrap_or("");
-                let id = worker_record(&item.text).map(|(id, _)| id).unwrap_or("");
-                let unambiguous = cell
-                    .items
-                    .iter()
-                    .filter(|i| {
-                        let other = &thread.items[**i];
-                        other.kind == ItemKind::Spawn
-                            && worker_record(&other.text)
-                                .is_some_and(|(other_id, _)| other_id == id)
-                    })
-                    .count()
-                    == 1;
-                let terminal = thread.completed_turns.contains(turn)
-                    || cell.prompt < thread.history_len
-                    || cell
-                        .items
-                        .iter()
-                        .any(|i| thread.items[*i].kind == ItemKind::Reply);
-                let metrics = thread.metrics.get(turn);
-                let end = metrics
-                    .and_then(|m| m.worker_ended_at_ms.get(id).copied().or(m.ended_at_ms))
-                    .or_else(|| {
-                        terminal.then(|| {
-                            cell.items
-                                .iter()
-                                .map(|i| thread.items[*i].timestamp)
-                                .max()
-                                .unwrap_or(item.timestamp)
-                        })
-                    });
-                let summary = if end.is_none() {
-                    thread.activity.summary(turn, Some(id))
-                } else {
-                    String::new()
-                };
-                if unambiguous {
-                    elapsed::inline_badge(
-                        &mut layout,
-                        at + lines.len(),
-                        item.timestamp,
-                        end,
-                        summary,
-                        String::new(),
-                        "elapsed",
-                    );
-                    lines.push(Line::raw(""));
-                }
-                let action = format!("{indent}{} view subagent", icon::AGENT);
-                let row = lines.len();
-                lines.push(Line::raw(action));
-                activity_hits.push((row, ClickTarget::Worker(turn_index, id.to_owned())));
-            }
-            if let Some(work) = item.work.as_ref().filter(|w| w.tool.is_none()) {
-                let count = threads
-                    .iter()
-                    .flat_map(|t| &t.items)
-                    .filter(|i| {
-                        i.turn == item.turn
-                            && i.work
-                                .as_ref()
-                                .is_some_and(|w| w.key == work.key && w.tool.is_some())
-                    })
-                    .count();
-                let metadata = if count > 0 {
-                    format!("{count} recorded tool calls")
-                } else {
-                    String::new()
-                };
-                if let Some(ms) = work.timing.as_ref().and_then(|t| t.execution_ms) {
-                    elapsed::inline_badge(
-                        &mut layout,
-                        at + lines.len(),
-                        0,
-                        Some(ms),
-                        String::new(),
-                        metadata,
-                        "execution",
-                    );
-                    lines.push(Line::raw(""));
-                } else if !metadata.is_empty() {
-                    for text in crate::app::panels::activity::wrap(&metadata, row_width) {
-                        lines.push(Line::raw(format!("{indent}{text}")));
-                    }
-                }
-                let row = lines.len();
-                lines.push(Line::raw(format!("{indent}{} view subagent", icon::AGENT)));
-                activity_hits.push((
-                    row,
-                    ClickTarget::Worker(turn_index, work.key.work_id.clone()),
-                ));
-            }
-            if open && item.kind != ItemKind::Spawn {
-                let detail = crate::app::panels::activity::details(threads, &row, false);
-                for text in crate::app::panels::activity::wrap(
-                    &detail.replace(
-                        "[r] show bounded, redacted raw output",
-                        "Ctrl+D: inspect raw diagnostics",
-                    ),
-                    row_width,
-                ) {
-                    lines.push(Line::styled(
-                        format!("{indent}{text}"),
-                        Style::default().fg(Color::Gray),
-                    ));
-                }
-            }
-        }
-        if omitted > 0 {
-            for text in crate::app::panels::activity::wrap(
-                &format!("{omitted} more records: Ctrl+O, Ctrl+D to inspect"),
-                row_width,
-            ) {
-                lines.push(Line::raw(format!("{indent}{text}")));
-            }
-        }
-        layout.hits.splice(at..at, vec![None; lines.len()]);
-        for (row, hit) in activity_hits {
-            layout.hits[at + row] = Some(hit);
-        }
-        layout.lines.splice(at..at, lines);
     }
-    if !thread.hide_history && thread.history_len > 0 {
+    let has_cards = layout.lines.len() > before;
+    if cell.prompt >= thread.history_len {
+        if let Some(text) = turn.and_then(|turn| {
+            thread
+                .checklist
+                .as_ref()
+                .filter(|(t, _)| t == turn)
+                .map(|(_, text)| text)
+                .or_else(|| thread.recorded_checklists.get(turn))
+        }) {
+            super::progress::insert(&mut layout, text, content_width);
+        }
+    }
+    layout.activity_row = activity_start.map(|at| at + usize::from(has_cards));
+    let host_session = |item: &crate::app::Item| {
+        item.turn
+            .as_deref()
+            .and_then(|t| t.strip_prefix("conversation:foreground:"))
+            .and_then(|t| t.rsplit_once(':'))
+            .map(|(host, _)| host.to_owned())
+    };
+    if let Some(host) = host_session(&thread.items[cell.prompt]) {
+        let previous = thread.items[..cell.prompt]
+            .iter()
+            .rev()
+            .find(|i| {
+                matches!(
+                    i.kind,
+                    ItemKind::User | ItemKind::Reply | ItemKind::PendingReply
+                )
+            })
+            .and_then(host_session);
+        if previous.as_ref() != Some(&host) {
+            let label = format!("Session {host}");
+            layout.lines.splice(
+                0..0,
+                [
+                    Line::raw(""),
+                    session_archive::separator(&label, content_width),
+                    Line::raw(""),
+                ],
+            );
+            layout.hits.splice(0..0, [None, None, None]);
+            elapsed::shift_rows(&mut layout, 3);
+        }
+    } else if !thread.hide_history && thread.history_len > 0 {
         let start = if cell.prompt < thread.history_len {
             0
         } else {
@@ -705,13 +518,5 @@ fn compose_cell(
     }
     layout.lines.push(Line::raw(""));
     layout.hits.push(None);
-    add_selected_rail(&mut layout);
     layout
-}
-
-pub(in crate::app) fn add_selected_rail(layout: &mut CellLayout) {
-    for line in &mut layout.lines {
-        line.spans
-            .insert(0, Span::styled("│ ", Style::default().fg(Color::DarkGray)));
-    }
 }

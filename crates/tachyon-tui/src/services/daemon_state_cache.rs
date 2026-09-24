@@ -390,6 +390,29 @@ impl Default for Worker {
 }
 
 impl Worker {
+    #[cfg(test)]
+    pub(crate) fn test_socket(
+        query: Query,
+        socket: UnixStream,
+        out: Sender<super::TuiEvent>,
+    ) -> (Self, std::thread::JoinHandle<()>) {
+        let mut worker = Self::default();
+        worker.started = true;
+        worker.state.0.lock().unwrap().query = Some(query);
+        let shared = worker.state.clone();
+        let connection = Mutex::new(Some(socket));
+        let join = std::thread::spawn(move || {
+            run(shared, out, || {
+                connection
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| io::Error::other("fixture disconnected"))
+            })
+        });
+        (worker, join)
+    }
+
     pub fn select(&mut self, query: Option<Query>, out: &Sender<super::TuiEvent>) {
         let (lock, wake) = &*self.state;
         let mut state = lock.lock().unwrap();

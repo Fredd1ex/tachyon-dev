@@ -5,15 +5,15 @@
 //! A floating pane (like telescope.nvim) lists running agents.
 //!
 //! Keys:
-//!   Enter        submit input / toggle collapse on focused thread
+//!   Enter        submit input / open focused task window (empty draft)
 //!   Tab          toggle floating agent pane
 //!   Up / Down    scroll transcript (empty input)
 //!   PageUp/Down  scroll the active surface
 //!   Alt+Up/Down  explicitly select turns across visit history
-//!   Ctrl+L       hide/show previous visits without deleting history
+//!   Alt+Left/Right focus a task in the selected turn
+//!   Ctrl+L       hide/show loaded older daemon history
 //!   End          return to the latest turn
-//!   Ctrl+O       toggle inline details for the current turn
-//!   Ctrl+D       toggle secondary diagnostics while details are open
+//!   Ctrl+D       toggle diagnostic metrics while details are open
 //!   y             copy the selected or latest chat cell (empty input)
 //!   Drag          native terminal text selection (default)
 //!   Ctrl+Shift+C  terminal Copy (cell copy only in /mouse capture mode)
@@ -266,6 +266,7 @@ fn name_block_background(color: Color) -> Color {
 
 /// Events from background subscription threads.
 enum TuiEvent {
+    Manager(tachyon_api::interaction_manager::Frame),
     Status(services::Snapshot),
     Attention(attention::ResultEvent),
     Operational,
@@ -335,15 +336,15 @@ struct App {
     #[cfg(test)]
     probe: Option<std::os::unix::net::UnixStream>,
     attention: attention::State,
-    visits: session_archive::Visits,
+    visits: services::history::Cursor,
     threads: Vec<Thread>,
-    history: services::history::History,
     pages: services::history::Navigator,
     controls: services::control::Worker,
     sub_out: mpsc::Sender<TuiEvent>,
     sub_rx: mpsc::Receiver<TuiEvent>,
     status_requests: mpsc::SyncSender<()>,
     subscriptions: services::subscriptions::Subscriptions,
+    interaction: services::interaction::State,
     prefer_notifications: bool,
     seen_events: HashSet<(String, u64)>,
     seen_interactions: HashSet<(String, String, u64)>,
@@ -359,6 +360,7 @@ struct App {
     transcript_scroll: TranscriptScroll,
     transcript_cache: TurnLayoutCache,
     transcript_view: TranscriptView,
+    // Selected projected turn; opening details is independent (TurnProjection::details).
     open_trace: Option<usize>,
     open_worker: Option<(usize, String)>,
     inspector: panels::Inspector,
@@ -369,6 +371,7 @@ struct App {
     operational_worker: daemon_state_cache::Worker,
     operational_query: Option<daemon_state_cache::Query>,
     operational_view: daemon_state_cache::View,
+    progress: checklist::Progress,
     operational_scroll: u16,
     live_conversation: daemon_state_cache::CurrentConversation,
     commands_open: bool,
@@ -377,7 +380,6 @@ struct App {
     info_scroll: u16,
     focus: usize,
     last_poll: Instant,
-    last_save: Instant,
     clipboard: mpsc::SyncSender<String>,
     clipboard_notice: Option<(String, Instant)>,
     mouse_capture: MouseCapture,
@@ -388,10 +390,8 @@ struct App {
 
 pub fn run() -> io::Result<()> {
     let attention = attention::State::open(&tachyon_util::daemon::data_dir())?;
-    let mut visits = session_archive::Visits::open(&tachyon_util::daemon::data_dir())?;
+    let visits = services::history::Cursor::default();
     let mut threads = vec![Thread::new_foreground()];
-    visits.latest(&mut threads)?;
-    let history = services::history::History::start()?;
     let pages = services::history::Navigator::start()?;
     let controls = services::control::Worker::start()?;
     // Ensure the foreground thread exists.
@@ -443,7 +443,6 @@ pub fn run() -> io::Result<()> {
     let focus = foreground_focus(&threads);
 
     let last_poll = Instant::now() - Duration::from_secs(1);
-    let last_save = Instant::now();
     let clipboard = clipboard_worker(copy_to_clipboard, sub_out.clone())?;
     let clipboard_notice: Option<(String, Instant)> = None;
     let mouse_capture = MouseCapture::default();
@@ -465,13 +464,13 @@ pub fn run() -> io::Result<()> {
         attention,
         visits,
         threads,
-        history,
         pages,
         controls,
         sub_out,
         sub_rx,
         status_requests,
         subscriptions,
+        interaction: services::interaction::State::default(),
         prefer_notifications,
         seen_events,
         seen_interactions,
@@ -497,6 +496,7 @@ pub fn run() -> io::Result<()> {
         operational_worker,
         operational_query,
         operational_view,
+        progress: Default::default(),
         operational_scroll,
         live_conversation,
         commands_open,
@@ -505,7 +505,6 @@ pub fn run() -> io::Result<()> {
         info_scroll,
         focus,
         last_poll,
-        last_save,
         clipboard,
         clipboard_notice,
         mouse_capture,

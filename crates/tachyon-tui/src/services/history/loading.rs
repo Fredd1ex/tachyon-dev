@@ -1,8 +1,8 @@
 //! Read-side navigation is independent of the durable checkpoint worker.
+use super::{Cursor as Visits, LoadedPage, PageRequest};
 use crate::app::{
-    input, reset_transcript, select_trace_turn,
-    session_archive::{LoadedPage, PageRequest, Visits},
-    toggle_history, Thread, TranscriptScroll, TranscriptView, TurnLayoutCache, TurnProjection,
+    input, reset_transcript, select_trace_turn, toggle_history, Thread, TranscriptScroll,
+    TranscriptView, TurnLayoutCache, TurnProjection,
 };
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use std::{
@@ -174,6 +174,18 @@ impl Navigator {
         self.loading
     }
 
+    pub(in crate::app) fn older(&mut self, cursor: &Visits) {
+        if !self.loading {
+            self.request(
+                cursor.request(false, true),
+                Selection::Step {
+                    older: true,
+                    entering: false,
+                },
+            );
+        }
+    }
+
     pub(in crate::app) fn toggle(&mut self, visits: &Visits, threads: &mut [Thread]) {
         self.cancel();
         toggle_history(threads);
@@ -202,11 +214,10 @@ impl Navigator {
             .count();
         let older = direction < 0;
         let boundary = !thread.hide_history
-            && history > 0
             && if older {
                 *selected == Some(0)
             } else {
-                *selected == Some(history - 1)
+                history > 0 && *selected == Some(history - 1)
             };
         let entering = !thread.hide_history
             && history > 0

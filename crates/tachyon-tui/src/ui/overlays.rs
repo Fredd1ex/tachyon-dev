@@ -64,7 +64,7 @@ pub(in crate::app) fn draw_command_palette(
     mouse_capture: MouseCapture,
     scroll: &mut u16,
 ) {
-    let popup = popup_rect(area, 76, 40);
+    let popup = popup_rect(area, 76, 42);
     let commands = vec![
         Line::from(mouse_capture.label()),
         help_section("KEYBINDS"),
@@ -72,15 +72,12 @@ pub(in crate::app) fn draw_command_palette(
         help_key("? / Ctrl+P", "toggle help"),
         help_key("Tab", "agents pane"),
         help_key("Ctrl+I", "toggle info (if distinct from Tab)"),
-        help_key("Ctrl+O", "toggle inline details for selected/current turn"),
-        help_key(
-            "Ctrl+D",
-            "toggle secondary diagnostics while details are open",
-        ),
+        help_key("Alt+Left/Right", "focus task in selected turn"),
+        help_key("Ctrl+D", "toggle diagnostic metrics in details"),
         help_key("Diagnostics: Up/Down", "select individual activity row"),
         help_key(
             "Enter / Space / click",
-            "expand/collapse selected activity row",
+            "open task window; inside window toggle evidence",
         ),
         help_key(
             "Diagnostics: r / d",
@@ -120,6 +117,7 @@ pub(in crate::app) fn draw_command_palette(
         help_key("/clear", "hide/show previous visits"),
         help_key("/mouse", "toggle native selection / clickable capture"),
         help_key("/managed TEXT", "use managed worker workspaces"),
+        help_key("/reconcile", "retrieve original pending command receipts"),
         help_key(
             "/attention, /ack ID",
             "list attention / explicitly acknowledge",

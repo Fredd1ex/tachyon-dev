@@ -2,6 +2,7 @@
 
 mod allocation_policy;
 mod history_store;
+mod interaction;
 mod messaging;
 mod monitor;
 #[cfg(test)]
@@ -35,8 +36,8 @@ use tachyon_util::guard;
 use crate::history_store::HistoryStore;
 use crate::messaging::{
     acknowledge_reminder_notification, emit_schedule_event, encode_interaction_command,
-    encode_reminder_notification, encode_scheduled_task_notification, persist_interaction_history,
-    project_pending_history, stream_agent, stream_work,
+    encode_reminder_notification, encode_scheduled_task_notification, project_pending_history,
+    stream_agent, stream_work,
 };
 use crate::runtime_store::{RuntimeStore, RuntimeTaskRecord};
 use tachyon_memory::{MemoryMutationSource, MemoryStore};
@@ -98,6 +99,8 @@ enum CoordinatorRequest {
 mod orchestrators;
 
 struct Registry {
+    interaction_bound: Arc<OnceLock<()>>,
+    interaction: Arc<Mutex<tachyon_interaction_manager::Manager>>,
     web: Option<Arc<web::WebService>>,
     service_shutdown: Arc<AtomicBool>,
     monitor: Option<Arc<monitor::Monitor>>,
@@ -118,6 +121,8 @@ struct Registry {
 impl Default for Registry {
     fn default() -> Self {
         Self {
+            interaction_bound: Default::default(),
+            interaction: Arc::new(Mutex::new(Default::default())),
             web: None,
             service_shutdown: Arc::new(AtomicBool::new(false)),
             monitor: None,
@@ -400,7 +405,11 @@ fn reap_warm_workers(registry: &Arc<Mutex<Registry>>) {
 }
 
 fn persist_task(registry: &Arc<Mutex<Registry>>, info: &AgentInfo, note: &str) {
+    interaction::work(registry, &info.id);
     if info.id == FOREGROUND_ID {
+        if info.state.is_terminal() {
+            interaction::host_stopped(registry);
+        }
         return;
     }
     let (runtime_store, runtime_task) = {
@@ -527,16 +536,7 @@ fn run_reminder_scheduler(registry: Arc<Mutex<Registry>>, shutdown: Arc<AtomicBo
         }
     }
     while !shutdown.load(Ordering::SeqCst) {
-        let (store, user_connected) = {
-            let registry = registry.lock().unwrap();
-            (
-                registry.runtime_store.clone(),
-                registry
-                    .tasks
-                    .get(FOREGROUND_ID)
-                    .is_some_and(|foreground| !foreground.subs.is_empty()),
-            )
-        };
+        let store = registry.lock().unwrap().runtime_store.clone();
         if let Some(store) = store {
             // Delivery no longer depends on a connected UI.
             messaging::deliver_attention(&registry, &store);
@@ -552,7 +552,7 @@ fn run_reminder_scheduler(registry: Arc<Mutex<Registry>>, shutdown: Arc<AtomicBo
                 }
                 Err(error) => eprintln!("tachyond: poll scheduled tasks: {error}"),
             }
-            if user_connected {
+            {
                 match store.claim_scheduled_task_notifications(unix_now_ms(), 8) {
                     Ok(notifications) => {
                         for (task, result) in notifications {
@@ -1305,16 +1305,33 @@ fn start_ready_tasks(registry: &Arc<Mutex<Registry>>) {
 
 /// Fan a line out to every subscriber of an agent. Drops dead subscribers.
 fn correlate_event(data: &str, info: &AgentInfo) -> String {
+    use tachyon_api::interaction_manager::canonical_turn_id;
     let Ok(mut envelope) = serde_json::from_str::<EventEnvelope>(data) else {
+        if info.id == FOREGROUND_ID {
+            if let Ok(mut event) =
+                serde_json::from_str::<tachyon_api::InteractionEventEnvelope>(data)
+            {
+                event.metadata.turn_id = event
+                    .metadata
+                    .turn_id
+                    .map(|turn| canonical_turn_id(&info.session_id, &turn));
+                return serde_json::to_string(&event).unwrap_or_else(|_| data.into());
+            }
+        }
         return data.to_string();
     };
+    if info.id == FOREGROUND_ID && envelope.actor == tachyon_api::Actor::Foreground {
+        envelope.session_id = info.session_id.clone();
+        envelope.conversation_id = Some(FOREGROUND_ID.into());
+        envelope.turn_id = envelope
+            .turn_id
+            .map(|turn| canonical_turn_id(&info.session_id, &turn));
+        return serde_json::to_string(&envelope).unwrap_or_else(|_| data.into());
+    }
     if matches!(
         envelope.kind,
         StructuredAgentEvent::ToolStarted { .. } | StructuredAgentEvent::ToolFinished { .. }
     ) {
-        if info.id == FOREGROUND_ID && envelope.actor == tachyon_api::Actor::Foreground {
-            return data.to_string();
-        }
         let valid = envelope.session_id == info.id
             && matches!(&envelope.actor, tachyon_api::Actor::Worker { id } if id == &info.id)
             && envelope
@@ -1338,15 +1355,13 @@ fn correlate_event(data: &str, info: &AgentInfo) -> String {
             envelope.parent_task_id = info.parent_task_id.clone();
             envelope.tool_call_id = info.tool_call_id.clone();
             envelope.turn_id = info.origin_turn_id.clone().filter(|id| !id.is_empty());
-            if let Some((conversation, turn)) = info
+            if let Some(turn) = info
                 .origin_turn_id
                 .as_deref()
-                .and_then(|turn| turn.strip_prefix("conversation:"))
-                .and_then(|turn| turn.rsplit_once(':'))
-                .filter(|(conversation, turn)| !conversation.is_empty() && !turn.is_empty())
+                .filter(|turn| turn.contains(':'))
             {
-                envelope.conversation_id = Some(conversation.to_owned());
-                envelope.turn_id = Some(turn.to_owned());
+                envelope.conversation_id = Some(FOREGROUND_ID.into());
+                envelope.turn_id = Some(canonical_turn_id("", turn));
             }
         }
         return serde_json::to_string(&envelope).unwrap_or_else(|_| data.to_string());
@@ -1368,14 +1383,13 @@ fn correlate_event(data: &str, info: &AgentInfo) -> String {
         envelope.turn_id = info.origin_turn_id.clone().or(envelope.turn_id);
         // The delegation host owns this identity; a worker's local turn/session
         // must not be used as the conversation scope (including on worker reuse).
-        if let Some((conversation, turn)) = info
+        if let Some(turn) = info
             .origin_turn_id
             .as_deref()
-            .and_then(|turn| turn.strip_prefix("conversation:"))
-            .and_then(|turn| turn.rsplit_once(':'))
+            .filter(|turn| turn.contains(':'))
         {
-            envelope.conversation_id = Some(conversation.to_owned());
-            envelope.turn_id = Some(turn.to_owned());
+            envelope.conversation_id = Some(FOREGROUND_ID.into());
+            envelope.turn_id = Some(canonical_turn_id("", turn));
         }
         envelope.tool_call_id = info.tool_call_id.clone().or(envelope.tool_call_id);
     }
@@ -1917,6 +1931,7 @@ fn push_event_inner(
                 if let Ok(envelope) = serde_json::from_str::<EventEnvelope>(&correlated) {
                     log_event(id, &stream, &correlated);
                     handle_work_candidate(registry, id, envelope);
+                    interaction::work(registry, id);
                 }
                 return;
             }
@@ -2200,8 +2215,19 @@ fn push_event_inner(
         );
     }
     handle_context_compaction(registry, id, &correlated_data);
-    persist_interaction_history(registry, &correlated_data);
-    acknowledge_reminder_notification(registry, &correlated_data);
+    if stream == EventStream::Stdout {
+        let terminal_work =
+            decode_structured_event(&correlated_data).and_then(|event| match event {
+                StructuredAgentEvent::WorkResult { result } => Some(result.work_id),
+                _ => None,
+            });
+        interaction::work_record(registry, id, terminal_work.as_deref());
+        interaction::telemetry(registry, id, &correlated_data);
+    }
+    if id == FOREGROUND_ID && stream == EventStream::Stdout {
+        interaction::publish(registry, &correlated_data);
+        acknowledge_reminder_notification(registry, &correlated_data);
+    }
     log_event(id, &stream, &correlated_data);
     if completed {
         start_ready_tasks(registry);
@@ -2464,6 +2490,7 @@ fn main() -> std::process::ExitCode {
         ..Registry::default()
     }));
     let (coordinator_tx, coordinator_rx) = mpsc::sync_channel(64);
+    interaction::initialize(&reg);
     reg.lock().unwrap().coordinator_tx = Some(coordinator_tx);
     let background_registry = Arc::clone(&reg);
     let background_shutdown = Arc::clone(&shutdown);
@@ -2487,7 +2514,8 @@ fn main() -> std::process::ExitCode {
     // Spawn the foreground runtime.
     {
         let foreground_started = unix_now();
-        match spawn_foreground() {
+        let foreground_session = uuid::Uuid::new_v4().to_string();
+        match spawn_foreground(&foreground_session) {
             Ok((id, child, stdin)) => {
                 // The foreground isn't a normal agent list entry; it's the
                 // conversation host. Still stored in tasks so subscriptions
@@ -2502,7 +2530,7 @@ fn main() -> std::process::ExitCode {
                     retained: false,
                     lease_until_secs: None,
                     // Logical foreground/turn IDs repeat after --new-session.
-                    session_id: uuid::Uuid::new_v4().to_string(),
+                    session_id: foreground_session,
                     lifetime_class: Default::default(),
                     purpose: "foreground".into(),
                     owner: "daemon".into(),
@@ -2757,7 +2785,10 @@ fn handle_connection(stream: UnixStream, registry: Arc<Mutex<Registry>>) -> std:
             return stream_work(&mut writer, work_id, registry);
         }
         if let ApiRequest::ForegroundSubscribe = &req {
-            return stream_agent(&mut writer, FOREGROUND_ID, registry);
+            return interaction::serve(&mut writer, &registry, None);
+        }
+        if let ApiRequest::InteractionAttach { after } = &req {
+            return interaction::serve(&mut writer, &registry, after.clone());
         }
 
         if let ApiRequest::ConversationWeb { metadata, command } = &req {
@@ -3743,6 +3774,7 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
                         },
                     );
                     drop(reg);
+                    interaction::work(registry, &id);
                     if let Err(error) = deliver_work(registry, &id, &request, info.persistent) {
                         if let Some(worker) = registry.lock().unwrap().tasks.get_mut(&id) {
                             if worker.assignment == assignment
@@ -3888,6 +3920,8 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
                 persist_task(registry, &info, "Agent waiting for dependencies.");
                 return ApiResponse::Agent { info };
             }
+
+            interaction::work(registry, &id);
 
             let spawned = std::fs::create_dir_all(&workspace).and_then(|_| {
                 if *lifetime_class == LifetimeClass::Persistent {
@@ -4162,7 +4196,41 @@ fn dispatch(req: &ApiRequest, registry: &Arc<Mutex<Registry>>) -> ApiResponse {
         AgentSubscribe { .. } | WorkSubscribe { .. } => {
             ApiResponse::error("unreachable: handled in handle_connection")
         }
-        ForegroundSubscribe => ApiResponse::error("unreachable: handled in handle_connection"),
+        InteractionSnapshot => interaction::snapshot(registry)
+            .map(|snapshot| ApiResponse::InteractionFrame {
+                frame: tachyon_api::interaction_manager::Frame::Snapshot { snapshot },
+            })
+            .unwrap_or_else(ApiResponse::error),
+        InteractionContent {
+            reference,
+            offset,
+            limit,
+        } => {
+            let history = registry.lock().unwrap().history_store.clone();
+            history
+                .ok_or_else(|| "history unavailable".to_string())
+                .and_then(|history| history.interaction_content(reference, *offset, *limit))
+                .map(|page| ApiResponse::InteractionContent { page })
+                .unwrap_or_else(ApiResponse::error)
+        }
+        InteractionProjection { revision, offset } => {
+            let manager = registry.lock().unwrap().interaction.clone();
+            let response = manager
+                .lock()
+                .unwrap()
+                .page(revision, *offset)
+                .map(|page| ApiResponse::InteractionProjection { page })
+                .unwrap_or_else(|current| ApiResponse::InteractionFrame {
+                    frame: tachyon_api::interaction_manager::Frame::ResnapshotRequired { current },
+                });
+            response
+        }
+        InteractionSubmit { command } => interaction::submit(registry, command)
+            .map(|receipt| ApiResponse::InteractionReceipt { receipt })
+            .unwrap_or_else(ApiResponse::error),
+        ForegroundSubscribe | InteractionAttach { .. } => {
+            ApiResponse::error("unreachable: handled in handle_connection")
+        }
     }
 }
 
@@ -4900,8 +4968,8 @@ fn spawn_warm_ghost(id: &str, workspace: &str, host_services: bool) -> std::io::
 
 /// Spawn the standalone Conversational Agent. Returns
 /// (id, child, stdin).
-fn spawn_foreground() -> std::io::Result<(String, Child, std::process::ChildStdin)> {
-    let mut cmd = foreground_command();
+fn spawn_foreground(session: &str) -> std::io::Result<(String, Child, std::process::ChildStdin)> {
+    let mut cmd = foreground_command(session);
 
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -4916,8 +4984,9 @@ fn spawn_foreground() -> std::io::Result<(String, Child, std::process::ChildStdi
     Ok((id, child, stdin))
 }
 
-fn foreground_command() -> Command {
+fn foreground_command(session: &str) -> Command {
     let mut cmd = Command::new(foreground_path());
+    cmd.env("TACHYON_FOREGROUND_SESSION_ID", session);
     cmd.arg("--agent-id")
         .arg(FOREGROUND_ID)
         .arg("--new-session");
@@ -4988,6 +5057,15 @@ fn pump_agent(registry: &Arc<Mutex<Registry>>, id: &str, generation: u64) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+                    if regs
+                        .lock()
+                        .unwrap()
+                        .tasks
+                        .get(&id_out)
+                        .is_none_or(|task| task.generation != generation)
+                    {
+                        return;
+                    }
                     if is_foreground {
                         if let Some(rest) = trimmed.strip_prefix("[daemon:spawn]") {
                             handle_foreground_spawn(&regs, rest.trim(), &id_out);
@@ -5940,7 +6018,10 @@ mod tests {
                 };
                 assert_eq!(actual, expected);
             }
-            assert_eq!(foreground_command().get_program(), foreground_path());
+            assert_eq!(
+                foreground_command("host-session").get_program(),
+                foreground_path()
+            );
             return;
         }
         // Isolate environment changes from parallel host tests; launch only this test.
@@ -5973,7 +6054,11 @@ mod tests {
 
     #[test]
     fn daemon_launches_foreground_with_a_fresh_checkpoint() {
-        let command = foreground_command();
+        let command = foreground_command("host-session");
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "TACHYON_FOREGROUND_SESSION_ID"
+                && value == Some(std::ffi::OsStr::new("host-session"))));
         let args = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -5982,7 +6067,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_accounting_session_does_not_change_event_or_lifecycle_identity() {
+    fn foreground_host_session_qualifies_events_without_changing_lifecycle_identity() {
         let mut foreground = task(FOREGROUND_ID, AgentState::Running);
         foreground.info.session_id = uuid::Uuid::new_v4().to_string();
         let session = foreground.info.session_id.clone();
@@ -6007,10 +6092,10 @@ mod tests {
             },
         };
         let correlated = correlate_event(&serde_json::to_string(&event).unwrap(), &foreground.info);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&correlated).unwrap(),
-            serde_json::to_value(event).unwrap()
-        );
+        let correlated: EventEnvelope = serde_json::from_str(&correlated).unwrap();
+        assert_eq!(correlated.session_id, session);
+        assert_eq!(correlated.turn_id, Some(format!("{session}:4")));
+        assert_eq!(correlated.kind, event.kind);
         let registry = Arc::new(Mutex::new(Registry {
             foreground_id: Some(FOREGROUND_ID.into()),
             ..Default::default()
@@ -7727,8 +7812,8 @@ mod tests {
             push_event(&registry, "worker", EventStream::Stdout, &wire);
             let correlated: EventEnvelope =
                 serde_json::from_str(&events.try_recv().unwrap().data).unwrap();
-            assert_eq!(correlated.conversation_id.as_deref(), Some("host"));
-            assert_eq!(correlated.turn_id.as_deref(), Some("7"));
+            assert_eq!(correlated.conversation_id.as_deref(), Some(FOREGROUND_ID));
+            assert_eq!(correlated.turn_id.as_deref(), Some("host:7"));
             assert_eq!(correlated.task_id.as_deref(), Some("work-1"));
             assert_eq!(correlated.parent_task_id.as_deref(), Some("host-parent"));
             assert_eq!(correlated.tool_call_id.as_deref(), Some("delegation-call"));
@@ -7777,7 +7862,13 @@ mod tests {
             let mut foreground_event = fabricated.clone();
             foreground_event.session_id = FOREGROUND_ID.into();
             foreground_event.actor = tachyon_api::Actor::Foreground;
-            assert_eq!(correlate(&foreground_event, &foreground), foreground_event);
+            let normalized = correlate(&foreground_event, &foreground);
+            assert_eq!(
+                normalized.turn_id.as_deref(),
+                Some("accounting-session:999")
+            );
+            assert_eq!(normalized.session_id, "accounting-session");
+            assert_eq!(normalized.kind, foreground_event.kind);
             let foreground_events = {
                 let mut reg = registry.lock().unwrap();
                 reg.tasks.insert(
@@ -7794,7 +7885,9 @@ mod tests {
             );
             let forwarded: EventEnvelope =
                 serde_json::from_str(&foreground_events.try_recv().unwrap().data).unwrap();
-            assert_eq!(forwarded, foreground_event);
+            assert_eq!(forwarded.kind, foreground_event.kind);
+            assert_eq!(forwarded.conversation_id.as_deref(), Some(FOREGROUND_ID));
+            assert_eq!(forwarded.turn_id.as_deref(), Some("foreground:999"));
             for assigned in [false, true] {
                 let standalone_events = {
                     let mut reg = registry.lock().unwrap();
@@ -7939,8 +8032,8 @@ mod tests {
                 push_event(&registry, "worker", EventStream::Stdout, &fresh_wire);
                 let correlated: EventEnvelope =
                     serde_json::from_str(&events.try_recv().unwrap().data).unwrap();
-                assert_eq!(correlated.conversation_id.as_deref(), Some("new-host"));
-                assert_eq!(correlated.turn_id.as_deref(), Some("8"));
+                assert_eq!(correlated.conversation_id.as_deref(), Some(FOREGROUND_ID));
+                assert_eq!(correlated.turn_id.as_deref(), Some("new-host:8"));
                 assert_eq!(correlated.task_id.as_deref(), Some("work-1"));
                 assert_eq!(correlated.parent_task_id.as_deref(), Some("host-parent"));
                 assert_eq!(correlated.tool_call_id.as_deref(), Some("delegation-call"));
@@ -8007,8 +8100,8 @@ mod tests {
                     // Worker execution time is not foreground response latency.
                     assert_eq!(correlated.conversation_id, None);
                 } else {
-                    assert_eq!(correlated.conversation_id.as_deref(), Some(host));
-                    assert_eq!(correlated.turn_id.as_deref(), Some("2"));
+                    assert_eq!(correlated.conversation_id.as_deref(), Some(FOREGROUND_ID));
+                    assert_eq!(correlated.turn_id, Some(format!("{host}:2")));
                     assert_eq!(correlated.task_id, worker.info.logical_task_id);
                 }
             }

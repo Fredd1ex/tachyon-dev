@@ -64,6 +64,7 @@ pub(in crate::app) fn mark_visible_ready_turns_seen(
     }
 }
 
+#[cfg(test)]
 pub(in crate::app) fn toggle_trace(open_trace: &mut Option<usize>, turn: usize) {
     *open_trace = (*open_trace != Some(turn)).then_some(turn);
 }

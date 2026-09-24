@@ -5,6 +5,7 @@ pub(super) struct LayoutKey {
     pub(super) revision: u64,
     pub(super) structure: u64,
     pub(super) trace: Option<usize>,
+    pub(super) record: Option<(usize, usize)>,
     pub(super) worker: Option<(usize, String)>,
     pub(super) busy: bool,
     pub(super) activity: String,
@@ -13,7 +14,9 @@ pub(super) struct LayoutKey {
 
 pub(in crate::app) mod projection;
 
+mod active_work;
 pub(in crate::app) mod layout;
+mod progress;
 
 pub(in crate::app) mod trace;
 

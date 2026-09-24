@@ -90,7 +90,12 @@ fn individual_expansion_is_lazy_cached_and_mouse_owned() {
     panel.key(KeyCode::Char(' '));
     paint(&mut panel, &threads, 0, 100, 30);
     assert!(panel.expanded.is_empty());
-    panel.click(panel.area.x, panel.area.y + 1);
+    let y = panel
+        .hits
+        .iter()
+        .position(|hit| *hit == Some((0, 2)))
+        .unwrap();
+    panel.click(panel.area.x, panel.area.y + y as u16);
     paint(&mut panel, &threads, 0, 100, 30);
     assert_eq!(panel.expanded.len(), 1);
     assert!(panel.expanded.contains(&(0, 2)));
@@ -142,7 +147,7 @@ fn assignments_and_overlapping_turns_keep_evidence_and_status_local() {
     panel.key(KeyCode::Enter);
     let text = paint(&mut panel, &threads, 0, 100, 30);
     assert!(text.contains("https://example.com/weather"));
-    assert!(text.find("sources:").unwrap() < text.find("Arguments:").unwrap());
+    assert!(!text.contains("Arguments:"));
     assert!(!text.contains("HIDDEN"));
     assert!(!text.contains("DO_NOT_SHOW"));
     assert!(!text.contains("RAW_ONLY"));
@@ -155,6 +160,26 @@ fn assignments_and_overlapping_turns_keep_evidence_and_status_local() {
     assert!(text.contains("Other task - failed"));
     assert!(!text.contains("forecast"));
     assert!(panel.expanded.is_empty());
+    let rows = activity::tasks(&threads, 0, Some("weather"));
+    assert_eq!(rows.len(), 1);
+    panel.open(Some(rows[0].id));
+    let text = paint(&mut panel, &threads, 0, 100, 30);
+    assert!(text.contains("New forecast"));
+    assert!(text.contains("Search - error"));
+    assert!(text.contains("sources:"));
+    for forbidden in [
+        "Old forecast",
+        "Other task",
+        "RAW_ONLY",
+        "DO_NOT_SHOW",
+        "assistant body",
+    ] {
+        assert!(!text.contains(forbidden), "{forbidden}: {text}");
+    }
+    assert_eq!(panel.rows.len(), 2);
+    panel.key(KeyCode::Enter);
+    paint(&mut panel, &threads, 0, 100, 30);
+    assert_eq!(panel.expanded.len(), 1);
 }
 
 #[test]
@@ -163,6 +188,55 @@ fn detail_wrap_is_cell_bounded_and_never_splits_wide_glyphs() {
         for row in activity::wrap("wide \u{754c} and narrow\nsecond line", width) {
             assert!(Line::raw(row).width() <= width as usize);
         }
+    }
+}
+
+#[test]
+fn explicit_details_float_without_expanding_the_answer() {
+    use crate::app::{build_turn_cells, transcript::layout::inline_cell_layout};
+    let mut fg = Thread::new_foreground();
+    fg.add_turn(ItemKind::User, "question".into(), Some("turn".into()));
+    fg.add_tool(
+        "websearch {\"query\":\"PRIVATE_ARGS\"}".into(),
+        "call".into(),
+        Some("turn".into()),
+    );
+    fg.add_tool_result(
+        "call".into(),
+        serde_json::json!({"results": "long result ".repeat(100)}).to_string(),
+        Some("turn".into()),
+    );
+    fg.finish_reply("The answer remains.".into(), Some("turn".into()));
+    let threads = vec![fg];
+    let cells = build_turn_cells(&threads[0]);
+    let rows = activity::tasks(&threads, 0, Some("turn"));
+    for width in [12, 24, 92] {
+        let layout = inline_cell_layout(0, 0, &threads, &cells[0], width, 0, false, "", true, None);
+        assert!(!layout
+            .lines
+            .iter()
+            .any(|line| line.to_string().contains("long result")));
+        let mut inspector = Inspector::default();
+        inspector.open(Some(rows[0].id));
+        let mut projection = TurnProjection::default();
+        projection.update(&threads[0]);
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal
+            .draw(|f| inspector.draw(f, f.area(), &threads, &projection, 0))
+            .unwrap();
+        assert_eq!(inspector.rows.len(), 1);
+        assert!(inspector.expanded.contains(&rows[0].id));
+        assert_eq!(layout.lines.len(), layout.hits.len());
+        let text = layout
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!text.contains("long result"));
+        assert!(!text.contains("PRIVATE_ARGS"));
+        assert!(!text.contains("Arguments:"));
+        assert!(text.contains("answer"));
     }
 }
 
@@ -240,9 +314,9 @@ fn inline_live_tool_results_are_scoped_lazy_and_not_a_modal() {
     );
     let text = render(&threads, 0, 100, true);
     assert!(text.contains("result recorded"));
-    assert!(text.contains("sources:"));
+    assert!(!text.contains("sources:"));
     assert!(!text.contains("hidden"));
-    assert!(text.find("sources:").unwrap() < text.find("Arguments:").unwrap());
+    assert!(!text.contains("Arguments:"));
     threads[0].add_turn(ItemKind::User, "joke please".into(), Some("joke".into()));
     threads[0].finish_reply("A funny answer.".into(), Some("joke".into()));
     for width in [1, 2, 24, 40, 100] {
@@ -254,7 +328,7 @@ fn inline_live_tool_results_are_scoped_lazy_and_not_a_modal() {
 }
 
 #[test]
-fn inline_task_timer_is_one_line_and_final_group_collapses() {
+fn task_cards_are_two_lines_without_fabricated_live_timing() {
     use crate::app::{
         build_turn_cells, elapsed, transcript::layout::inline_cell_layout, ClickTarget,
     };
@@ -280,11 +354,17 @@ fn inline_task_timer_is_one_line_and_final_group_collapses() {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    assert!(text(&layout, 12_000).contains("elapsed 2s"));
-    assert!(text(&layout, 15_000).contains("elapsed 5s"));
-    assert!(layout
-        .hits
-        .contains(&Some(ClickTarget::Worker(0, "researcher".into()))));
+    assert!(text(&layout, 12_000).contains("Check forecast"));
+    assert!(text(&layout, 15_000).contains("-> started"));
+    assert_eq!(
+        layout
+            .hits
+            .iter()
+            .filter(|h| **h == Some(ClickTarget::Item(0, 2)))
+            .count(),
+        2
+    );
+    assert!(layout.hits.contains(&Some(ClickTarget::Item(0, 2))));
     threads[0].finish_reply("Answer.".into(), Some("turn".into()));
     threads[0]
         .metrics
@@ -294,7 +374,7 @@ fn inline_task_timer_is_one_line_and_final_group_collapses() {
     let cells = build_turn_cells(&threads[0]);
     let layout = inline_cell_layout(0, 0, &threads, &cells[0], 100, 0, false, "", false, None);
     assert_eq!(text(&layout, 20_000), text(&layout, 200_000));
-    assert!(text(&layout, 20_000).contains("1 task, 0 complete"));
+    assert!(!text(&layout, 20_000).contains("-> started"));
     assert!(!text(&layout, 20_000).contains("view subagent"));
 }
 
@@ -395,12 +475,12 @@ fn three_city_activity_is_bounded_merged_and_final_collapsed() {
         let cells = build_turn_cells(&threads[0]);
         let layout = inline_cell_layout(0, 0, &threads, &cells[0], width, 0, true, "", false, None);
         let at = layout.activity_row.unwrap();
-        for line in &layout.lines[at..at + 3] {
+        for line in &layout.lines[at..at + 6] {
             assert!(line.width() <= width as usize, "{width}: {line}");
         }
-        assert!(layout.hits.contains(&Some(crate::app::ClickTarget::Worker(
-            0,
-            "opaque-worker-0".into()
+        assert!(layout.hits.contains(&Some(crate::app::ClickTarget::Item(
+            rows[0].id.0,
+            rows[0].id.1
         ))));
         let text = layout
             .lines
@@ -436,12 +516,30 @@ fn three_city_activity_is_bounded_merged_and_final_collapsed() {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(text.contains("3 tasks, 3 complete"));
-    assert!(!text.contains("Compare London"));
+    assert!(!text.contains("Ctrl+O details"));
+    assert!(text.contains("Compare London"));
     DETAIL_FORMATS.with(|n| assert_eq!(n.get(), 0));
     let expanded = inline_cell_layout(0, 0, &threads, &cells[0], 100, 0, false, "", true, None);
-    assert!(expanded.lines.len() > collapsed.lines.len());
-    DETAIL_FORMATS.with(|n| assert!(n.get() > 0));
+    assert_eq!(expanded.lines, collapsed.lines);
+    let expanded_text = expanded
+        .lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for city in ["London", "Paris", "Tokyo"] {
+        assert_eq!(expanded_text.matches(&format!("Compare {city}")).count(), 1);
+    }
+    for forbidden in [
+        "outcome unknown",
+        "Stale assignment",
+        "Foreign turn",
+        "RAW_ONLY",
+        "webfetch",
+    ] {
+        assert!(!expanded_text.contains(forbidden));
+    }
+    DETAIL_FORMATS.with(|n| assert_eq!(n.get(), 0));
     assert_eq!(selected_chat_cell_text(&threads, Some(0)), copy);
 }
 
@@ -455,7 +553,7 @@ fn compact_tasks_have_explicit_overflow_and_exact_turn_identity() {
         "Checking.".into(),
         Some("turn".into()),
     );
-    for id in ["a", "aa", "b", "c", "d", "e"] {
+    for id in ["a", "aa", "b", "c", "d", "e", "f", "g"] {
         fg.add_turn(
             ItemKind::Spawn,
             format!("worker {id}: Task {id}"),
@@ -480,7 +578,7 @@ fn compact_tasks_have_explicit_overflow_and_exact_turn_identity() {
     );
     let threads = vec![fg, unrelated];
     let rows = activity::tasks(&threads, 0, Some("turn"));
-    assert_eq!(rows.len(), 6);
+    assert_eq!(rows.len(), 8);
     assert_eq!(
         rows.iter()
             .filter(|r| r.label.ends_with(" - complete"))
@@ -493,8 +591,19 @@ fn compact_tasks_have_explicit_overflow_and_exact_turn_identity() {
     let cells = build_turn_cells(&threads[0]);
     let layout = inline_cell_layout(0, 0, &threads, &cells[0], 80, 0, true, "", false, None);
     let at = layout.activity_row.unwrap();
-    assert!(layout.lines[at + 3].to_string().contains("+3 more"));
-    assert!(!layout.lines[at + 4].to_string().contains("Task"));
+    assert!(layout.lines[at + 6].to_string().contains("+5 more"));
+    assert!(!layout.lines[at + 7].to_string().contains("Task"));
+    DETAIL_FORMATS.with(|n| n.set(0));
+    let expanded = inline_cell_layout(0, 0, &threads, &cells[0], 80, 0, true, "", true, None);
+    DETAIL_FORMATS.with(|n| assert_eq!(n.get(), 0));
+    assert_eq!(
+        expanded
+            .hits
+            .iter()
+            .filter(|hit| matches!(hit, Some(crate::app::ClickTarget::Item(..))))
+            .count(),
+        6
+    );
     for width in 0..80 {
         for text in [
             "界界界\nemoji 🦀 task",

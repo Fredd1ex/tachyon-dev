@@ -25,46 +25,12 @@ pub(super) struct Badge {
     label: &'static str,
     activity: String,
     metadata: Option<String>,
-    task_title: Option<String>,
 }
 
 pub(super) fn shift_rows(layout: &mut CellLayout, count: usize) {
     for timer in &mut layout.timers {
         timer.row += count;
     }
-}
-
-pub(super) fn inline_badge(
-    layout: &mut CellLayout,
-    row: usize,
-    start: u64,
-    end: Option<u64>,
-    activity: String,
-    metadata: String,
-    label: &'static str,
-) {
-    layout.timers.push(Badge {
-        row,
-        start,
-        end,
-        label,
-        activity,
-        metadata: Some(metadata),
-        task_title: None,
-    });
-}
-
-pub(super) fn task_badge(layout: &mut CellLayout, row: usize, start: u64, title: String) {
-    inline_badge(
-        layout,
-        row,
-        start,
-        None,
-        "started".into(),
-        String::new(),
-        "elapsed",
-    );
-    layout.timers.last_mut().unwrap().task_title = Some(title);
 }
 
 pub(super) fn record(thread: &mut Thread, envelope: &EventEnvelope) {
@@ -181,7 +147,6 @@ pub(super) fn main_badge(layout: &mut CellLayout, thread: &Thread, cell: &TurnCe
             .map(|turn| thread.activity.compact_summary(turn))
             .unwrap_or_default(),
         metadata: Some(turn_cell_badges(thread, cell)),
-        task_title: None,
     });
 }
 
@@ -249,7 +214,6 @@ pub(super) fn worker_badge(
         end,
         label,
         metadata: None,
-        task_title: None,
         // A reused worker can have a new fenced assignment while the trace
         // retains the previous assignment's frozen timing.
         activity: if live(thread, cell)
@@ -282,18 +246,6 @@ pub(super) fn overlay(layout: &CellLayout, row: usize, width: u16, now_ms: u64) 
         format_duration(Duration::from_secs(seconds))
     };
     let suffix = format!(" {} {duration}", timer.label);
-    if let Some(title) = &timer.task_title {
-        let indent = if width >= 8 { "    " } else { "" };
-        let text = crate::app::panels::activity::aligned_row(
-            title,
-            &format!("{}{suffix}", timer.activity),
-            width as usize - indent.len(),
-        );
-        return Line::styled(
-            format!("{indent}{text}"),
-            Style::default().fg(Color::DarkGray),
-        );
-    }
     if let Some(metadata) = &timer.metadata {
         let rail = layout.lines[row]
             .spans

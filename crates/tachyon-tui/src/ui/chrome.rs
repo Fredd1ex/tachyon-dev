@@ -112,7 +112,7 @@ pub(in crate::app) fn draw_input(
 pub(in crate::app) fn footer_mode_text(open_trace: Option<usize>, follow: bool) -> Option<String> {
     if open_trace.is_some() {
         Some(format!(
-            "DETAILS    Ctrl+O collapse · Ctrl+D diagnostics · {} Pg scroll · {} Esc close · {} help",
+            "DETAILS    click task · Ctrl+D diagnostics · {} Pg scroll · {} Esc close · {} help",
             icon::SCROLL,
             icon::CLOSE,
             icon::HELP

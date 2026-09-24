@@ -329,11 +329,13 @@ pub(super) fn synthetic_interaction_metadata(turn: Option<u64>) -> InteractionMe
 }
 
 pub(super) fn init_event_context(_role: AgentRole, agent_id: Option<&str>) {
-    let session_id = agent_id
-        .map(str::to_string)
+    let session_id = std::env::var("TACHYON_FOREGROUND_SESSION_ID")
+        .ok()
+        .filter(|id| !id.is_empty())
+        .or_else(|| agent_id.map(str::to_string))
         .unwrap_or_else(|| format!("conversation-{}", std::process::id()));
     let actor = Actor::Foreground;
-    let conversation_id = Some(session_id.clone());
+    let conversation_id = Some(FOREGROUND_ID.into());
     let _ = EVENT_CONTEXT.set(EventContext {
         session_id,
         conversation_id,
@@ -380,6 +382,48 @@ fn unix_now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_turn_echoes_typed_submit_origin_and_original_host_command() {
+        use tachyon_api::interaction_manager::CommandOrigin;
+        for (command, turn) in [("client-a", "1"), ("client-b", "2")] {
+            let mut metadata =
+                InteractionMetadata::new(format!("host-{command}"), command, FOREGROUND_ID, 1);
+            metadata.command_origin = Some(CommandOrigin {
+                session_id: "daemon-host-session".into(),
+                command_id: command.into(),
+                host_message_id: metadata.message_id.clone(),
+            });
+            let input = tachyon_api::InteractionCommandEnvelope {
+                metadata: metadata.clone(),
+                command: tachyon_api::InteractionCommand::AcceptUserTurn {
+                    text: "identical text".into(),
+                },
+            };
+            let crate::input::ChatInput::User { text, mut metadata } =
+                crate::input::decode_chat_input(
+                    &serde_json::to_string(&input).unwrap(),
+                    AgentRole::Conversation,
+                )
+            else {
+                panic!("not a user turn")
+            };
+            metadata.turn_id = Some(turn.into());
+            let event = interaction_event_envelope(
+                &metadata,
+                InteractionEvent::UserTurnAccepted { text },
+                42,
+                2,
+            );
+            assert_eq!(event.metadata.command_origin, input.metadata.command_origin);
+            assert_eq!(
+                event.metadata.causation_id.as_ref(),
+                Some(&input.metadata.message_id)
+            );
+            assert_eq!(event.metadata.correlation_id, command);
+            assert_eq!(event.metadata.turn_id.as_deref(), Some(turn));
+        }
+    }
 
     #[tokio::test]
     async fn answer_without_receipt_also_suppresses_late_contextual_status() {

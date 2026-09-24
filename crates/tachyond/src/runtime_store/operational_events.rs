@@ -8,6 +8,26 @@ pub(super) const EVENTS: TableDefinition<u64, &[u8]> =
 pub(super) const METADATA: TableDefinition<&str, &[u8]> = TableDefinition::new("feed_metadata");
 const KEY: &str = "operational_v1";
 
+pub(crate) type Subscriber = std::sync::Arc<dyn Fn(&OperationalEvent) + Send + Sync>;
+
+impl super::RuntimeStore {
+    pub(crate) fn subscribe_operational(&self, subscriber: Subscriber) {
+        self.operational_subscribers
+            .lock()
+            .unwrap()
+            .push(subscriber);
+    }
+
+    /// Only after the durable mutation commits. Never call subscribers under a
+    /// redb write transaction or the subscriber-list mutex.
+    pub(super) fn operational_committed(&self, event: OperationalEvent) {
+        let subscribers = self.operational_subscribers.lock().unwrap().clone();
+        for subscriber in subscribers {
+            subscriber(&event);
+        }
+    }
+}
+
 pub(super) fn initialize(tx: &WriteTransaction) -> Result<(), String> {
     tx.open_table(EVENTS).map_err(err)?;
     let mut table = tx.open_table(METADATA).map_err(err)?;

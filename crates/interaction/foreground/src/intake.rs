@@ -381,7 +381,7 @@ mod tests {
                             panic!("expected delegation");
                         };
                         assert_eq!(selected.as_deref(), cwd);
-                        assert_eq!(origin_turn_id, Some(format!("conversation:{}:{turn}", crate::streaming::session_id())));
+                        assert_eq!(origin_turn_id, Some(format!("{}:{turn}", crate::streaming::session_id())));
                         assert!(ids.insert(logical_task_id));
                     }
                 }

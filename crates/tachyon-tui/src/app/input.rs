@@ -5,8 +5,7 @@ use crate::app::editor::{
     backspace_at, chars, delete_at, delete_word_left, insert_at, move_word_left, move_word_right,
 };
 use crate::app::navigation::{
-    close_trace_details, ctrl_o_target, foreground_focus, mark_ready_turn_seen, reset_transcript,
-    toggle_trace, toggle_worker,
+    close_trace_details, foreground_focus, mark_ready_turn_seen, reset_transcript, toggle_worker,
 };
 use crate::app::panels::agents::pane_agent_ids;
 use crate::app::panels::orchestrators::orchestrator_offset;
@@ -125,7 +124,11 @@ impl Routing<'_> {
         if !*self.pane && !*self.info && !*self.help && self.trace.is_some() {
             if matches!(event, Event::Key(key) if key.kind != KeyEventKind::Release && key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL))
             {
-                self.inspector.secondary = !self.inspector.secondary;
+                if self.inspector.secondary {
+                    self.inspector.key(KeyCode::Char('d'));
+                } else {
+                    self.inspector.secondary = true;
+                }
                 return Dispatch::Consumed;
             }
             if active == Surface::Transcript
@@ -264,6 +267,120 @@ impl App {
         input_event: Event,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> io::Result<bool> {
+        if matches!(&input_event, Event::Key(key) if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            return Ok(false);
+        }
+        if !self.pane_open && !self.info_open && !self.commands_open && self.inspector.secondary {
+            if matches!(&input_event, Event::Key(key) if key.kind != KeyEventKind::Release && key.code == KeyCode::Esc)
+            {
+                self.inspector.secondary = false;
+                self.turn_projection.details = None;
+                self.turn_projection.record = None;
+                return Ok(false);
+            }
+        }
+        if !self.pane_open && !self.info_open && !self.commands_open && !self.inspector.secondary {
+            if let Event::Key(key) = &input_event {
+                if key.kind != KeyEventKind::Release
+                    && self.input.is_empty()
+                    && self.open_trace.is_some()
+                {
+                    let scope = foreground_thread(&self.threads).and_then(|(_, thread)| {
+                        self.open_trace
+                            .and_then(|i| self.turn_projection.cells.get(i))
+                            .and_then(|cell| thread.items[cell.prompt].turn.as_deref())
+                    });
+                    let rows = foreground_thread(&self.threads)
+                        .map(|(index, _)| panels::activity::tasks(&self.threads, index, scope))
+                        .unwrap_or_default();
+                    match key.code {
+                        KeyCode::Left | KeyCode::Right if key.modifiers == KeyModifiers::ALT => {
+                            self.turn_projection.record_focus = if key.code == KeyCode::Left {
+                                self.turn_projection.record_focus.saturating_sub(1)
+                            } else {
+                                (self.turn_projection.record_focus + 1)
+                                    .min(rows.len().saturating_sub(1))
+                            };
+                            return Ok(false);
+                        }
+                        KeyCode::Enter | KeyCode::Char(' ')
+                            if key.modifiers == KeyModifiers::NONE =>
+                        {
+                            if let Some(row) = rows.get(self.turn_projection.record_focus) {
+                                self.turn_projection.record = Some(row.id);
+                                self.turn_projection.details = scope.map(str::to_owned);
+                                self.inspector.open(Some(row.id));
+                            }
+                            return Ok(false);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Event::Mouse(mouse) = &input_event {
+                if self.mouse_capture.0
+                    && mouse.kind == MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                {
+                    let (y, height) = *VIEW.lock().unwrap();
+                    if mouse.row >= y && mouse.row < y.saturating_add(height) {
+                        let hit = HITS
+                            .lock()
+                            .unwrap()
+                            .get((mouse.row - y) as usize)
+                            .cloned()
+                            .flatten();
+                        if let Some(ClickTarget::Item(t, i)) = hit {
+                            if let Some((foreground, thread)) = foreground_thread(&self.threads) {
+                                let turn = self
+                                    .threads
+                                    .get(t)
+                                    .and_then(|source| source.items.get(i))
+                                    .and_then(|item| item.turn.clone());
+                                if let Some(index) = panels::activity::tasks(
+                                    &self.threads,
+                                    foreground,
+                                    turn.as_deref(),
+                                )
+                                .iter()
+                                .position(|row| row.id == (t, i))
+                                {
+                                    self.turn_projection.record_focus = index;
+                                    self.open_trace =
+                                        self.turn_projection.cells.iter().position(|cell| {
+                                            thread.items[cell.prompt].turn == turn
+                                        });
+                                    self.turn_projection.details = turn;
+                                    self.open_worker = None;
+                                    self.turn_projection.record = Some((t, i));
+                                    self.inspector.open(Some((t, i)));
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !self.pane_open
+            && !self.info_open
+            && !self.commands_open
+            && !self.inspector.secondary
+            && !self.threads[0].hide_history
+            && self.transcript_scroll.top == 0
+            && matches!(
+                input::navigation(
+                    &input_event,
+                    self.input.is_empty(),
+                    self.mouse_capture.0,
+                    self.transcript_view.viewport
+                ),
+                Some(input::Navigation::Up(_))
+            )
+        {
+            self.pages.older(&self.visits);
+            return Ok(false);
+        }
         self.pages.input(
             &input_event,
             input::surface(
@@ -397,20 +514,6 @@ impl App {
                         self.commands_open = false;
                     }
                 }
-                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if surface == input::Surface::Inspector {
-                        self.open_trace = None;
-                    } else if let Some(turn) =
-                        ctrl_o_target(&self.transcript_view, self.transcript_scroll.follow)
-                    {
-                        self.open_trace = Some(turn);
-                        self.pane_open = false;
-                        self.info_open = false;
-                        self.commands_open = false;
-                    }
-                    self.open_worker = None;
-                    self.inspector.reset();
-                }
                 KeyCode::Tab => {
                     self.pane_open = !self.pane_open;
                     if self.pane_open {
@@ -489,6 +592,7 @@ impl App {
                             -1,
                         );
                         if self.open_trace != previous || self.transcript_view.starts.is_empty() {
+                            self.turn_projection.details = None;
                             self.open_worker = None;
                             self.inspector = panels::Inspector::default();
                         }
@@ -516,6 +620,7 @@ impl App {
                             1,
                         );
                         if self.open_trace != previous || self.transcript_view.starts.is_empty() {
+                            self.turn_projection.details = None;
                             self.open_worker = None;
                             self.inspector = panels::Inspector::default();
                         }
@@ -668,17 +773,23 @@ impl App {
                                 *VIEW.lock().unwrap() = (0, 0);
                             }
                             _ => {
-                                let result = match self.attention.command(rest) {
-                                    Some(Ok(requests)) => self
-                                        .controls
-                                        .submit(
-                                            rest.into(),
-                                            services::control::Command::Attention(requests),
-                                        )
-                                        .map(|_| ()),
-                                    Some(Err(error)) => Err(error),
-                                    None => {
-                                        handle_slash(rest, &mut self.threads, &mut self.controls)
+                                let result = if rest == "reconcile" {
+                                    self.reconcile_commands()
+                                } else {
+                                    match self.attention.command(rest) {
+                                        Some(Ok(requests)) => self
+                                            .controls
+                                            .submit(
+                                                rest.into(),
+                                                services::control::Command::Attention(requests),
+                                            )
+                                            .map(|_| ()),
+                                        Some(Err(error)) => Err(error),
+                                        None => handle_slash(
+                                            rest,
+                                            &mut self.threads,
+                                            &mut self.controls,
+                                        ),
                                     }
                                 };
                                 if let Err(error) = result {
@@ -692,14 +803,15 @@ impl App {
                         return Ok(false);
                     }
                     // User message -> foreground thread.
-                    if let Err(error) =
-                        actions::submit_chat(&cmd, &mut self.threads, &mut self.controls)
-                    {
+                    if let Err(error) = actions::submit_chat(
+                        &cmd,
+                        &mut self.threads,
+                        &mut self.controls,
+                        &mut self.interaction,
+                    ) {
                         self.clipboard_notice = Some((error, Instant::now()));
                         return Ok(false);
                     }
-                    self.history
-                        .checkpoint(&mut self.visits, &self.threads, &self.attention);
                     self.open_trace = None;
                     self.open_worker = None;
                     self.transcript_scroll.end();
@@ -857,9 +969,24 @@ impl App {
                                         mark_ready_turn_seen(&mut self.threads, &turn_id);
                                     }
                                 }
-                                toggle_trace(&mut self.open_trace, turn);
+                                self.open_trace = Some(turn);
+                                let identity =
+                                    foreground_thread(&self.threads).and_then(|(_, thread)| {
+                                        self.turn_projection
+                                            .cells
+                                            .get(turn)
+                                            .and_then(|cell| thread.items[cell.prompt].turn.clone())
+                                    });
+                                self.turn_projection.details =
+                                    if self.turn_projection.details == identity {
+                                        None
+                                    } else {
+                                        identity
+                                    };
+                                self.turn_projection.record = None;
+                                self.turn_projection.record_focus = 0;
                                 self.open_worker = None;
-                                self.inspector.reset();
+                                self.inspector.open(None);
                                 return Ok(false);
                             }
                             if let Some(ClickTarget::Worker(turn, worker)) = hit {

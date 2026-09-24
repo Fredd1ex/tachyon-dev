@@ -59,8 +59,9 @@ pub(super) fn draw_conversation(
         width: area.width,
         revision: thread.revision,
         structure: thread.structure_revision,
-        trace: open_trace,
+        trace: None,
         worker: open_worker.cloned(),
+        record: None,
         busy: foreground_busy,
         activity: foreground_activity.to_owned(),
         workers: {
@@ -109,7 +110,7 @@ pub(super) fn draw_conversation(
         }
         for (index, cell) in cells.iter().enumerate() {
             starts.push(total_height);
-            let open = open_trace == Some(index);
+            let open = key.trace == Some(index);
             let selected_worker = open_worker
                 .filter(|(turn, _)| *turn == index)
                 .map(|(_, worker)| worker.as_str());
@@ -127,23 +128,23 @@ pub(super) fn draw_conversation(
                     worker.hash(&mut hasher);
                     revision.worker ^= hasher.finish();
                 }
+                if open {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    projection.record.hash(&mut hasher);
+                    revision.worker ^= hasher.finish();
+                }
             }
             let variant = u8::from(is_latest)
                 | (u8::from(open) << 1)
                 | (u8::from(selected_worker.is_some()) << 2);
             let height = cache
                 .layout(cell_key(cell), revision, variant, || {
-                    let compose = if selected_worker.is_some() {
-                        transcript::layout::turn_cell_layout
-                    } else {
-                        transcript::layout::inline_cell_layout
-                    };
-                    compose(
+                    let layout = transcript::layout::inline_cell_layout(
                         thread_index,
                         index,
                         threads,
                         cell,
-                        area.width,
+                        area.width.saturating_sub(2),
                         if cell.prompt < thread.history_len {
                             0
                         } else {
@@ -153,7 +154,8 @@ pub(super) fn draw_conversation(
                         foreground_activity,
                         open,
                         selected_worker,
-                    )
+                    );
+                    layout
                 })
                 .lines
                 .len();
@@ -178,9 +180,13 @@ pub(super) fn draw_conversation(
         cache.frame_key = Some(key);
     }
     // An empty current session needs a boundary only after visible history.
-    let empty_current = cells
-        .last()
-        .is_some_and(|cell| cell.prompt < thread.history_len);
+    let empty_current = cells.last().is_some_and(|cell| {
+        cell.prompt < thread.history_len
+            && !thread.items[cell.prompt]
+                .turn
+                .as_deref()
+                .is_some_and(|t| t.starts_with("conversation:foreground:"))
+    });
     let current_start = total_height;
     let current_separator = empty_current.then(|| {
         [
@@ -212,6 +218,12 @@ pub(super) fn draw_conversation(
     let mut visible_lines = Vec::new();
     let mut visible_hits = Vec::new();
     let frame_ms = elapsed::frame_ms();
+    let selected_scope = open_trace
+        .and_then(|i| cells.get(i))
+        .and_then(|cell| thread.items[cell.prompt].turn.as_deref());
+    let focused_record = crate::app::panels::activity::tasks(threads, thread_index, selected_scope)
+        .get(projection.record_focus)
+        .map(|row| row.id);
     let mut anchor_turn = None;
     let first_visible = starts
         .partition_point(|start| *start <= top)
@@ -224,9 +236,29 @@ pub(super) fn draw_conversation(
             let layout = &cache.layouts[&cell_key(cell)].layout;
             let skip = top.saturating_sub(start);
             let take = bottom.min(end).saturating_sub(start + skip);
-            visible_lines.extend(
-                (skip..skip + take).map(|row| elapsed::overlay(layout, row, area.width, frame_ms)),
-            );
+            visible_lines.extend((skip..skip + take).map(|row| {
+                let mut line =
+                    elapsed::overlay(layout, row, area.width.saturating_sub(2), frame_ms);
+                line.spans.insert(
+                    0,
+                    Span::styled(
+                        if open_trace == Some(index) {
+                            "│ "
+                        } else {
+                            "  "
+                        },
+                        Style::default().fg(Color::Cyan),
+                    ),
+                );
+                if layout.hits.get(row).is_some_and(|hit| {
+                    focused_record.is_some_and(|(t, i)| *hit == Some(ClickTarget::Item(t, i)))
+                }) {
+                    line.style = Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD);
+                }
+                line
+            }));
             visible_hits.extend(layout.hits.iter().skip(skip).take(take).cloned());
         }
         if end >= bottom {
@@ -272,4 +304,80 @@ pub(super) fn draw_conversation(
         starts,
         heights,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::ItemKind;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn selection_is_a_paint_only_rail_for_pending_final_and_empty_diagnostics() {
+        for final_reply in [false, true] {
+            for width in [1, 2, 24, 100] {
+                let mut thread = Thread::new_foreground();
+                thread.add_turn(ItemKind::User, "question".into(), Some("turn".into()));
+                if final_reply {
+                    thread.finish_reply(
+                        "An answer that wraps on a narrow screen.".into(),
+                        Some("turn".into()),
+                    );
+                } else {
+                    thread.add_turn(
+                        ItemKind::PendingReply,
+                        "Working on the answer.".into(),
+                        Some("turn".into()),
+                    );
+                }
+                let threads = vec![thread];
+                let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+                let mut scroll = TranscriptScroll::default();
+                let mut cache = TurnLayoutCache::default();
+                let mut view = TranscriptView::default();
+                let mut projection = TurnProjection::default();
+                let mut baseline = None;
+                let mut builds = 0;
+                let mut heights = Vec::new();
+                for selected in [None, Some(0), None] {
+                    terminal
+                        .draw(|f| {
+                            draw_conversation(
+                                f,
+                                f.area(),
+                                &threads,
+                                false,
+                                "",
+                                &mut scroll,
+                                &mut cache,
+                                &mut view,
+                                selected,
+                                None,
+                                &mut projection,
+                            )
+                        })
+                        .unwrap();
+                    let mut buffer = terminal.backend().buffer().clone();
+                    if selected.is_some() {
+                        assert!(buffer.content.iter().any(|cell| cell.symbol() == "│"));
+                    }
+                    for row in buffer.content.chunks_mut(width as usize) {
+                        for cell in row.iter_mut().take(2) {
+                            cell.reset();
+                        }
+                    }
+                    if let Some(expected) = &baseline {
+                        assert_eq!(&buffer, expected);
+                        assert_eq!(cache.builds, builds);
+                        assert_eq!(view.heights, heights);
+                    } else {
+                        baseline = Some(buffer);
+                        builds = cache.builds;
+                        heights = view.heights.clone();
+                    }
+                    assert!(projection.details.is_none());
+                }
+            }
+        }
+    }
 }

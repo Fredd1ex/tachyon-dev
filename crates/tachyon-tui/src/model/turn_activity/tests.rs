@@ -107,6 +107,69 @@ fn deliver(threads: &mut Vec<Thread>, envelope: &EventEnvelope) {
 }
 
 #[test]
+fn task_card_observes_live_tools_before_work_result_and_rejects_stale_fences() {
+    use crate::app::{build_turn_cells, panels::activity, transcript::layout::inline_cell_layout};
+    use ratatui::{backend::TestBackend, widgets::Paragraph, Terminal};
+    let mut threads = vec![Thread::new_foreground()];
+    let turn = "conversation:host:2";
+    accept(&mut threads[0], turn);
+    threads[0].add_turn(
+        ItemKind::Spawn,
+        "worker warm-worker: Fix selection and detail UX".into(),
+        Some(turn.into()),
+    );
+    let mut started = start("call", "Read");
+    if let AgentEvent::ToolStarted { arguments, .. } = &mut started {
+        *arguments =
+            r#"{"filePath":"crates/tachyon-tui/src/app/verification/pty.rs","token":"NEVER_SHOW"}"#
+                .into();
+    }
+    deliver(&mut threads, &assignment_event(1, 1, "first", started));
+    let rows = activity::tasks(&threads, 0, Some(turn));
+    assert_eq!(rows.len(), 1);
+    assert!(activity::latest(&threads, 0, &rows[0], 120).contains("Read crates/"));
+    let mut ended = finish("call");
+    if let AgentEvent::ToolFinished { output, .. } = &mut ended {
+        *output = r#"{"summary":"Read 80 lines","sources":["pty.rs"]}"#.into();
+    }
+    deliver(&mut threads, &assignment_event(1, 1, "first", ended));
+    assert!(activity::latest(&threads, 0, &rows[0], 120).contains("Read 80 lines"));
+    deliver(
+        &mut threads,
+        &assignment_event(1, 2, "second", start("call", "NewSearch")),
+    );
+    deliver(
+        &mut threads,
+        &assignment_event(1, 1, "first", finish("call")),
+    );
+    assert!(activity::latest(&threads, 0, &rows[0], 120).contains("NewSearch"));
+    assert!(!activity::latest(&threads, 0, &rows[0], 120).contains("result recorded"));
+    for width in [1, 2, 12, 40, 120] {
+        let cells = build_turn_cells(&threads[0]);
+        let layout = inline_cell_layout(0, 0, &threads, &cells[0], width, 0, true, "", false, None);
+        let at = layout.activity_row.unwrap();
+        assert!(layout.lines[at].width() <= width as usize);
+        assert!(layout.lines[at + 1].width() <= width as usize);
+        assert_eq!(layout.hits[at], layout.hits[at + 1]);
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new(layout.lines.clone()), f.area()))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(!screen.contains("NEVER_SHOW"));
+        if width == 120 {
+            assert!(screen.contains("NewSearch"));
+        }
+    }
+}
+
+#[test]
 fn daemon_scoped_new_assignment_survives_old_finishes_results_and_reused_call_ids() {
     for (old, new) in [((1, 1), (1, 2)), ((1, 9), (2, 1))] {
         for finish_before_start in [false, true] {
@@ -1093,7 +1156,7 @@ fn real_draws_keep_detached_viewport_selection_and_history_cache_during_tool_cha
                 .unwrap();
             let old_cell = &projection.cells[0];
             let old_revision = cell_revision(&threads[0], old_cell);
-            cache.layout(cell_key(old_cell), old_revision, 2, || {
+            cache.layout(cell_key(old_cell), old_revision, 0, || {
                 panic!("history rebuilt")
             });
             let state = (

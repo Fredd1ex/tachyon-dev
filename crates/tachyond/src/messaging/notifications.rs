@@ -100,6 +100,7 @@ pub(crate) fn emit_schedule_event(
 
 pub(crate) fn encode_reminder_notification(reminder: &ReminderInfo) -> Result<String, String> {
     let metadata = InteractionMetadata {
+        command_origin: None,
         web_availability: None,
         attention: None,
         protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
@@ -127,6 +128,7 @@ pub(crate) fn encode_scheduled_task_notification(
     result: &str,
 ) -> Result<String, String> {
     let metadata = InteractionMetadata {
+        command_origin: None,
         web_availability: None,
         attention: None,
         protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
@@ -153,7 +155,7 @@ pub(crate) fn encode_scheduled_task_notification(
     .map_err(|error| format!("encode scheduled task notification: {error}"))
 }
 
-fn history_projection(data: &str) -> Option<HistoryProjection> {
+pub(crate) fn history_projection(data: &str) -> Option<HistoryProjection> {
     let envelope = serde_json::from_str::<InteractionEventEnvelope>(data).ok()?;
     let (role, text) = match envelope.event {
         InteractionEvent::UserTurnAccepted { text } => (HistoryRole::User, text),
@@ -204,22 +206,20 @@ pub(crate) fn project_pending_history(registry: &Arc<Mutex<Registry>>) -> Result
     Ok(())
 }
 
-pub(crate) fn persist_interaction_history(registry: &Arc<Mutex<Registry>>, data: &str) {
+#[cfg(test)]
+pub(crate) fn persist_interaction_history(
+    registry: &Arc<Mutex<Registry>>,
+    data: &str,
+) -> Result<(), String> {
     let Some(projection) = history_projection(data) else {
-        return;
+        return Ok(());
     };
     let runtime = registry.lock().unwrap().runtime_store.clone();
     let Some(runtime) = runtime else {
-        eprintln!("tachyond: runtime store missing for history event");
-        return;
+        return Err("runtime store missing for history event".into());
     };
-    if let Err(error) = runtime.enqueue_history(&projection) {
-        eprintln!("tachyond: enqueue history {}: {error}", projection.event_id);
-        return;
-    }
-    if let Err(error) = project_pending_history(registry) {
-        eprintln!("tachyond: project history: {error}");
-    }
+    runtime.enqueue_history(&projection)?;
+    project_pending_history(registry)
 }
 
 pub(crate) fn acknowledge_reminder_notification(registry: &Arc<Mutex<Registry>>, data: &str) {
@@ -673,14 +673,14 @@ mod tests {
             },
         };
         let wire = serde_json::to_string(&event).unwrap();
-        persist_interaction_history(&registry, &wire);
+        persist_interaction_history(&registry, &wire).unwrap();
         assert_eq!(runtime.pending_history().unwrap().len(), 1);
         registry.lock().unwrap().history_store = Some(Arc::new(
             HistoryStore::open(&directory.path().join("history.redb")).unwrap(),
         ));
         project_pending_history(&registry).unwrap();
         assert!(runtime.pending_history().unwrap().is_empty());
-        persist_interaction_history(&registry, &wire);
+        persist_interaction_history(&registry, &wire).unwrap();
         assert!(runtime.pending_history().unwrap().is_empty());
     }
 

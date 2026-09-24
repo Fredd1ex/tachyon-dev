@@ -50,7 +50,7 @@ pub(in crate::app) fn build_turn_cells(thread: &Thread) -> Vec<TurnCell> {
             .iter()
             .enumerate()
             .filter(|(_, item)| {
-                item.kind == ItemKind::Reply
+                matches!(item.kind, ItemKind::Reply | ItemKind::PendingReply)
                     && item
                         .turn
                         .as_deref()

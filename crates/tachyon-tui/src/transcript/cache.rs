@@ -172,14 +172,17 @@ pub(super) struct TurnCell {
 
 #[derive(Default)]
 pub(super) struct TurnProjection {
+    pub(super) selection: Option<(usize, String)>,
+    pub(super) details: Option<String>,
+    pub(super) record: Option<(usize, usize)>,
+    pub(super) record_focus: usize,
     pub(super) structure_revision: Option<u64>,
     pub(super) cells: Vec<TurnCell>,
 }
 
 impl TurnProjection {
     pub(super) fn reset(&mut self) {
-        self.structure_revision = None;
-        self.cells.clear();
+        *self = Self::default();
     }
 
     pub(super) fn update(&mut self, thread: &Thread) -> bool {

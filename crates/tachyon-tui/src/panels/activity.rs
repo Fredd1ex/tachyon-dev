@@ -60,7 +60,13 @@ pub(in crate::app) fn project(
                     }
                 }
             }
-            let label = if let Some(work) = &item.work {
+            let canonical = item
+                .work
+                .as_ref()
+                .and_then(|w| thread.canonical_works.get(&w.key.work_id));
+            let label = if let Some(work) = canonical {
+                format!("{} - {:?}", safe(&work.title, 140), work.phase)
+            } else if let Some(work) = &item.work {
                 if let Some(tool) = &work.tool {
                     let error = tool.output.get("is_error").and_then(|v| v.as_bool()) == Some(true)
                         || tool.output.get("error").is_some_and(|v| !v.is_null())
@@ -152,7 +158,7 @@ pub(in crate::app) fn project(
                     "{} {} - {}",
                     if item.kind == ItemKind::SpawnResult {
                         icon::SUCCESS
-                    } else if terminal || reused {
+                    } else if terminal || reused || ii < thread.history_len {
                         icon::WARNING
                     } else {
                         icon::RUNNING
@@ -160,7 +166,7 @@ pub(in crate::app) fn project(
                     safe(task.unwrap_or("Work"), 140),
                     if item.kind == ItemKind::SpawnResult {
                         "complete"
-                    } else if terminal || reused {
+                    } else if terminal || reused || ii < thread.history_len {
                         "outcome unknown"
                     } else {
                         "started"
@@ -224,6 +230,99 @@ pub(in crate::app) fn compact_row(threads: &[Thread], row: &ActivityRow, width: 
     aligned_row(&title, &format!("{status}{timing}"), width)
 }
 
+pub(in crate::app) fn latest(
+    threads: &[Thread],
+    foreground: usize,
+    row: &ActivityRow,
+    width: usize,
+) -> String {
+    let item = &threads[row.id.0].items[row.id.1];
+    let canonical = item
+        .work
+        .as_ref()
+        .and_then(|w| threads[row.id.0].canonical_works.get(&w.key.work_id));
+    let text = if let Some(work) = canonical {
+        let tool = work
+            .latest_tool
+            .as_ref()
+            .map(|t| {
+                format!(
+                    "{} ({})",
+                    t.name,
+                    if t.finished { "finished" } else { "running" }
+                )
+            })
+            .unwrap_or_else(|| "No tool activity".into());
+        format!(
+            "{tool}; {} started, {} finished",
+            work.metrics.tools_started, work.metrics.tools_finished
+        )
+    } else if let Some(work) = &item.work {
+        if work.tool.is_none() {
+            safe(
+                item.text
+                    .split_once('\n')
+                    .map(|(_, s)| s)
+                    .unwrap_or("Result recorded"),
+                256,
+            )
+        } else {
+            row.label.clone()
+        }
+    } else if item.kind == ItemKind::SpawnResult {
+        safe(
+            item.text
+                .split_once('\n')
+                .map(|(_, s)| s)
+                .unwrap_or("Complete"),
+            256,
+        )
+    } else if let Some((id, _)) = worker_record(&item.text) {
+        item.turn
+            .as_deref()
+            .filter(|turn| {
+                !threads[foreground].completed_turns.contains(*turn)
+                    && row.id.1 >= threads[row.id.0].history_len
+            })
+            .and_then(|turn| threads[foreground].activity.latest(turn, id))
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                row.label
+                    .rsplit_once(" - ")
+                    .map(|(_, s)| s)
+                    .unwrap_or("No correlated tool activity")
+                    .to_owned()
+            })
+    } else if item.kind == ItemKind::Tool {
+        let (name, args) = item
+            .text
+            .split_once(char::is_whitespace)
+            .unwrap_or((&item.text, ""));
+        let path = (args.len() <= 64 * 1024)
+            .then(|| serde_json::from_str::<serde_json::Value>(args).ok())
+            .flatten()
+            .and_then(|v| {
+                v.get("filePath")
+                    .or_else(|| v.get("path"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| safe(s, 256))
+            });
+        let status = row.label.rsplit_once(" - ").map(|(_, s)| s).unwrap_or("");
+        format!(
+            "{}{} - {status}",
+            safe(name, 80),
+            path.map(|p| format!(" {p}")).unwrap_or_default()
+        )
+    } else {
+        row.label.clone()
+    };
+    let indent = if width >= 4 { "  " } else { "" };
+    format!(
+        "{indent}{}",
+        compact(&format!("-> {text}"), width.saturating_sub(indent.len()))
+    )
+}
+
 pub(in crate::app) fn aligned_row(title: &str, status: &str, width: usize) -> String {
     let right = compact(status, width);
     let right_width = ratatui::text::Span::raw(&right).width();
@@ -282,6 +381,10 @@ pub(in crate::app) fn tasks(
         if item.kind == ItemKind::Tool {
             return !has_tasks;
         }
+        if item.kind == ItemKind::Spawn && row.label.ends_with(" - outcome unknown") {
+            // Retain unmatched legacy lifecycle evidence in diagnostics only.
+            return false;
+        }
         if let Some((id, _)) = worker_record(&item.text) {
             // A uniquely attributed host result represents this worker's start,
             // even when the opaque worker ID differs from its work ID. Never
@@ -298,7 +401,7 @@ pub(in crate::app) fn tasks(
 
 // Evidence is untrusted terminal text. Redact credential-shaped text as well as
 // sensitive JSON fields; never display a URL's credentials, query or fragment.
-pub(super) fn safe(text: &str, limit: usize) -> String {
+pub(in crate::app) fn safe(text: &str, limit: usize) -> String {
     let text: String = text
         .chars()
         .take(limit)
@@ -331,6 +434,9 @@ pub(super) fn safe(text: &str, limit: usize) -> String {
             return "[redacted URL]".into();
         }
         return clean.to_owned();
+    }
+    if text.contains("://") {
+        return "[embedded URL withheld]".into();
     }
     if text.chars().count() == limit {
         format!("{text} [truncated]")
@@ -383,9 +489,9 @@ pub(in crate::app) fn details(threads: &[Thread], row: &ActivityRow, raw: bool) 
                     parts.push(format!("{field}: {}", preview(value, 3)));
                 }
             }
-            // Arguments are opt-in with the row, native output needs a second opt-in.
-            parts.push(format!("Arguments: {}", preview(&tool.arguments, 3)));
+            // Arguments and native output require the secondary raw opt-in.
             if raw {
+                parts.push(format!("Arguments: {}", preview(&tool.arguments, 3)));
                 parts.push(format!("Output: {}", preview(&tool.output, 3)));
             }
         } else {
@@ -429,14 +535,16 @@ pub(in crate::app) fn details(threads: &[Thread], row: &ActivityRow, raw: bool) 
             .unwrap_or("");
         // Legacy free-form arguments/output may contain arbitrary credentials.
         // Only structured values have a safe field-level preview.
-        parts.push(format!(
-            "Arguments: {}",
-            (args.len() <= 64 * 1024)
-                .then(|| serde_json::from_str::<serde_json::Value>(args).ok())
-                .flatten()
-                .map(|v| preview(&v, 3))
-                .unwrap_or_else(|| "unstructured or oversized arguments withheld".into())
-        ));
+        if raw {
+            parts.push(format!(
+                "Arguments: {}",
+                (args.len() <= 64 * 1024)
+                    .then(|| serde_json::from_str::<serde_json::Value>(args).ok())
+                    .flatten()
+                    .map(|v| preview(&v, 3))
+                    .unwrap_or_else(|| "unstructured or oversized arguments withheld".into())
+            ));
+        }
         if raw {
             parts.push(format!(
                 "Output: {}",
@@ -451,14 +559,6 @@ pub(in crate::app) fn details(threads: &[Thread], row: &ActivityRow, raw: bool) 
     } else {
         parts.push(safe(&item.text, 2048));
     }
-    parts.push(
-        if raw {
-            "[r] hide raw output"
-        } else {
-            "[r] show bounded, redacted raw output"
-        }
-        .into(),
-    );
     parts.join("\n").chars().take(8192).collect()
 }
 

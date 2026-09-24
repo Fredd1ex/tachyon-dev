@@ -15,6 +15,7 @@ use tachyon_api::types::{AgentInfo, ApiRequest, ApiResponse, DaemonInfo, Schedul
 /// Error surfaced to the caller.
 #[derive(Debug)]
 pub enum ClientError {
+    InteractionGap,
     Monitor(tachyon_api::monitor::MonitorError),
     Todo(tachyon_api::todo::TodoError),
     Io(io::Error),
@@ -25,6 +26,9 @@ pub enum ClientError {
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ClientError::InteractionGap => {
+                write!(f, "interaction projection changed; resnapshot required")
+            }
             ClientError::Monitor(error) => write!(f, "monitor error: {error:?}"),
             ClientError::Todo(error) => write!(f, "todo error: {error:?}"),
             ClientError::Io(e) => write!(f, "ipc error: {e}"),
@@ -51,6 +55,9 @@ impl From<ClientError> for String {
 pub struct Client {
     conn: Connection,
 }
+
+#[cfg(test)]
+mod interaction_tests;
 
 impl Client {
     /// Allows an owning worker to interrupt a blocked request during teardown.
@@ -465,9 +472,122 @@ impl Client {
     }
 
     /// Open a live stream of foreground events.
-    pub fn foreground_subscribe(&mut self) -> Result<(), ClientError> {
-        let _ = self.request(&ApiRequest::ForegroundSubscribe, Duration::from_secs(5))?;
+    pub fn foreground_subscribe(&mut self) -> Result<InteractionSubscription, ClientError> {
+        InteractionSubscription::open(None)
+    }
+
+    pub fn interaction_snapshot(
+        &mut self,
+    ) -> Result<tachyon_api::interaction_manager::Snapshot, ClientError> {
+        match self.request(&ApiRequest::InteractionSnapshot, Duration::from_secs(5))? {
+            ApiResponse::InteractionFrame {
+                frame: tachyon_api::interaction_manager::Frame::Snapshot { snapshot },
+            } => self.assemble_interaction_snapshot(snapshot),
+            _ => Err(ClientError::Api("unexpected interaction snapshot".into())),
+        }
+    }
+
+    /// Assemble one exact revision off the UI thread. A gap never exposes mixed pages.
+    pub fn assemble_interaction_snapshot(
+        &mut self,
+        mut snapshot: tachyon_api::interaction_manager::Snapshot,
+    ) -> Result<tachyon_api::interaction_manager::Snapshot, ClientError> {
+        while let Some(offset) = snapshot.projection_next {
+            match self.request(
+                &ApiRequest::InteractionProjection {
+                    revision: snapshot.revision.clone(),
+                    offset,
+                },
+                Duration::from_secs(5),
+            )? {
+                ApiResponse::InteractionProjection { page }
+                    if page.revision == snapshot.revision
+                        && page.next_offset.is_none_or(|next| next > offset) =>
+                {
+                    snapshot
+                        .projection
+                        .responses
+                        .extend(page.projection.responses);
+                    snapshot.projection.works.extend(page.projection.works);
+                    snapshot
+                        .projection
+                        .progress
+                        .extend(page.projection.progress);
+                    snapshot.projection_next = page.next_offset;
+                }
+                _ => return Err(ClientError::InteractionGap),
+            }
+        }
+        for content in &snapshot.history_content {
+            let text = self.interaction_text(&content.reference, content.total_bytes)?;
+            if let Some(entry) = snapshot
+                .history
+                .iter_mut()
+                .find(|e| e.event_id == content.event_id)
+            {
+                entry.text = text;
+            }
+        }
+        for response in &mut snapshot.projection.responses {
+            self.hydrate_response(response)?;
+        }
+        Ok(snapshot)
+    }
+
+    pub fn hydrate_response(
+        &mut self,
+        response: &mut tachyon_api::interaction_manager::Response,
+    ) -> Result<(), ClientError> {
+        if let Some(reference) = &response.answer_ref {
+            response.answer = self.interaction_text(reference, response.answer_bytes)?;
+        }
         Ok(())
+    }
+
+    /// Handles are opaque; concatenate byte pages before decoding UTF-8.
+    pub fn interaction_text(&mut self, reference: &str, total: u64) -> Result<String, ClientError> {
+        let mut bytes = Vec::new();
+        let mut offset = 0;
+        while offset < total {
+            let limit = (total - offset).min(65536) as usize;
+            match self.request(
+                &ApiRequest::InteractionContent {
+                    reference: reference.into(),
+                    offset,
+                    limit: Some(limit),
+                },
+                Duration::from_secs(5),
+            )? {
+                ApiResponse::InteractionContent { page }
+                    if page.reference == reference
+                        && page.offset == offset
+                        && !page.bytes.is_empty()
+                        && page.bytes.len() <= limit as usize =>
+                {
+                    offset += page.bytes.len() as u64;
+                    bytes.extend(page.bytes);
+                }
+                _ => return Err(ClientError::Api("invalid interaction content page".into())),
+            }
+        }
+        String::from_utf8(bytes).map_err(|e| ClientError::Api(e.to_string()))
+    }
+
+    pub fn interaction_submit(
+        &mut self,
+        command: tachyon_api::interaction_manager::Submit,
+    ) -> Result<tachyon_api::interaction_manager::Receipt, ClientError> {
+        match self.request(
+            &ApiRequest::InteractionSubmit {
+                command: command.clone(),
+            },
+            Duration::from_secs(5),
+        )? {
+            ApiResponse::InteractionReceipt { receipt } if receipt.command == command => {
+                Ok(receipt)
+            }
+            _ => Err(ClientError::Api("unexpected interaction receipt".into())),
+        }
     }
 }
 
@@ -511,6 +631,55 @@ impl Subscription {
 }
 
 pub use tachyon_api::types as api;
+
+/// Dedicated manager connection. Dropping this never cancels a turn.
+pub struct InteractionSubscription {
+    conn: Connection,
+}
+impl InteractionSubscription {
+    pub fn open(
+        after: Option<tachyon_api::interaction_manager::Revision>,
+    ) -> Result<Self, ClientError> {
+        let mut conn = Connection::connect(tachyon_util::daemon::socket_path())?;
+        conn.send(&ApiRequest::InteractionAttach { after })?;
+        Ok(Self { conn })
+    }
+    pub fn recv(&mut self) -> Result<tachyon_api::interaction_manager::Frame, ClientError> {
+        match self.conn.recv()? {
+            ApiResponse::InteractionFrame { mut frame } => {
+                use tachyon_api::interaction_manager::{Frame, ProjectionChange};
+                match &mut frame {
+                    Frame::Snapshot { snapshot } => {
+                        if snapshot.projection_next.is_some()
+                            || !snapshot.history_content.is_empty()
+                            || snapshot
+                                .projection
+                                .responses
+                                .iter()
+                                .any(|r| r.answer_ref.is_some())
+                        {
+                            *snapshot = Client::connect()?
+                                .assemble_interaction_snapshot(snapshot.clone())?;
+                        }
+                    }
+                    Frame::Update { update } => {
+                        for change in &mut update.changes {
+                            if let ProjectionChange::Response { response } = change {
+                                if response.answer_ref.is_some() {
+                                    Client::connect()?.hydrate_response(response)?;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(frame)
+            }
+            ApiResponse::Error { message, .. } => Err(ClientError::Api(message)),
+            _ => Err(ClientError::Api("unexpected interaction frame".into())),
+        }
+    }
+}
 
 /// Dedicated latest-value connection. No event replay and no overflow queue.
 pub struct MonitorSubscription {

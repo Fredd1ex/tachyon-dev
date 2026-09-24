@@ -13,6 +13,28 @@ use ratatui::Frame;
 
 impl App {
     pub(super) fn draw(&mut self, f: &mut Frame) {
+        if let Some((_, thread)) = super::foreground_thread(&self.threads) {
+            self.turn_projection.update(thread);
+            if let Some((index, identity)) = &self.turn_projection.selection {
+                if self.open_trace == Some(*index) {
+                    self.open_trace =
+                        self.turn_projection.cells.iter().position(|cell| {
+                            thread.items[cell.prompt].turn.as_ref() == Some(identity)
+                        });
+                }
+            }
+            self.turn_projection.selection = self.open_trace.and_then(|index| {
+                self.turn_projection
+                    .cells
+                    .get(index)
+                    .and_then(|cell| thread.items[cell.prompt].turn.clone())
+                    .map(|identity| (index, identity))
+            });
+            if self.open_trace.is_none() {
+                self.turn_projection.details = None;
+                self.turn_projection.record = None;
+            }
+        }
         let area = f.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -93,7 +115,8 @@ impl App {
             self.daemon.as_ref(),
             &self.agent_infos,
             &self.threads,
-            self.open_trace,
+            self.open_trace
+                .filter(|_| self.turn_projection.details.is_some()),
             self.transcript_scroll.follow,
         );
         if let Some((notice, _)) = &self.clipboard_notice {

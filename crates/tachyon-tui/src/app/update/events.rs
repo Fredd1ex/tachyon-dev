@@ -3,19 +3,27 @@ use crate::app::model::items::ItemKind;
 use crate::app::model::thread::find_or_create_thread;
 use crate::app::panels::agents::pane_agent_ids;
 use crate::app::panels::tabs::PaneTab;
-use crate::app::update::metrics::{qualify_event_turn, record_correlated_metrics};
+use crate::app::update::metrics::qualify_event_turn;
 use crate::app::update::raw_line::{accept_event, classify_line};
 use crate::app::update::{apply_actor_event, apply_interaction_event};
 use crate::app::{attention, daemon_state_cache, session_archive, turn_activity, App, TuiEvent};
 use std::time::Instant;
 use tachyon_api::types::EventStream;
-use tachyon_api::{InteractionEvent, FOREGROUND_ID, MEMORY_ID};
+use tachyon_api::{InteractionEvent, FOREGROUND_ID};
 
 impl App {
     pub(in crate::app) fn apply_event(&mut self, ev: TuiEvent) -> bool {
         let mut checkpoint = false;
         match ev {
+            TuiEvent::Manager(frame) => return self.manager_frame(frame),
             TuiEvent::Status(snapshot) => {
+                let source = crate::app::services::interaction::SOURCE;
+                if snapshot.daemon.is_some() && !self.subscriptions.contains(source) {
+                    if let Err(error) = self.subscriptions.start(source.into(), Vec::new()) {
+                        self.clipboard_notice =
+                            Some((format!("Interaction attach: {error}"), Instant::now()));
+                    }
+                }
                 if self.daemon.is_none() && snapshot.daemon.is_some() {
                     self.daemon_since = Some(Instant::now());
                 } else if snapshot.daemon.is_none() {
@@ -24,22 +32,7 @@ impl App {
                 self.daemon = snapshot.daemon;
                 self.agent_infos.clear();
                 for agent in snapshot.agents {
-                    if agent.id != MEMORY_ID && !self.subscriptions.contains(&agent.id) {
-                        if let Err(error) = self.subscriptions.start(agent.id.clone(), Vec::new()) {
-                            self.clipboard_notice =
-                                Some((format!("Subscribe: {error}"), Instant::now()));
-                        }
-                    }
                     self.agent_infos.insert(agent.id.clone(), agent);
-                }
-                if self.daemon.is_some() && !self.subscriptions.contains(FOREGROUND_ID) {
-                    if let Err(error) = self
-                        .subscriptions
-                        .start(FOREGROUND_ID.into(), self.visits.recovery())
-                    {
-                        self.clipboard_notice =
-                            Some((format!("Subscribe: {error}"), Instant::now()));
-                    }
                 }
                 self.scheduled_tasks = snapshot.schedules;
                 self.focus = self.focus.min(
@@ -64,7 +57,6 @@ impl App {
                         self.operational_query = view.query.clone();
                         self.operational_scroll = 0;
                     }
-                    self.apply_checklist(&view);
                     self.operational_view = view;
                 }
             }
@@ -82,8 +74,15 @@ impl App {
                     .turn_id
                     .as_deref()
                     .map(|turn| session_archive::conversation_turn(&entry.conversation_id, turn));
-                if let Some(turn) = &turn {
-                    self.visits.recovered(turn);
+                if self.threads[idx]
+                    .items
+                    .iter()
+                    .any(|i| i.kind == ItemKind::Reply && i.turn == turn && i.text == entry.text)
+                    && turn
+                        .as_ref()
+                        .is_some_and(|t| self.threads[idx].completed_turns.contains(t))
+                {
+                    return checkpoint;
                 }
                 turn_activity::reply(
                     &mut self.threads[idx],
@@ -96,6 +95,10 @@ impl App {
                 agent_id,
                 mut envelope,
             } => {
+                // Raw AgentSubscribe publications are diagnostics, not conversation authority.
+                if agent_id == FOREGROUND_ID {
+                    return false;
+                }
                 let identity = (
                     envelope.metadata.conversation_id.clone(),
                     envelope.metadata.message_id.clone(),
@@ -111,7 +114,6 @@ impl App {
                 if !self.seen_interactions.insert(identity) {
                     return checkpoint;
                 }
-                self.visits.observe(&envelope);
                 if self
                     .live_conversation
                     .observe(&agent_id, &envelope.metadata)
@@ -141,11 +143,13 @@ impl App {
                 agent_id,
                 mut envelope,
             } => {
+                if agent_id == FOREGROUND_ID {
+                    return false;
+                }
                 if !accept_event(&mut self.seen_events, &envelope) {
                     return checkpoint;
                 }
                 qualify_event_turn(&mut envelope);
-                record_correlated_metrics(&mut self.threads, &envelope);
                 let actor = envelope.actor.clone();
                 let envelope_turn = envelope.turn_id.clone();
                 let event = envelope.kind;
@@ -166,6 +170,9 @@ impl App {
                 stream,
                 data,
             } => {
+                if agent_id == FOREGROUND_ID {
+                    return false;
+                }
                 let is_foreground = agent_id == FOREGROUND_ID;
                 let text = if stream == EventStream::Stderr {
                     format!("⚠ {data}")
@@ -183,6 +190,14 @@ impl App {
             }
             TuiEvent::Ended { agent_id, summary } => {
                 self.subscriptions.end(&agent_id);
+                if agent_id == crate::app::services::interaction::SOURCE {
+                    self.interaction_disconnected();
+                    self.clipboard_notice = Some((
+                        format!("Interaction disconnected: {summary}; recovering"),
+                        Instant::now(),
+                    ));
+                    return true;
+                }
                 let root = find_or_create_thread(&mut self.threads, FOREGROUND_ID, true, None);
                 let changed = self.threads[root].activity.finish_actor(&agent_id);
                 self.threads[root].touch();

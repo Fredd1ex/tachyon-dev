@@ -310,6 +310,7 @@ type ScopeKey = (String, String, String, Option<String>, Option<Assignment>);
 
 #[derive(Default)]
 pub(super) struct Activity {
+    sequence: u64,
     scopes: BTreeMap<ScopeKey, Scope>,
     assignments: BTreeMap<(String, String), (Assignment, bool)>,
     closed_workers: BTreeSet<(String, String)>,
@@ -326,10 +327,51 @@ struct Assignment {
 #[derive(Default)]
 struct Scope {
     calls: BTreeMap<String, Option<String>>,
+    observations: BTreeMap<String, String>,
+    latest: Option<(u64, String)>,
     closed: bool,
 }
 
 impl Activity {
+    pub(super) fn latest(&self, turn: &str, work: &str) -> Option<&str> {
+        self.scoped(turn, work)
+            .into_iter()
+            .filter_map(|scope| scope.latest.as_ref())
+            .max_by_key(|(sequence, _)| sequence)
+            .map(|(_, text)| text.as_str())
+    }
+
+    pub(super) fn tools(&self, turn: &str, work: &str) -> Vec<String> {
+        self.scoped(turn, work)
+            .into_iter()
+            .flat_map(|scope| scope.observations.values().cloned())
+            .take(MAX_CALLS)
+            .collect()
+    }
+
+    fn scoped(&self, turn: &str, work: &str) -> Vec<&Scope> {
+        if self.saturated() {
+            return Vec::new();
+        }
+        // Legacy starts identify a worker, not a work assignment. Only accept
+        // that link if the retained event scopes have one unambiguous identity.
+        let identities: BTreeSet<_> = self
+            .scopes
+            .keys()
+            .filter(|(t, actor, ..)| t == turn && actor == work)
+            .map(|(_, _, session, task, assignment)| (session, task, assignment))
+            .collect();
+        self.scopes
+            .iter()
+            .filter(|((t, actor, _, task, _), scope)| {
+                t == turn
+                    && !scope.closed
+                    && (task.as_deref() == Some(work) || (actor == work && identities.len() == 1))
+            })
+            .map(|(_, scope)| scope)
+            .collect()
+    }
+
     pub(super) fn work_ids<'a>(&'a self, turn: &'a str) -> impl Iterator<Item = &'a str> {
         self.assignments
             .keys()
@@ -588,12 +630,18 @@ impl Activity {
             self.overflowed = true;
             return;
         }
+        self.sequence = self.sequence.saturating_add(1);
         let scope = self.scopes.entry(key).or_default();
         if scope.closed {
             return;
         }
         match &e.kind {
-            AgentEvent::ToolStarted { id, name, .. } => {
+            AgentEvent::ToolStarted {
+                id,
+                name,
+                arguments,
+                ..
+            } => {
                 if id.len() > 512 {
                     return;
                 }
@@ -602,12 +650,31 @@ impl Activity {
                     scope.calls.clear();
                     return;
                 }
+                if !scope.calls.contains_key(id) {
+                    let path = (arguments.len() <= 64 * 1024)
+                        .then(|| serde_json::from_str::<serde_json::Value>(arguments).ok())
+                        .flatten()
+                        .and_then(|v| {
+                            v.get("filePath")
+                                .or_else(|| v.get("path"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_owned)
+                        });
+                    let text = format!(
+                        "{}{}",
+                        Self::label(name),
+                        path.map(|p| format!(" {}", crate::app::panels::activity::safe(&p, 256)))
+                            .unwrap_or_default()
+                    );
+                    scope.observations.insert(id.clone(), text.clone());
+                    scope.latest = Some((self.sequence, text));
+                }
                 scope
                     .calls
                     .entry(id.clone())
                     .or_insert_with(|| Some(Self::label(name)));
             }
-            AgentEvent::ToolFinished { id, .. } => {
+            AgentEvent::ToolFinished { id, output, .. } => {
                 if id.len() > 512 {
                     return;
                 }
@@ -615,6 +682,51 @@ impl Activity {
                     scope.closed = true;
                     scope.calls.clear();
                 } else {
+                    if let Some(Some(name)) = scope.calls.get(id) {
+                        let failed = (output.len() <= 64 * 1024)
+                            .then(|| serde_json::from_str::<serde_json::Value>(output).ok())
+                            .flatten()
+                            .is_some_and(|v| {
+                                v.get("is_error").and_then(|v| v.as_bool()) == Some(true)
+                                    || v.get("error").is_some_and(|v| !v.is_null())
+                                    || v.get("exit_code")
+                                        .and_then(|v| v.as_i64())
+                                        .is_some_and(|n| n != 0)
+                            });
+                        let summary = (output.len() <= 64 * 1024)
+                            .then(|| serde_json::from_str::<serde_json::Value>(output).ok())
+                            .flatten()
+                            .and_then(|v| {
+                                v.get("summary")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| crate::app::panels::activity::safe(s, 256))
+                            });
+                        scope.latest = Some((
+                            self.sequence,
+                            format!(
+                                "{name} - {}{}",
+                                if failed { "error" } else { "result recorded" },
+                                summary.map(|s| format!(": {s}")).unwrap_or_default()
+                            ),
+                        ));
+                        let mut detail = scope.latest.as_ref().unwrap().1.clone();
+                        if output.len() <= 64 * 1024 {
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(output) {
+                                for field in ["sources", "results", "error"] {
+                                    if let Some(value) = value.get(field).filter(|v| !v.is_null()) {
+                                        detail.push_str(&format!(
+                                            "\n{field}: {}",
+                                            crate::app::panels::activity::safe(
+                                                &value.to_string(),
+                                                512
+                                            )
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        scope.observations.insert(id.clone(), detail);
+                    }
                     scope.calls.insert(id.clone(), None);
                 }
             }

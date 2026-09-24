@@ -321,7 +321,8 @@ fn delegation_correlation(
             origin_turn_id.as_deref().unwrap_or("task"),
             tool_call.id
         ),
-        origin_turn_id: origin_turn_id.map(|turn| format!("conversation:{session_id}:{turn}")),
+        origin_turn_id: origin_turn_id
+            .map(|turn| tachyon_api::interaction_manager::canonical_turn_id(session_id, &turn)),
         parent_task_id: None,
         tool_call_id: (!tool_call.id.is_empty()).then(|| tool_call.id.clone()),
     }

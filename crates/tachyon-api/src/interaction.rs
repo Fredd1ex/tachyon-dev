@@ -16,6 +16,9 @@ pub struct WebAvailability {
 /// Correlation metadata shared by foreground commands and events.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InteractionMetadata {
+    /// Daemon-issued submit origin, echoed unchanged by the foreground host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_origin: Option<crate::interaction_manager::CommandOrigin>,
     /// Set by the daemon on each accepted turn. Missing legacy metadata fails closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_availability: Option<WebAvailability>,
@@ -42,6 +45,7 @@ impl InteractionMetadata {
         occurred_at_ms: u64,
     ) -> Self {
         Self {
+            command_origin: None,
             web_availability: None,
             attention: None,
             protocol_version: INTERACTION_PROTOCOL_VERSION,
@@ -155,6 +159,7 @@ mod tests {
 
     fn metadata() -> InteractionMetadata {
         InteractionMetadata {
+            command_origin: None,
             web_availability: None,
             attention: None,
             protocol_version: INTERACTION_PROTOCOL_VERSION,

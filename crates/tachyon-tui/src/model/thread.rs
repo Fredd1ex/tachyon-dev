@@ -27,6 +27,7 @@ pub(in crate::app) fn find_or_create_thread(
 }
 
 pub(in crate::app) struct Thread {
+    pub(in crate::app) canonical_works: HashMap<String, tachyon_api::interaction_manager::Work>,
     pub(in crate::app) history_len: usize,
     pub(in crate::app) history_label: Option<String>,
     pub(in crate::app) session_started: u64,
@@ -48,11 +49,13 @@ pub(in crate::app) struct Thread {
     pub(in crate::app) metric_revisions: HashMap<String, u64>,
     pub(in crate::app) activity: turn_activity::Activity,
     pub(in crate::app) checklist: Option<(String, String)>,
+    pub(in crate::app) recorded_checklists: std::collections::BTreeMap<String, String>,
 }
 
 impl Thread {
     pub(in crate::app) fn new_foreground() -> Self {
         Thread {
+            canonical_works: HashMap::new(),
             history_len: 0,
             history_label: None,
             session_started: now_seconds(),
@@ -74,6 +77,7 @@ impl Thread {
             metric_revisions: HashMap::new(),
             activity: turn_activity::Activity::default(),
             checklist: None,
+            recorded_checklists: Default::default(),
         }
     }
 

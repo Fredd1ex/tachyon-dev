@@ -15,6 +15,15 @@ const MESSAGES_BY_CONVERSATION: TableDefinition<&str, &str> =
 const ACTIVITY_BY_TIME: TableDefinition<&str, &str> = TableDefinition::new("activity_by_time");
 const ACTIVITY_BY_DAY: TableDefinition<&str, &str> = TableDefinition::new("activity_by_day");
 const SUMMARY_INTERVAL: u64 = 20;
+const COMMANDS: TableDefinition<&str, &[u8]> = TableDefinition::new("interaction_commands");
+const ACCEPTED_TURNS: TableDefinition<&str, &str> =
+    TableDefinition::new("interaction_accepted_turns");
+const INTERACTION_PROJECTION: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("interaction_projection_v1");
+const INTERACTION_CONTENT: TableDefinition<(&str, u64), &[u8]> =
+    TableDefinition::new("interaction_content_v1");
+const INTERACTION_FINAL_GENERATIONS: TableDefinition<&str, u64> =
+    TableDefinition::new("interaction_final_generations_v1");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ConversationRecord {
@@ -49,6 +58,340 @@ pub(crate) struct HistoryStore {
 }
 
 impl HistoryStore {
+    pub(crate) fn remember_interaction_final(
+        &self,
+        event: &tachyon_api::InteractionEventEnvelope,
+    ) -> Result<(), String> {
+        if !matches!(
+            event.event,
+            tachyon_api::InteractionEvent::ConversationFinished { .. }
+        ) {
+            return Ok(());
+        }
+        let tx = self.database.begin_write().map_err(|e| e.to_string())?;
+        tx.open_table(INTERACTION_FINAL_GENERATIONS)
+            .map_err(|e| e.to_string())?
+            .insert(
+                event.metadata.message_id.as_str(),
+                event.metadata.generation,
+            )
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn interaction_final_generations(
+        &self,
+        entries: &[HistoryEntry],
+    ) -> Result<std::collections::BTreeMap<String, u64>, String> {
+        let tx = self.database.begin_read().map_err(|e| e.to_string())?;
+        let table = tx
+            .open_table(INTERACTION_FINAL_GENERATIONS)
+            .map_err(|e| e.to_string())?;
+        let mut generations = std::collections::BTreeMap::new();
+        for entry in entries {
+            if let Some(row) = table
+                .get(entry.event_id.as_str())
+                .map_err(|e| e.to_string())?
+            {
+                generations.insert(entry.event_id.clone(), row.value());
+            }
+        }
+        Ok(generations)
+    }
+    pub(crate) fn interaction_checkpoint(
+        &self,
+    ) -> Result<tachyon_interaction_manager::Checkpoint, String> {
+        let tx = self.database.begin_read().map_err(|e| e.to_string())?;
+        let table = tx
+            .open_table(INTERACTION_PROJECTION)
+            .map_err(|e| e.to_string())?;
+        table
+            .get("foreground")
+            .map_err(|e| e.to_string())?
+            .map(|row| serde_json::from_slice(row.value()).map_err(|e| e.to_string()))
+            .transpose()
+            .map(|value| value.unwrap_or_default())
+    }
+
+    pub(crate) fn save_interaction_checkpoint(
+        &self,
+        checkpoint: &tachyon_interaction_manager::Checkpoint,
+    ) -> Result<(), String> {
+        self.save_interaction_event(checkpoint, None)
+    }
+
+    pub(crate) fn save_interaction_event(
+        &self,
+        checkpoint: &tachyon_interaction_manager::Checkpoint,
+        event: Option<&tachyon_api::InteractionEventEnvelope>,
+    ) -> Result<(), String> {
+        let bytes = serde_json::to_vec(checkpoint).map_err(|e| e.to_string())?;
+        let tx = self.database.begin_write().map_err(|e| e.to_string())?;
+        if let Some(event) = event {
+            use tachyon_api::InteractionEvent;
+            if let Some(response) = checkpoint
+                .projection
+                .responses
+                .iter()
+                .find(|r| Some(&r.turn_id) == event.metadata.turn_id.as_ref())
+            {
+                let content = match &event.event {
+                    InteractionEvent::ConversationDelta { text } => Some((
+                        text,
+                        response.answer_bytes.saturating_sub(text.len() as u64),
+                        None,
+                    )),
+                    InteractionEvent::ConversationFinished { text } => {
+                        Some((text, 0, Some(event.metadata.message_id.as_str())))
+                    }
+                    _ => None,
+                };
+                if let Some((text, offset, final_event)) = content {
+                    let reference = tachyon_interaction_manager::answer_reference(
+                        &response.turn_id,
+                        response.generation,
+                        final_event,
+                    );
+                    let mut table = tx
+                        .open_table(INTERACTION_CONTENT)
+                        .map_err(|e| e.to_string())?;
+                    for (index, chunk) in text.as_bytes().chunks(65536).enumerate() {
+                        table
+                            .insert((reference.as_str(), offset + (index * 65536) as u64), chunk)
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
+        tx.open_table(INTERACTION_PROJECTION)
+            .map_err(|e| e.to_string())?
+            .insert("foreground", bytes.as_slice())
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn interaction_content(
+        &self,
+        reference: &str,
+        offset: u64,
+        limit: Option<usize>,
+    ) -> Result<tachyon_api::interaction_manager::ContentPage, String> {
+        let limit = limit.unwrap_or(65536);
+        if reference.len() > 4096 || !(1..=65536).contains(&limit) {
+            return Err("invalid content bounds".into());
+        }
+        let tx = self.database.begin_read().map_err(|e| e.to_string())?;
+        if let Some(event_id) = reference.strip_prefix("history:") {
+            let table = tx.open_table(MESSAGES).map_err(|e| e.to_string())?;
+            let row = table
+                .get(event_id)
+                .map_err(|e| e.to_string())?
+                .ok_or("unknown history reference")?;
+            let message: HistoryMessage =
+                serde_json::from_slice(row.value()).map_err(|e| e.to_string())?;
+            if offset > message.text.len() as u64 {
+                return Err("content offset out of range".into());
+            }
+            let bytes: Vec<u8> = message
+                .text
+                .as_bytes()
+                .iter()
+                .skip(offset as usize)
+                .take(limit)
+                .copied()
+                .collect();
+            let next = offset + bytes.len() as u64;
+            return Ok(tachyon_api::interaction_manager::ContentPage {
+                reference: reference.into(),
+                offset,
+                bytes,
+                next_offset: (next < message.text.len() as u64).then_some(next),
+            });
+        }
+        let table = tx
+            .open_table(INTERACTION_CONTENT)
+            .map_err(|e| e.to_string())?;
+        let last = table
+            .range((reference, 0)..=(reference, u64::MAX))
+            .map_err(|e| e.to_string())?
+            .next_back()
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .ok_or("unknown content reference")?;
+        let total = last.0.value().1 + last.1.value().len() as u64;
+        if offset > total {
+            return Err("content offset out of range".into());
+        }
+        let start = table
+            .range((reference, 0)..=(reference, offset))
+            .map_err(|e| e.to_string())?
+            .next_back()
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .map(|(key, _)| key.value().1)
+            .unwrap_or(0);
+        let mut bytes = Vec::new();
+        for row in table
+            .range((reference, start)..=(reference, u64::MAX))
+            .map_err(|e| e.to_string())?
+        {
+            let (key, chunk) = row.map_err(|e| e.to_string())?;
+            let skip = offset.saturating_sub(key.value().1) as usize;
+            bytes.extend(chunk.value().iter().skip(skip).take(limit - bytes.len()));
+            if bytes.len() == limit {
+                break;
+            }
+        }
+        let next = offset + bytes.len() as u64;
+        Ok(tachyon_api::interaction_manager::ContentPage {
+            reference: reference.into(),
+            offset,
+            bytes,
+            next_offset: (next < total).then_some(next),
+        })
+    }
+    pub(crate) fn existing_command(
+        &self,
+        command: &tachyon_api::interaction_manager::Submit,
+    ) -> Result<Option<tachyon_api::interaction_manager::Receipt>, String> {
+        let read = self.database.begin_read().map_err(|e| e.to_string())?;
+        let table = read.open_table(COMMANDS).map_err(|e| e.to_string())?;
+        let key = serde_json::to_string(&(&command.session_id, &command.command_id))
+            .map_err(|e| e.to_string())?;
+        let receipt = table
+            .get(key.as_str())
+            .map_err(|e| e.to_string())?
+            .map(|v| serde_json::from_slice::<tachyon_api::interaction_manager::Receipt>(v.value()))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        if receipt.as_ref().is_some_and(|r| &r.command != command) {
+            return Err("command ID reused with different payload".into());
+        }
+        Ok(receipt)
+    }
+    pub(crate) fn command_receipt(
+        &self,
+        command: &tachyon_api::interaction_manager::Submit,
+        delivered: bool,
+        origin: Option<&tachyon_api::interaction_manager::CommandOrigin>,
+    ) -> Result<(tachyon_api::interaction_manager::Receipt, bool), String> {
+        use tachyon_api::interaction_manager::{Admission, Receipt};
+        if origin.is_some_and(|origin| {
+            origin.session_id != command.session_id
+                || origin.command_id != command.command_id
+                || origin.host_message_id.is_empty()
+        }) {
+            return Err("invalid admitted command origin".into());
+        }
+        let write = self.database.begin_write().map_err(|e| e.to_string())?;
+        let key = serde_json::to_string(&(&command.session_id, &command.command_id))
+            .map_err(|e| e.to_string())?;
+        let (receipt, fresh) = {
+            let mut table = write.open_table(COMMANDS).map_err(|e| e.to_string())?;
+            let previous = table
+                .get(key.as_str())
+                .map_err(|e| e.to_string())?
+                .map(|v| serde_json::from_slice::<Receipt>(v.value()))
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            if previous.as_ref().is_some_and(|r| &r.command != command) {
+                return Err("command ID reused with different payload".into());
+            }
+            let fresh = previous.is_none();
+            let mut receipt = previous.unwrap_or(Receipt {
+                command: command.clone(),
+                admission: Admission::Uncertain,
+                origin: origin.cloned(),
+                accepted: None,
+            });
+            if delivered {
+                receipt.admission = Admission::Delivered;
+            }
+            let bytes = serde_json::to_vec(&receipt).map_err(|e| e.to_string())?;
+            table
+                .insert(key.as_str(), bytes.as_slice())
+                .map_err(|e| e.to_string())?;
+            (receipt, fresh)
+        };
+        write.commit().map_err(|e| e.to_string())?;
+        Ok((receipt, fresh))
+    }
+
+    /// Bind only a host acceptance authenticated against the original admission.
+    /// History projection never writes this table or guesses by text/order.
+    pub(crate) fn bind_accepted_turn(
+        &self,
+        event: &tachyon_api::InteractionEventEnvelope,
+    ) -> Result<(), String> {
+        use tachyon_api::interaction_manager::{AcceptedTurn, Receipt};
+        let Some(origin) = &event.metadata.command_origin else {
+            return Ok(());
+        };
+        let tachyon_api::InteractionEvent::UserTurnAccepted { text } = &event.event else {
+            return Ok(());
+        };
+        let accepted = AcceptedTurn {
+            turn_id: event
+                .metadata
+                .turn_id
+                .clone()
+                .ok_or("accepted turn missing identity")?,
+            event_id: event.metadata.message_id.clone(),
+        };
+        let key = serde_json::to_string(&(&origin.session_id, &origin.command_id))
+            .map_err(|e| e.to_string())?;
+        let write = self.database.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut table = write.open_table(COMMANDS).map_err(|e| e.to_string())?;
+            let mut receipt: Receipt = {
+                let value = table
+                    .get(key.as_str())
+                    .map_err(|e| e.to_string())?
+                    .ok_or("acceptance has no admitted command")?;
+                serde_json::from_slice(value.value()).map_err(|e| e.to_string())?
+            };
+            if receipt.origin.as_ref() != Some(origin)
+                || receipt.command.text != *text
+                || event.metadata.correlation_id != origin.command_id
+                || event.metadata.causation_id.as_deref() != Some(&origin.host_message_id)
+                || receipt.command.conversation_id != event.metadata.conversation_id
+                || !accepted
+                    .turn_id
+                    .starts_with(&format!("{}:", origin.session_id))
+            {
+                return Err("acceptance does not match admitted origin".into());
+            }
+            if receipt
+                .accepted
+                .as_ref()
+                .is_some_and(|previous| previous != &accepted)
+            {
+                return Err("command already bound to a different acceptance".into());
+            }
+            {
+                let mut turns = write
+                    .open_table(ACCEPTED_TURNS)
+                    .map_err(|e| e.to_string())?;
+                if turns
+                    .get(accepted.turn_id.as_str())
+                    .map_err(|e| e.to_string())?
+                    .is_some_and(|previous| previous.value() != key)
+                {
+                    return Err("turn already bound to a different command".into());
+                }
+                turns
+                    .insert(accepted.turn_id.as_str(), key.as_str())
+                    .map_err(|e| e.to_string())?;
+            }
+            receipt.accepted = Some(accepted);
+            let bytes = serde_json::to_vec(&receipt).map_err(|e| e.to_string())?;
+            table
+                .insert(key.as_str(), bytes.as_slice())
+                .map_err(|e| e.to_string())?;
+        }
+        write.commit().map_err(|e| e.to_string())
+    }
+
     pub(crate) fn open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
@@ -94,6 +437,19 @@ impl HistoryStore {
             write
                 .open_table(CONVERSATIONS)
                 .map_err(|error| error.to_string())?;
+            write.open_table(COMMANDS).map_err(|e| e.to_string())?;
+            write
+                .open_table(INTERACTION_PROJECTION)
+                .map_err(|e| e.to_string())?;
+            write
+                .open_table(INTERACTION_CONTENT)
+                .map_err(|e| e.to_string())?;
+            write
+                .open_table(INTERACTION_FINAL_GENERATIONS)
+                .map_err(|e| e.to_string())?;
+            write
+                .open_table(ACCEPTED_TURNS)
+                .map_err(|e| e.to_string())?;
             write
                 .open_table(MESSAGES)
                 .map_err(|error| error.to_string())?;
@@ -245,7 +601,7 @@ impl HistoryStore {
         Ok(true)
     }
 
-    fn recent_conversation_messages(
+    pub(crate) fn recent_conversation_messages(
         &self,
         conversation_id: &str,
         limit: usize,

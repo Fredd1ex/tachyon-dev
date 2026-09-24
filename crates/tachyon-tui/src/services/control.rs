@@ -9,18 +9,19 @@ use tachyon_api::attention::Attention;
 use tachyon_api::types::{ApiRequest, ApiResponse};
 use tachyon_client::Client;
 
-use super::super::{actions::foreground_workspace_request, attention};
+use super::super::attention;
 
 const CAPACITY: usize = 16;
 
 pub(in crate::app) enum Command {
     Agent(ApiRequest),
     Daemon(String),
-    Chat(String),
+    Submit(tachyon_api::interaction_manager::Submit),
     Attention(Vec<ApiRequest>),
 }
 
 pub(in crate::app) enum Output {
+    Interaction(tachyon_api::interaction_manager::Receipt),
     Message(Result<String, String>),
     Attention(Result<(Vec<Attention>, String), String>),
 }
@@ -159,7 +160,18 @@ impl Drop for Worker {
 
 impl Completion {
     pub(in crate::app) fn report(&self) -> String {
+        if let Output::Interaction(receipt) = &self.output {
+            return format!(
+                "command #{} {}: transport {:?}; host acceptance {:?}; not completion; receipt: {}",
+                self.id,
+                self.label,
+                receipt.admission,
+                receipt.accepted,
+                serde_json::to_string(receipt).unwrap()
+            );
+        }
         let text = match &self.output {
+            Output::Interaction(_) => unreachable!(),
             Output::Message(Ok(text)) => text.as_str(),
             Output::Message(Err(error)) | Output::Attention(Err(error)) => error.as_str(),
             Output::Attention(Ok((_, text))) => text.as_str(),
@@ -186,6 +198,13 @@ fn execute_with(
     command: Command,
     mut request: impl FnMut(&ApiRequest, Duration) -> Result<ApiResponse, String>,
 ) -> Output {
+    if let Command::Submit(command) = command {
+        let recovery = serde_json::to_string(&command).unwrap();
+        return match request(&ApiRequest::InteractionSubmit { command: command.clone() }, Duration::from_secs(5)) {
+            Ok(ApiResponse::InteractionReceipt { receipt }) if receipt.command == command => Output::Interaction(receipt),
+            response => Output::Message(Err(format!("admission unknown; not retried ({response:?}); reconcile identical command, never a new ID: {recovery}"))),
+        };
+    }
     if let Command::Attention(requests) = command {
         return Output::Attention(attention::execute(requests, |req| {
             request(req, Duration::from_secs(5))
@@ -209,18 +228,7 @@ fn execute_with(
                 ))
             }
         }
-        Command::Chat(text) => {
-            let (text, cwd) = foreground_workspace_request(text, std::env::current_dir())?;
-            match request(
-                &ApiRequest::ForegroundChat { text, cwd },
-                Duration::from_secs(5),
-            )? {
-                ApiResponse::Chat { id } if id == tachyon_api::FOREGROUND_ID => {
-                        Ok("daemon delivery acknowledged; turn acceptance and execution arrive via foreground events".into())
-                }
-                _ => Err("mismatched intake response; acceptance unknown; not retried".into()),
-            }
-        }
+        Command::Submit(_) => unreachable!(),
         Command::Agent(req) => {
             let id = match &req {
                 ApiRequest::AgentAwait { id }

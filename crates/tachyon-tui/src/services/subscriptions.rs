@@ -50,6 +50,9 @@ impl Publisher {
         }
         let mut bytes = Count(std::mem::size_of::<Message>() + self.source.len());
         match &event {
+            TuiEvent::Manager(frame) => {
+                serde_json::to_writer(&mut bytes, frame).map_err(|e| e.to_string())?;
+            }
             TuiEvent::Interaction { agent_id, envelope } => {
                 bytes.0 += agent_id.len();
                 serde_json::to_writer(&mut bytes, envelope).map_err(|e| e.to_string())?;
@@ -146,7 +149,12 @@ impl Default for Subscriptions {
 impl Subscriptions {
     #[cfg(test)]
     pub(in crate::app) fn attach_fixture(&mut self, socket: UnixStream) -> io::Result<()> {
-        self.start_with(FOREGROUND_ID.into(), move || Ok(socket), Vec::new(), false)
+        self.start_with(
+            super::interaction::SOURCE.into(),
+            move || Ok(socket),
+            Vec::new(),
+            false,
+        )
     }
 
     pub(in crate::app) fn contains(&self, source: &str) -> bool {
@@ -199,8 +207,12 @@ impl Subscriptions {
                         .map_err(|e| e.to_string())?;
                     write_request(
                         &mut socket,
-                        &ApiRequest::AgentSubscribe {
-                            id: publisher.source.clone(),
+                        &if publisher.source == super::interaction::SOURCE {
+                            ApiRequest::InteractionAttach { after: None }
+                        } else {
+                            ApiRequest::AgentSubscribe {
+                                id: publisher.source.clone(),
+                            }
                         },
                     )
                     .map_err(|e| e.to_string())?;
@@ -213,7 +225,7 @@ impl Subscriptions {
                         }
                     }
                     std::thread::scope(|scope| {
-                        if recover_attention && publisher.source == FOREGROUND_ID {
+                        if recover_attention && publisher.source == super::interaction::SOURCE {
                             scope.spawn(|| {
                                 if let Err(error) = recover(&publisher, &worker_sockets, None) {
                                     let _ = publisher.send(TuiEvent::ChatResult {
@@ -223,7 +235,11 @@ impl Subscriptions {
                             });
                         }
                         let mut reader = BufReader::new(socket);
-                        let result = read_events(&mut reader, &publisher);
+                        let result = if publisher.source == super::interaction::SOURCE {
+                            super::interaction::read(&mut reader, |event| publisher.send(event))
+                        } else {
+                            read_events(&mut reader, &publisher)
+                        };
                         let _ = publisher.send(TuiEvent::Ended {
                             agent_id: publisher.source.clone(),
                             summary: result.err().unwrap_or_else(|| "stream ended".into()),
@@ -323,11 +339,12 @@ fn read_events(reader: &mut BufReader<UnixStream>, publisher: &Publisher) -> Res
         match read_response(reader).map_err(|e| e.to_string())? {
             ApiResponse::Event { stream, data } => {
                 let agent_id = publisher.source.clone();
-                let event = if let Some(envelope) = decode_interaction_event(&data) {
-                    drop(data);
-                    TuiEvent::Interaction { agent_id, envelope }
-                } else if let Ok(envelope) =
-                    serde_json::from_str::<EventEnvelope>(&data).or_else(|_| {
+                // Worker assertions and legacy foreground copies are not response authority.
+                if decode_interaction_event(&data).is_some() {
+                    continue;
+                }
+                let event = if let Ok(envelope) = serde_json::from_str::<EventEnvelope>(&data)
+                    .or_else(|_| {
                         serde_json::from_str::<AgentEvent>(&data).map(|kind| EventEnvelope {
                             event_id: 0,
                             session_id: agent_id.clone(),
@@ -341,13 +358,26 @@ fn read_events(reader: &mut BufReader<UnixStream>, publisher: &Publisher) -> Res
                             occurred_at_ms: now_seconds(),
                             kind,
                         })
-                    })
-                {
+                    }) {
+                    if agent_id == FOREGROUND_ID
+                        && matches!(
+                            envelope.kind,
+                            AgentEvent::Reply { .. }
+                                | AgentEvent::ReplyDelta { .. }
+                                | AgentEvent::Status { .. }
+                                | AgentEvent::Error { .. }
+                        )
+                    {
+                        continue;
+                    }
                     drop(data);
                     TuiEvent::Structured { agent_id, envelope }
                 } else if is_structured_legacy_marker(&data) {
                     continue;
                 } else {
+                    if agent_id == FOREGROUND_ID {
+                        continue;
+                    }
                     TuiEvent::Line {
                         agent_id,
                         stream,
@@ -368,6 +398,94 @@ mod tests {
     use crate::app::{apply_correlated_agent_event, ItemKind, Thread};
     use std::{io::Write, time::Instant};
     use tachyon_api::{transport::write_response, types::EventStream};
+
+    #[test]
+    fn foreground_raw_overlap_is_filtered_but_host_scoped_telemetry_survives() {
+        let mut subscriptions = Subscriptions::default();
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        subscriptions
+            .start_with(FOREGROUND_ID.into(), move || Ok(reader), Vec::new(), false)
+            .unwrap();
+        let mut request = BufReader::new(writer.try_clone().unwrap());
+        assert!(matches!(
+            tachyon_api::transport::read_request(&mut request).unwrap(),
+            ApiRequest::AgentSubscribe { .. }
+        ));
+        drop(request);
+        let mut metadata =
+            tachyon_api::InteractionMetadata::new("raw-copy", "request", FOREGROUND_ID, 1);
+        metadata.turn_id = Some("host:1".into());
+        write_response(
+            &mut writer,
+            &ApiResponse::Event {
+                stream: EventStream::Stdout,
+                data: serde_json::to_string(&tachyon_api::InteractionEventEnvelope {
+                    metadata,
+                    event: tachyon_api::InteractionEvent::ConversationFinished {
+                        text: "duplicate".into(),
+                    },
+                })
+                .unwrap(),
+            },
+        )
+        .unwrap();
+        write(&mut writer, &reply("overlapping raw reply".into(), true));
+        write(
+            &mut writer,
+            &AgentEvent::Error {
+                turn: Some(1),
+                message: "raw error must not terminate manager reply".into(),
+            },
+        );
+        let envelope = EventEnvelope {
+            event_id: 1,
+            session_id: "host".into(),
+            conversation_id: Some(FOREGROUND_ID.into()),
+            turn_id: Some("host:1".into()),
+            task_id: None,
+            parent_task_id: None,
+            tool_call_id: None,
+            actor: tachyon_api::Actor::Foreground,
+            sequence: 1,
+            occurred_at_ms: 1,
+            kind: AgentEvent::Timing {
+                turn: 1,
+                stage: "first_visible".into(),
+                elapsed_ms: 42,
+            },
+        };
+        write_response(
+            &mut writer,
+            &ApiResponse::Event {
+                stream: EventStream::Stdout,
+                data: serde_json::to_string(&envelope).unwrap(),
+            },
+        )
+        .unwrap();
+        drop(writer);
+        let root = tempfile::tempdir().unwrap();
+        let mut app = crate::app::verification::fixture(root.path(), 0);
+        let mut received = 0;
+        let mut ended = false;
+        wait(|| {
+            match subscriptions.poll() {
+                Some(Some(event @ TuiEvent::Structured { .. })) => {
+                    app.apply_event(event);
+                    received += 1;
+                }
+                Some(Some(TuiEvent::Ended { .. })) => ended = true,
+                Some(Some(_)) => panic!("raw conversation output leaked"),
+                _ => {}
+            }
+            ended
+        });
+        assert_eq!(received, 1);
+        assert!(app.threads[0].metrics.is_empty());
+        assert!(app.threads[0]
+            .items
+            .iter()
+            .all(|i| !matches!(i.kind, ItemKind::Reply | ItemKind::Error)));
+    }
 
     fn wait(mut ready: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);

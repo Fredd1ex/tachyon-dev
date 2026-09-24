@@ -10,6 +10,7 @@ name = "tachyond"
 path = "src/main.rs"
 
 [dependencies]
+tachyon-interaction-manager = { path = "../interaction/manager" }
 tempfile.workspace = true
 redb.workspace = true
 uuid.workspace = true

@@ -1909,7 +1909,7 @@ fn footer_trace_mode_is_concise_and_contextual() {
     assert_eq!(
         footer_mode_text(Some(1), false),
         Some(format!(
-            "DETAILS    Ctrl+O collapse · Ctrl+D diagnostics · {} Pg scroll · {} Esc close · {} help",
+            "DETAILS    click task · Ctrl+D diagnostics · {} Pg scroll · {} Esc close · {} help",
             icon::SCROLL,
             icon::CLOSE,
             icon::HELP
@@ -2082,6 +2082,7 @@ fn clear_reset_discards_unified_view_projection_and_cache() {
     let mut projection = TurnProjection {
         structure_revision: Some(2),
         cells: Vec::new(),
+        ..TurnProjection::default()
     };
     reset_transcript(
         &mut scroll,
@@ -2117,6 +2118,7 @@ fn envelope(event_id: u64, kind: AgentEvent) -> EventEnvelope {
 fn interaction(event: InteractionEvent) -> InteractionEventEnvelope {
     InteractionEventEnvelope {
         metadata: tachyon_api::InteractionMetadata {
+            command_origin: None,
             web_availability: None,
             attention: None,
             protocol_version: tachyon_api::INTERACTION_PROTOCOL_VERSION,
@@ -2653,14 +2655,14 @@ fn worker_start_uses_its_correlated_origin_turn() {
             worker_id: "worker-1".into(),
             objective: "objective".into(),
         },
-        Some("3"),
+        Some("host-session:3"),
     );
     let spawn = thread
         .items
         .iter()
         .find(|item| item.kind == ItemKind::Spawn)
         .expect("spawn item");
-    assert_eq!(spawn.turn.as_deref(), Some("2"));
+    assert_eq!(spawn.turn.as_deref(), Some("host-session:3"));
 }
 
 #[test]

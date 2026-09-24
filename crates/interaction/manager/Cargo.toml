@@ -1,0 +1,11 @@
+[package]
+name = "tachyon-interaction-manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tachyon-api.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+serde.workspace = true

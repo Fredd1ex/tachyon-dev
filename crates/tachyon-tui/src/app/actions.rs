@@ -39,14 +39,31 @@ pub(super) fn submit_chat(
     cmd: &str,
     threads: &mut Vec<Thread>,
     worker: &mut Worker,
+    interaction: &mut super::services::interaction::State,
 ) -> Result<u64, String> {
-    let id = worker.submit("foreground intake".into(), Command::Chat(cmd.into()))?;
+    let session_id = interaction
+        .session
+        .clone()
+        .ok_or("Interaction snapshot unavailable; draft retained")?;
+    let (text, cwd) = foreground_workspace_request(cmd.into(), std::env::current_dir())?;
+    let command = tachyon_api::interaction_manager::Submit {
+        conversation_id: FOREGROUND_ID.into(),
+        session_id,
+        command_id: uuid::Uuid::new_v4().to_string(),
+        text,
+        cwd,
+    };
+    let id = worker.submit("foreground intake".into(), Command::Submit(command.clone()))?;
+    let key = super::services::interaction::pending_key(&command.session_id, &command.command_id);
+    interaction.pending.insert(key.clone(), command);
     let idx = find_or_create_thread(threads, FOREGROUND_ID, true, None);
-    threads[idx].add(
+    threads[idx].add_turn(
         ItemKind::User,
         cmd.strip_prefix("/managed ").unwrap_or(cmd).trim().into(),
+        Some(key.clone()),
     );
     threads[idx].reserve_reply();
+    threads[idx].items.last_mut().unwrap().turn = Some(key);
     Ok(id)
 }
 
@@ -73,8 +90,9 @@ pub(super) fn handle_slash(
     let idx = find_or_create_thread(threads, FOREGROUND_ID, true, None);
     if matches!(parts.as_slice(), ["help"] | []) {
         for line in [
-            "/clear       toggle previous visits (keeps history)",
+            "/clear       toggle loaded older history (keeps history)",
             "/managed TEXT  run this turn in managed agent workspaces",
+            "/reconcile   retrieve pending command receipts; never allocate new IDs",
             "/stop <id>  stop an agent",
             "/await <id>  show current agent state",
             "/interrupt <id>  interrupt an agent",

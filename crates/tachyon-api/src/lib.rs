@@ -14,6 +14,7 @@ pub mod context;
 pub mod continuation;
 pub mod conversation_campaign;
 pub mod interaction;
+pub mod interaction_manager;
 pub mod monitor;
 pub mod operational_events;
 pub mod todo;

@@ -20,6 +20,51 @@ pub(super) fn initialize(tx: &WriteTransaction) -> Result<(), String> {
     Ok(())
 }
 
+impl RuntimeStore {
+    pub(crate) fn interaction_progress(
+        &self,
+        scope: &TodoScope,
+    ) -> Result<tachyon_api::interaction_manager::Progress, String> {
+        let read = || -> Result<_, TodoError> {
+            let tx = self.database.begin_read().map_err(storage)?;
+            let key = scope_key(scope)?;
+            let revision = tx
+                .open_table(SCOPES)
+                .map_err(storage)?
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|v| v.value())
+                .unwrap_or(0);
+            let mut progress = tachyon_api::interaction_manager::Progress {
+                scope: scope.clone(),
+                scope_revision: Some(revision),
+                pending: 0,
+                in_progress: 0,
+                blocked: 0,
+                completed: 0,
+                cancelled: 0,
+            };
+            let records = tx.open_table(RECORDS).map_err(storage)?;
+            for row in records
+                .range((key.as_str(), "")..=(key.as_str(), "\u{10ffff}"))
+                .map_err(storage)?
+            {
+                let (_, value) = row.map_err(storage)?;
+                let todo: Todo = decode(value.value())?;
+                match todo.status {
+                    TodoStatus::Pending => progress.pending += 1,
+                    TodoStatus::InProgress => progress.in_progress += 1,
+                    TodoStatus::Blocked => progress.blocked += 1,
+                    TodoStatus::Completed => progress.completed += 1,
+                    TodoStatus::Cancelled => progress.cancelled += 1,
+                }
+            }
+            Ok(progress)
+        };
+        read().map_err(|e| format!("todo progress: {e:?}"))
+    }
+}
+
 /// Host-only, deliberately not deserializable. The host must explicitly grant
 /// exactly one scope. Campaign membership alone never constructs a grant.
 pub(crate) enum TodoAuthority {
@@ -518,6 +563,25 @@ impl TodoFacade<'_> {
             .insert(command_id.as_str(), bytes.as_slice())
             .map_err(storage)?;
         tx.commit().map_err(storage)?;
+        if let TodoResponse::Mutation {
+            todo,
+            scope_revision,
+            watermark,
+        } = &response
+        {
+            self.store.operational_committed(OperationalEvent {
+                schema_version: 1,
+                watermark: watermark.clone(),
+                scope: todo.scope.clone(),
+                scope_revision: *scope_revision,
+                occurred_at_ms: todo.updated_ms,
+                change: if added {
+                    OperationalChange::TodoAdded { todo: todo.clone() }
+                } else {
+                    OperationalChange::TodoUpdated { todo: todo.clone() }
+                },
+            });
+        }
         Ok(response)
     }
 }

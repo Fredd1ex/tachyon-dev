@@ -14,6 +14,23 @@ pub(super) fn control(
 ) {
     let report = result.report();
     match result.output {
+        Output::Interaction(receipt) => {
+            let idx = find_or_create_thread(threads, FOREGROUND_ID, true, None);
+            if let (Some(origin), Some(accepted)) = (&receipt.origin, &receipt.accepted) {
+                if origin.session_id == receipt.command.session_id
+                    && origin.command_id == receipt.command.command_id
+                {
+                    let turn = super::session_archive::conversation_turn(
+                        &receipt.command.conversation_id,
+                        &accepted.turn_id,
+                    );
+                    super::services::interaction::bind(&mut threads[idx], origin, &turn);
+                }
+            }
+            let streaming = threads[idx].streaming;
+            threads[idx].add(ItemKind::System, report);
+            threads[idx].streaming = streaming;
+        }
         Output::Attention(output) => {
             let output = match output {
                 Ok((records, _)) => Ok((records, report)),
@@ -125,11 +142,9 @@ pub(super) fn apply_agent_event(thread: &mut Thread, event: AgentEvent) {
 }
 
 pub(super) fn projected_turn(turn: Option<u64>, envelope_turn: Option<&str>) -> Option<String> {
-    if envelope_turn.is_some_and(|turn| turn.starts_with("conversation:")) {
-        return envelope_turn.map(str::to_owned);
-    }
-    turn.map(|turn| turn.to_string())
-        .or_else(|| envelope_turn.map(str::to_owned))
+    envelope_turn
+        .map(str::to_owned)
+        .or_else(|| turn.map(|turn| turn.to_string()))
 }
 
 pub(super) fn apply_correlated_agent_event(

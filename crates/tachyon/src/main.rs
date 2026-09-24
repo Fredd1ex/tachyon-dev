@@ -7,7 +7,6 @@ use tachyon::cli::{Cli, Command, DaemonAction, MemoryAction, ProviderAction};
 use tachyon::style::{colored_glyph, palette, render};
 
 use tachyon_api::types::{AgentState, ApiRequest, ApiResponse};
-use tachyon_api::FOREGROUND_ID;
 use tachyon_util::guard;
 
 fn main() -> ExitCode {
@@ -33,6 +32,15 @@ fn main() -> ExitCode {
     if let Command::Campaign { action } = cmd {
         return tachyon::campaign::run(action);
     }
+    if let Command::Chat(args) = cmd {
+        return match tachyon::interaction::run(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("tachyon: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // Only agent commands auto-start the daemon. Local administration and
     // provider commands must not spawn it implicitly.
@@ -48,7 +56,7 @@ fn main() -> ExitCode {
 fn needs_ipc(cmd: &Command) -> bool {
     !matches!(
         cmd,
-        Command::Daemon(_) | Command::Memory(_) | Command::Providers(_)
+        Command::Chat(_) | Command::Daemon(_) | Command::Memory(_) | Command::Providers(_)
     ) && !matches!(cmd, Command::Restart(args) if args.id == "daemon")
         && !matches!(cmd, Command::Cat(args) if args.result)
 }
@@ -118,7 +126,7 @@ fn dispatch(cmd: Command, p: &tachyon::style::Palette) -> ExitCode {
         Command::Start(args) => {
             // `start` goes through the foreground: send the task to its chat,
             // which may spawn worker agents as needed.
-            return start_via_foreground(&mut client, args.task, args.cwd, p);
+            return start_via_foreground(args.task, args.cwd, p);
         }
         Command::List(_) => ApiRequest::AgentList,
         Command::Status(args) => ApiRequest::AgentStatus { id: args.id },
@@ -150,7 +158,8 @@ fn dispatch(cmd: Command, p: &tachyon::style::Palette) -> ExitCode {
             limit: args.limit,
         },
         Command::Top(_) => ApiRequest::Top,
-        Command::Campaign { .. }
+        Command::Chat(_)
+        | Command::Campaign { .. }
         | Command::Daemon(_)
         | Command::Memory(_)
         | Command::Providers(_) => {
@@ -169,11 +178,8 @@ fn dispatch(cmd: Command, p: &tachyon::style::Palette) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `tachyon start <task>` delegates to the foreground. Send the task as a chat
-/// message, subscribe to its stream, and print foreground/worker
-/// activity until a final answer appears.
+/// `start` admits a durable foreground command; `chat` attaches to its responses.
 fn start_via_foreground(
-    client: &mut tachyon_client::Client,
     task: String,
     cwd: Option<String>,
     p: &tachyon::style::Palette,
@@ -185,75 +191,23 @@ fn start_via_foreground(
             return ExitCode::FAILURE;
         }
     };
-    let cwd_hint = match &cwd {
-        Some(c) => format!(" (cwd: {c})"),
-        None => String::new(),
-    };
-    println!(
-        "{} {}",
-        render(&p.accent, format!("foreground handling:{cwd_hint}")),
-        render(&p.dim, &task)
-    );
-
-    if let Err(e) = client.foreground_chat_with_cwd(task, cwd) {
-        println!("{} {}", render(&p.bad, "failed to reach foreground:"), e);
-        return ExitCode::FAILURE;
-    }
-
-    // Open a stream to the foreground and print activity until we see a
-    // final `[agent]` / `[daemon:result]` answer.
-    let mut sub = match tachyon_client::Subscription::open(FOREGROUND_ID) {
-        Ok(s) => s,
-        Err(e) => {
-            println!("{} {}", render(&p.bad, "failed to subscribe:"), e);
-            return ExitCode::FAILURE;
+    match tachyon::interaction::run(tachyon::cli::ChatArgs {
+        text: Some(task),
+        cwd,
+        follow: false,
+        json: false,
+        command_id: None,
+        session_id: None,
+    }) {
+        Ok(()) => {
+            println!("Submission recorded, not completed. Attach to canonical responses with: tachyon chat");
+            ExitCode::SUCCESS
         }
-    };
-
-    // Give the daemon a moment to relay; stream for up to ~5 min.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
-    let mut done = false;
-    while !done && std::time::Instant::now() < deadline {
-        match sub.next() {
-            Some(ApiResponse::Event { data, .. }) => {
-                let line = data.trim().to_string();
-                if line.is_empty() {
-                    continue;
-                }
-                // Suppress token-spray relay lines; show meaningful markers.
-                if line.starts_with("[text]") {
-                    continue;
-                }
-                if line.starts_with("[stream]") {
-                    continue;
-                }
-                // The task the user typed is already printed; skip its echo.
-                if line.starts_with("[user]") {
-                    continue;
-                }
-                println!("  {}", render(&p.dim, &line));
-                if line.starts_with("[agent] ")
-                    || line.starts_with("[ghost] answer")
-                    || line.contains("[daemon:result]")
-                    || line.starts_with("[ghost:error]")
-                {
-                    done = true;
-                }
-            }
-            Some(_) => {}
-            None => {
-                println!("{}", render(&p.warn, "foreground stream closed"));
-                break;
-            }
+        Err(error) => {
+            eprintln!("tachyon: {error}");
+            ExitCode::FAILURE
         }
     }
-    if !done {
-        println!(
-            "{}",
-            render(&p.warn, "timed out waiting for the foreground")
-        );
-    }
-    ExitCode::SUCCESS
 }
 
 fn print_response(resp: ApiResponse, p: &tachyon::style::Palette) {
@@ -696,6 +650,8 @@ mod tests {
         for args in [
             vec!["tachyon", "cat", "worker", "--result"],
             vec!["tachyon", "daemon", "status"],
+            vec!["tachyon", "chat"],
+            vec!["tachyon", "chat", "hello", "--follow"],
         ] {
             let command = Cli::try_parse_from(args).unwrap().command.unwrap();
             assert!(!needs_ipc(&command));

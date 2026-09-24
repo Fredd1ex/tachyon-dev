@@ -846,6 +846,22 @@ pub enum ApiRequest {
     /// Subscribe to the foreground conversation stream.
     #[serde(alias = "orchestrator_subscribe")]
     ForegroundSubscribe,
+    InteractionSnapshot,
+    InteractionProjection {
+        revision: crate::interaction_manager::Revision,
+        offset: usize,
+    },
+    InteractionContent {
+        reference: String,
+        offset: u64,
+        limit: Option<usize>,
+    },
+    InteractionAttach {
+        after: Option<crate::interaction_manager::Revision>,
+    },
+    InteractionSubmit {
+        command: crate::interaction_manager::Submit,
+    },
     /// Query canonical user-visible history in the half-open time range.
     HistoryQuery {
         since_ms: u64,
@@ -1459,6 +1475,18 @@ pub struct EventEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApiResponse {
+    InteractionProjection {
+        page: crate::interaction_manager::ProjectionPage,
+    },
+    InteractionContent {
+        page: crate::interaction_manager::ContentPage,
+    },
+    InteractionFrame {
+        frame: crate::interaction_manager::Frame,
+    },
+    InteractionReceipt {
+        receipt: crate::interaction_manager::Receipt,
+    },
     ConversationWeb {
         command: crate::web::WebCommand,
         result: Result<crate::web::WebResult, String>,

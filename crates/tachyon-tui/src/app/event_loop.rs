@@ -29,12 +29,6 @@ impl App {
                     self.clipboard_notice = Some((result.report(), Instant::now()));
                 }
                 update::control(result, &mut self.attention, &mut self.threads);
-                self.history
-                    .checkpoint(&mut self.visits, &self.threads, &self.attention);
-                self.redraw = true;
-            }
-            if let Some(error) = self.history.poll(&mut self.attention) {
-                self.clipboard_notice = Some((error, Instant::now()));
                 self.redraw = true;
             }
             let inline = self.inline_checklist_query();
@@ -63,19 +57,17 @@ impl App {
                         Some(query @ daemon_state_cache::Query::Resources { .. }) => query.clone(),
                         _ => daemon_state_cache::Query::Resources { after: None },
                     }),
-                    PaneTab::Foreground => inline.or_else(|| {
-                        self.live_conversation.scope().map(|scope| {
-                            daemon_state_cache::Query::Todos {
-                                scope,
-                                cursor: None,
-                                turn: None,
-                            }
-                        })
+                    PaneTab::Foreground => self.live_conversation.scope().map(|scope| {
+                        daemon_state_cache::Query::Todos {
+                            scope,
+                            cursor: None,
+                            turn: None,
+                        }
                     }),
                     _ => None,
                 }
             } else {
-                inline
+                None
             };
             if desired != self.operational_query {
                 self.operational_query = desired;
@@ -84,10 +76,6 @@ impl App {
                     ..Default::default()
                 };
                 self.operational_scroll = 0;
-                self.apply_checklist(&daemon_state_cache::View {
-                    query: self.operational_query.clone(),
-                    ..Default::default()
-                });
                 self.redraw = true;
             }
             self.operational_worker
@@ -100,7 +88,6 @@ impl App {
             }
 
             // Drain subscription events into threads.
-            let mut checkpoint = false;
             for _ in scheduler::budget() {
                 let ev = match scheduler::next(
                     &mut self.prefer_notifications,
@@ -112,7 +99,7 @@ impl App {
                     None => break,
                 };
                 self.redraw = true;
-                checkpoint |= self.apply_event(ev);
+                self.apply_event(ev);
             }
 
             if let Some(loaded) = self.pages.take() {
@@ -143,13 +130,6 @@ impl App {
                 self.redraw = true;
             }
 
-            // Periodic session save.
-            if checkpoint || self.last_save.elapsed() > Duration::from_secs(5) {
-                self.last_save = Instant::now();
-                self.history
-                    .checkpoint(&mut self.visits, &self.threads, &self.attention);
-            }
-
             if self
                 .clipboard_notice
                 .as_ref()
@@ -171,17 +151,14 @@ impl App {
                     }
                 }
                 // Receipt/layout alone is not display: the terminal draw must succeed.
-                if self.attention.visible(
+                self.attention.visible(
                     &self.threads,
                     &self.transcript_view.attention_hits,
                     self.pane_open
                         || self.info_open
                         || self.commands_open
                         || self.open_trace.is_some(),
-                ) {
-                    self.history
-                        .checkpoint(&mut self.visits, &self.threads, &self.attention);
-                }
+                );
                 self.redraw = false;
                 self.input_redraw = false;
                 self.last_draw = Instant::now();
@@ -212,8 +189,6 @@ impl App {
 
         // Capture even on terminal/input errors, restore the terminal before waiting
         // for the bounded drain, and never detach an archive writer on an error path.
-        self.history
-            .checkpoint(&mut self.visits, &self.threads, &self.attention);
         self.pages.stop();
         self.subscriptions.stop();
         let restored = (|| -> io::Result<()> {
@@ -239,10 +214,7 @@ impl App {
             eprintln!("{}", result.report());
             update::control(result, &mut self.attention, &mut self.threads);
         }
-        self.history
-            .checkpoint(&mut self.visits, &self.threads, &self.attention);
-        let saved = self.history.shutdown();
         let loaded = self.pages.shutdown();
-        saved.and(loaded).and(loop_result).and(restored)
+        loaded.and(loop_result).and(restored)
     }
 }

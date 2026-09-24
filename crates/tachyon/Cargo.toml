@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 serde_json.workspace = true
+uuid.workspace = true
 rpassword.workspace = true
 clap = { version = "4", features = ["derive"] }
 anstyle = "1"
@@ -19,3 +20,6 @@ tachyon-api.workspace = true
 tachyon-client.workspace = true
 tachyon-tui.workspace = true
 tachyon-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

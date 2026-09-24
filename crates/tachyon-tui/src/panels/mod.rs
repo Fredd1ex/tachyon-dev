@@ -30,9 +30,16 @@ pub(super) struct Inspector {
     key: Option<(String, u16, Vec<u64>)>,
     dirty: bool,
     reveal: bool,
+    target: Option<RowId>,
 }
 
 impl Inspector {
+    pub(super) fn open(&mut self, target: Option<RowId>) {
+        self.reset();
+        self.secondary = true;
+        self.target = target;
+        self.reveal = true;
+    }
     #[cfg(test)]
     pub(super) fn scroll_top(&self) -> usize {
         self.top
@@ -121,7 +128,54 @@ impl Inspector {
                 self.secondary = secondary;
             }
             let selected = self.rows.get(self.selected).map(|r| r.id);
+            let known: HashSet<_> = self.rows.iter().map(|r| r.id).collect();
             self.rows = activity::project(threads, ti, scope);
+            if let Some(target) = self.target {
+                let item = &threads[target.0].items[target.1];
+                let worker =
+                    crate::app::transcript::trace::worker_record(&item.text).map(|(id, _)| id);
+                let work_keys: Vec<_> = activity::tasks(threads, ti, scope)
+                    .iter()
+                    .filter_map(|row| {
+                        let source = &threads[row.id.0];
+                        let other = &source.items[row.id.1];
+                        other
+                            .work
+                            .as_ref()
+                            .filter(|w| {
+                                worker.is_some_and(|id| id == w.key.work_id || id == source.id)
+                            })
+                            .map(|w| w.key.clone())
+                    })
+                    .collect();
+                self.rows.retain(|row| {
+                    if item.turn.as_deref() != scope {
+                        return false;
+                    }
+                    let other = &threads[row.id.0].items[row.id.1];
+                    row.id == target
+                        || item
+                            .work
+                            .as_ref()
+                            .zip(other.work.as_ref())
+                            .is_some_and(|(a, b)| a.key == b.key)
+                        || (item.work.is_none()
+                            && work_keys.len() == 1
+                            && other.work.as_ref().is_some_and(|w| w.key == work_keys[0]))
+                        || (item.work.is_none()
+                            && worker.is_some()
+                            && worker
+                                == crate::app::transcript::trace::worker_record(&other.text)
+                                    .map(|(id, _)| id)
+                            && other.work.is_none())
+                });
+                self.expanded.extend(
+                    self.rows
+                        .iter()
+                        .map(|r| r.id)
+                        .filter(|id| !known.contains(id)),
+                );
+            }
             self.selected = selected
                 .and_then(|id| self.rows.iter().position(|r| r.id == id))
                 .unwrap_or(0);
@@ -132,6 +186,12 @@ impl Inspector {
             });
             self.lines.clear();
             self.hits.clear();
+            if !self.rows.is_empty() {
+                self.lines.push(Line::raw(
+                    "Enter/Space details · r raw output/arguments · Up/Down select",
+                ));
+                self.hits.push(None);
+            }
             for (index, row) in self.rows.iter().enumerate() {
                 for line in activity::wrap(
                     &format!(
@@ -150,6 +210,26 @@ impl Inspector {
                     self.hits.push(Some(row.id));
                 }
                 if self.expanded.contains(&row.id) {
+                    self.lines.push(Line::raw(activity::latest(
+                        threads,
+                        ti,
+                        row,
+                        width as usize,
+                    )));
+                    self.hits.push(None);
+                    let item = &threads[row.id.0].items[row.id.1];
+                    if item.work.is_none() && row.id.1 >= threads[row.id.0].history_len {
+                        if let Some((id, _)) =
+                            crate::app::transcript::trace::worker_record(&item.text)
+                        {
+                            for tool in thread.activity.tools(scope.unwrap_or(""), id) {
+                                for line in activity::wrap(&tool, width) {
+                                    self.lines.push(Line::raw(line));
+                                    self.hits.push(None);
+                                }
+                            }
+                        }
+                    }
                     let raw = self.raw.contains(&row.id);
                     let detail = self
                         .details
@@ -188,7 +268,9 @@ impl Inspector {
                     .items
                     .iter()
                     .rev()
-                    .filter(|item| item.text.starts_with("command #"))
+                    .filter(|item| {
+                        item.turn.as_deref() == scope && item.text.starts_with("command #")
+                    })
                     .take(16)
                 {
                     for line in activity::wrap(
@@ -208,7 +290,7 @@ impl Inspector {
             90,
             (self.lines.len().saturating_add(3).min(18) as u16).min(area.height),
         );
-        let block = ui::panel_block(" DIAGNOSTICS - Esc closes ");
+        let block = ui::panel_block(" TASK DETAILS - Esc closes ");
         self.area = block.inner(popup);
         // Keep the selected header visible on keyboard movement/expansion, without
         // changing the conversation viewport or following new transcript activity.

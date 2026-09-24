@@ -41,22 +41,62 @@ fn fixture_child() {
     let mut start = probe.try_clone().unwrap();
     let producer = thread::spawn(move || {
         let request = read_request(&mut BufReader::new(writer.try_clone().unwrap())).unwrap();
-        assert!(matches!(request, ApiRequest::AgentSubscribe { id } if id == FOREGROUND_ID));
+        assert!(matches!(
+            request,
+            ApiRequest::InteractionAttach { after: None }
+        ));
+        write_response(
+            &mut writer,
+            &ApiResponse::InteractionFrame {
+                frame: tachyon_api::interaction_manager::Frame::Snapshot {
+                    snapshot: tachyon_api::interaction_manager::Snapshot {
+                        history_content: Vec::new(),
+                        projection: Default::default(),
+                        projection_next: None,
+                        revision: tachyon_api::interaction_manager::Revision {
+                            epoch: "offline".into(),
+                            sequence: 0,
+                        },
+                        conversation_id: FOREGROUND_ID.into(),
+                        session_id: Some("host".into()),
+                        host_state: None,
+                        history: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap();
         let mut signal = [0];
         start.read_exact(&mut signal).unwrap();
         assert_eq!(signal, *b"f");
         let mut sent = 0u64;
         loop {
-            let event = AgentEvent::Reply {
-                turn: Some(31),
-                text: format!("Offline socket update {sent}"),
-                final_reply: true,
-            };
+            let mut metadata = tachyon_api::InteractionMetadata::new(
+                format!("event-{sent}"),
+                "request",
+                FOREGROUND_ID,
+                sent,
+            );
+            metadata.turn_id = Some("host:31".into());
             if let Err(error) = write_response(
                 &mut writer,
-                &ApiResponse::Event {
-                    stream: EventStream::Stdout,
-                    data: serde_json::to_string(&event).unwrap(),
+                &ApiResponse::InteractionFrame {
+                    frame: tachyon_api::interaction_manager::Frame::Update {
+                        update: tachyon_api::interaction_manager::Update {
+                            changes: Vec::new(),
+                            revision: tachyon_api::interaction_manager::Revision {
+                                epoch: "offline".into(),
+                                sequence: sent + 1,
+                            },
+                            session_id: "host".into(),
+                            event: Some(tachyon_api::InteractionEventEnvelope {
+                                metadata,
+                                event: tachyon_api::InteractionEvent::ConversationFinished {
+                                    text: format!("Offline socket update {sent}"),
+                                },
+                            }),
+                        },
+                    },
                 },
             ) {
                 assert!(
@@ -267,25 +307,8 @@ fn offline_pty_event_loop() {
     assert!(wheel["trace"].is_null());
     let chat = next(&mut reader, |s| s["event"] == "frame");
     let opened = input(&mut master, &mut reader, b"\x0f", "code: Char('o')");
-    assert_eq!(opened["trace"], chat["anchor"]);
-    assert!(opened["trace"].is_number());
-    next(&mut reader, |s| {
-        s["event"] == "frame" && s["inspector_painted"] == false
-    });
-    input(&mut master, &mut reader, b"\x04", "code: Char('d')");
-    next(&mut reader, |s| {
-        s["event"] == "frame" && s["inspector_painted"] == true
-    });
-    let narrow_inspector = resize(&process, &mut reader, 60, 18);
-    assert_eq!(narrow_inspector["trace"], opened["trace"]);
-    assert_eq!(narrow_inspector["inspector_painted"], true);
-    let inspector_scroll = input(&mut master, &mut reader, b"\x1b[<65;6;6M", "ScrollDown");
-    assert_eq!(inspector_scroll["top"], narrow_inspector["top"]);
-    // This turn has no correlated tools/work, so the compact surface cannot scroll.
-    assert_eq!(inspector_scroll["inspector_top"], 0);
-    let closed = input(&mut master, &mut reader, b"\x1b", "code: Esc");
-    assert!(closed["trace"].is_null());
-    assert_eq!(closed["top"], narrow_inspector["top"]);
+    assert_eq!(opened["trace"], chat["trace"]);
+    assert_eq!(opened["top"], chat["top"]);
     next(&mut reader, |s| {
         s["event"] == "frame" && s["inspector_painted"] == false
     });
@@ -295,7 +318,7 @@ fn offline_pty_event_loop() {
         let resized = resize(&process, &mut reader, columns, rows);
         assert_eq!(resized["anchor"], chat["anchor"]);
         assert_eq!(resized["follow"], false);
-        assert!(resized["trace"].is_null());
+        assert_eq!(resized["trace"], opened["trace"]);
     }
     let pane = input(&mut master, &mut reader, b"\t", "code: Tab");
     assert_eq!(pane["pane"], true);
@@ -381,13 +404,9 @@ fn offline_pty_event_loop() {
         disabled > enabled,
         "capture must be disabled during teardown"
     );
-    let mut visits = session_archive::Visits::open(root.path()).unwrap();
-    let mut restored = vec![Thread::new_foreground()];
-    visits.latest(&mut restored).unwrap();
-    assert!(restored
-        .iter()
-        .flat_map(|t| &t.items)
-        .any(|i| i.text.starts_with("Offline socket update ")));
+    assert!(!root.path().join("tui-visits").exists());
+    assert!(!root.path().join("tui-session.json").exists());
+    assert!(!root.path().join("tui-attention.json").exists());
     eprintln!(
         "PTY: {} socket updates sent; input/frame {input_latency:?}; joined teardown {teardown:?}",
         stopped["sent"]

@@ -28,21 +28,31 @@ impl EvidenceRecord {
     }
 
     pub(super) fn origin_turn(&self) -> Option<u64> {
+        self.origin_turn_in_session(crate::streaming::session_id())
+    }
+
+    fn origin_turn_in_session(&self, session: &str) -> Option<u64> {
         match self {
             Self::Correlated(envelope) => {
                 if envelope
                     .conversation_id
                     .as_deref()
                     .is_some_and(|conversation| {
-                        conversation != tachyon_api::FOREGROUND_ID
-                            && conversation != crate::streaming::session_id()
+                        conversation != tachyon_api::FOREGROUND_ID && conversation != session
                     })
                 {
                     return None;
                 }
                 let id = envelope.turn_id.as_deref()?;
-                let prefix = format!("conversation:{}:", crate::streaming::session_id());
-                id.strip_prefix(&prefix).unwrap_or(id).parse().ok()
+                if !id.contains(':')
+                    && session != tachyon_api::FOREGROUND_ID
+                    && envelope.conversation_id.as_deref() != Some(session)
+                {
+                    // Old unscoped worker counters cannot be attributed to a new host.
+                    return None;
+                }
+                let id = tachyon_api::interaction_manager::canonical_turn_id(session, id);
+                id.strip_prefix(&format!("{session}:"))?.parse().ok()
             }
             Self::Legacy(_) => None,
         }
@@ -642,6 +652,27 @@ pub(super) mod tests {
             "inspect release"
         )
         .is_none());
+    }
+
+    #[test]
+    fn daemon_sessions_never_adopt_old_or_unqualified_worker_turns() {
+        let EvidenceRecord::Correlated(mut envelope) = completed_evidence(7, "verified") else {
+            panic!()
+        };
+        envelope.conversation_id = Some(tachyon_api::FOREGROUND_ID.into());
+        for (turn, expected) in [
+            ("7", None),
+            ("old-host:7", None),
+            ("new-host:7", Some(7)),
+            ("conversation:old-host:7", None),
+            ("conversation:new-host:7", Some(7)),
+        ] {
+            envelope.turn_id = Some(turn.into());
+            assert_eq!(
+                EvidenceRecord::Correlated(envelope.clone()).origin_turn_in_session("new-host"),
+                expected
+            );
+        }
     }
 
     #[test]

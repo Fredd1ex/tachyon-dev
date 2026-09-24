@@ -1,7 +1,6 @@
 //! Correlated aggregate accounting reduction.
 use crate::app::model::metrics::TokenTotals;
 use crate::app::model::thread::{find_or_create_thread, Thread};
-use crate::app::update::projected_turn;
 use crate::app::{elapsed, session_archive, turn_activity};
 use tachyon_api::types::{
     Actor, AgentEvent, EventEnvelope, MemoryMutationKind, MemoryMutationResult, WorkOutcome,
@@ -20,6 +19,10 @@ pub(in crate::app) fn record_correlated_metrics(
     threads: &mut Vec<Thread>,
     envelope: &EventEnvelope,
 ) {
+    // A scheduler-local kind.turn is never a substitute for host correlation.
+    if envelope.turn_id.is_none() {
+        return;
+    }
     let root = find_or_create_thread(threads, FOREGROUND_ID, true, None);
     threads[root].touch();
     let revision = threads[root].revision;
@@ -29,12 +32,10 @@ pub(in crate::app) fn record_correlated_metrics(
         (
             Actor::Foreground,
             AgentEvent::Timing {
-                turn,
-                stage,
-                elapsed_ms,
+                stage, elapsed_ms, ..
             },
         ) => {
-            let turn = projected_turn(Some(*turn), envelope.turn_id.as_deref()).unwrap();
+            let turn = envelope.turn_id.clone().unwrap();
             let metrics = threads[root].metrics.entry(turn.clone()).or_default();
             match stage.as_str() {
                 "first_visible" => metrics.first_visible_ms = Some(*elapsed_ms),
@@ -46,14 +47,13 @@ pub(in crate::app) fn record_correlated_metrics(
         (
             Actor::Foreground,
             AgentEvent::Usage {
-                turn: Some(turn),
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
                 ..
             },
         ) => {
-            let turn = projected_turn(Some(*turn), envelope.turn_id.as_deref()).unwrap();
+            let turn = envelope.turn_id.clone().unwrap();
             threads[root]
                 .metrics
                 .entry(turn.clone())

@@ -1,10 +1,15 @@
 //! Deterministic notices and operator receipts. No model or conversation turns.
 use super::*;
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::fs::{self, File, OpenOptions};
+#[cfg(test)]
 use std::io::Write;
+#[cfg(test)]
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use tachyon_api::attention::{Attention, AttentionAcknowledgement, AttentionFrameMetadata};
 use tachyon_api::todo::TodoScope;
 use tachyon_api::types::{ApiRequest, HistoryEntry, HistoryKind, HistoryRole};
@@ -26,6 +31,7 @@ struct Receipts {
 #[derive(Clone)]
 pub(super) struct State {
     data: Receipts,
+    #[cfg(test)]
     path: PathBuf,
     dirty: bool,
     generation: u64,
@@ -78,15 +84,15 @@ fn append(thread: &mut Thread, text: String, notice: Option<Notice>, timestamp: 
 }
 
 impl State {
-    pub(super) fn open(root: &Path) -> io::Result<Self> {
-        let path = root.join("tui-attention.json");
-        let data = match File::open(&path) {
-            Ok(file) => serde_json::from_reader(file)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Receipts::default(),
-            Err(error) => return Err(error),
-        };
+    pub(super) fn open(_root: &Path) -> io::Result<Self> {
+        #[cfg(test)]
+        let path = _root.join("tui-attention.json");
+        // Durable bodies and display receipts belong to the daemon. Old local files
+        // remain untouched and cannot suppress recovered canonical notifications.
+        let data = Receipts::default();
         Ok(Self {
             data,
+            #[cfg(test)]
             path,
             dirty: false,
             generation: 0,
@@ -95,25 +101,7 @@ impl State {
         })
     }
 
-    pub(super) fn snapshot(&self) -> Option<Self> {
-        self.dirty.then(|| self.clone())
-    }
-
-    pub(super) fn pending_generation(&self) -> Option<u64> {
-        self.dirty.then_some(self.generation)
-    }
-
     #[cfg(test)]
-    pub(super) fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub(super) fn persisted(&mut self, generation: u64) {
-        if generation == self.generation {
-            self.dirty = false;
-        }
-    }
-
     pub(super) fn save(&mut self) -> io::Result<()> {
         if !self.dirty {
             return Ok(());
@@ -169,7 +157,7 @@ impl State {
                 entry.occurred_at_ms,
             );
         }
-        true
+        !exists
     }
 
     pub(super) fn visible(&mut self, threads: &[Thread], hits: &[Hit], covered: bool) -> bool {
@@ -223,8 +211,7 @@ impl State {
     }
 
     pub(super) fn retry(&mut self, out: &mpsc::Sender<TuiEvent>) {
-        if self.dirty
-            || self.in_flight
+        if self.in_flight
             || self
                 .attempted
                 .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
@@ -745,8 +732,6 @@ mod tests {
         let (view, text) = render(&threads, &mut TranscriptScroll::default(), 90, 20);
         assert!(text.contains("Work failed"));
         assert!(state.visible(&threads, &view.attention_hits, false));
-        state.save().unwrap();
-        let mut state = State::open(&dir.0).unwrap();
         assert_eq!(state.pending().len(), 2);
         state.complete(ResultEvent::Displayed(vec![]), &mut threads);
         assert_eq!(state.pending().len(), 2);
@@ -755,8 +740,9 @@ mod tests {
         let mut state = State::open(&dir.0).unwrap();
         assert!(state.pending().is_empty());
         assert!(!state.receive(entry, &mut threads));
-        assert!(!state.visible(&threads, &view.attention_hits, false));
-        assert!(state.pending().is_empty());
+        assert!(state.visible(&threads, &view.attention_hits, false));
+        // The daemon makes repeated display receipts idempotent after reconnect.
+        assert_eq!(state.pending().len(), 2);
     }
 
     #[test]
@@ -846,8 +832,6 @@ mod tests {
         });
         assert_eq!(confirmed.len(), 2);
         state.complete(ResultEvent::Displayed(confirmed), &mut threads);
-        state.save().unwrap();
-        let mut state = State::open(&dir.0).unwrap();
         assert_eq!(state.pending()[0].1, "attention-02");
         for _ in 0..2 {
             let confirmed = display(state.pending(), |request| {
